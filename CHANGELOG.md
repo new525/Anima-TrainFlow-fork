@@ -3,7 +3,15 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [v1.1.0-fork.2] - 2026-10-16
+## [1.2] - 2026-10-16
+
+### Documentation
+- README rewritten for the fork:
+  - a comparison table of what differs from upstream
+  - install steps that use this fork's own release zip or git clone and its bundled Python 3.10, instead of upstream's portable build, which contains upstream's code
+  - direct model download links (official `circlestone-labs/Anima` files; just the two tagger files instead of a 3.78 GB repo clone)
+  - a usage guide for the new controls and the output layout
+- Changelog versions renumbered to match the release tags (1.1, 1.2).
 
 ### Added
 - **➕ Train More** — extends the keyword's newest finished run to the current *Training Steps* value, resuming from sd-scripts' end-of-run state (`<name>-state`).
@@ -33,16 +41,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 - `.bmp` images: the tagger and the resolution scan skipped them, while pre-flight required captions for them. All tools now share sd-scripts' extension list.
+- The default DiT path now points at `models/anima/dit/anima-base-v1.0.safetensors`; the official model card says LoRAs should be trained on the base model. Saved settings are unaffected.
 
 ### Known limitations
+- Everything above was tested end to end on Python 3.10.20, the version bundled in `python_embeded/`, with Gradio 6.14.0 and a stand-in trainer.
 - **Untested on Windows:** the detached launch and reattach are tested on Linux only.
   - On Windows they rely on `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`, and on accelerate's child process inheriting the log-file handles. Accelerate launches it with a plain `subprocess.Popen(cmd, env=...)`.
   - After reattaching, the exit code may be unavailable. The outcome is then read from the log and the final LoRA's presence instead.
 - Two app instances started at once would both reattach to the same trainer.
 
-## [v1.1.0-fork.1] - 2026-10-16
+## [1.1] - 2026-10-16
 
-Based on upstream commit `cf13c7b` (portable release v1.1.0).
+First fork release. Based on upstream commit `cf13c7b` (upstream portable release v1.1.0).
 
 ### Added
 - **⏸ Pause / ▶ Continue** — freezes the trainer process tree in place and continues exactly where it stopped. VRAM stays allocated while paused; a pause does not survive closing the app.
@@ -79,4 +89,4 @@ Based on upstream commit `cf13c7b` (portable release v1.1.0).
 - A resumed run sees the dataset in a different order than an uninterrupted run would.
 - Resume points include the optimizer state and are considerably larger than a LoRA. sd-scripts also saves one when a run finishes, and a Halt resume point between save intervals is never pruned automatically; both are safe to delete.
 - A Halt pressed during latent caching takes effect after the first training step.
-- Bucketing and auto-captioning still run attached to the browser tab (fixed in v1.1.0-fork.2).
+- Bucketing and auto-captioning still run attached to the browser tab (fixed in 1.2).

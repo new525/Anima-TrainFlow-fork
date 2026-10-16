@@ -723,7 +723,7 @@ CUDA_ERROR = (
 DEFAULT_SETTINGS = {
     "trigger_word": "",
     "dataset_path": "",
-    "dit_path": str(ROOT / "models" / "anima" / "dit" / "anima-preview.safetensors"),
+    "dit_path": str(ROOT / "models" / "anima" / "dit" / "anima-base-v1.0.safetensors"),  # the model card says to train LoRAs on base
     "qwen_path": str(ROOT / "models" / "anima" / "text_encoder" / "qwen_3_06b_base.safetensors"),
     "vae_path": str(ROOT / "models" / "anima" / "vae" / "qwen_image_vae.safetensors"),
     "network_rank": 32,
