@@ -3,6 +3,43 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v1.1.0-fork.2] - 2026-10-16
+
+### Added
+- **➕ Train More** — extends the keyword's newest finished run to the current *Training Steps* value, resuming from sd-scripts' end-of-run state (`<name>-state`).
+  - The previous final LoRA is kept as `<name>-step<N>[-final].safetensors`.
+  - The finished config is backed up as `configs/<name>_training.before_extend_<N>.toml`.
+  - With Prodigy (constant LR) training simply continues. With AdamW the cosine schedule is rebuilt for the new length (torch restores the schedule's position, not its length), so the LR jumps back up to where that schedule stands at the old step, then decays to 0 again.
+- **Block Swap (Low VRAM)** slider (0–26) — writes `blocks_to_swap`, which the Anima trainer already supported; the app defined the setting but never passed it. Anima 2B has 28 blocks and sd-scripts allows swapping up to `num_blocks - 2`.
+- **Multiple preview prompts** — one per line in the prompt box, each prefixed with the trigger. Previously newlines were joined into a single prompt.
+- **Checkpoint Grid tab** — composites every preview into a steps × prompts image (`<run>/checkpoint_grid.png`) and marks steps that saved a LoRA.
+- **Loss tab** — live chart of the moving-average loss parsed from the trainer's progress line. History is rebuilt from the run's logs, so it continues across halts, resumes and app restarts.
+- **🔎 Inspect Dataset**, which reports:
+  - missing, empty and orphaned captions
+  - unreadable, ≥2048px, <512px and EXIF-rotated images
+  - same-name clashes and repeated tags
+  - captions already containing the trigger
+  - the 20 most frequent tags, and tags present in every caption
+- Preview gallery captions show step and prompt.
+
+### Changed
+- **The trainer outlives the app.** It is launched in its own process group, with its own hidden console on Windows, and writes directly to `<run>/logs/train_*.log`, which the app tails.
+  - Closing the console window, a crash, or restarting `app.py` no longer ends a run.
+  - `<run>/trainer.json` records the process; on startup the app reattaches to a trainer that is still running. Reattaching checks the process start time as well as the PID, so a reused PID isn't mistaken for the trainer.
+  - Pause state, halt requests and loss history survive the reattach.
+- Bucketing, auto-captioning and inspection run as background jobs, so a page refresh doesn't interrupt them. One job runs at a time, and the status line shows it. Starting one while training warns that the GPU is shared.
+- If every caption already contains the trigger tag, no `caption_prefix` is added. When only some captions contain it, the app warns.
+- **↩ Resume Run** also considers the end-of-run resume point, so an interrupted Train More can be resumed.
+
+### Fixed
+- `.bmp` images: the tagger and the resolution scan skipped them, while pre-flight required captions for them. All tools now share sd-scripts' extension list.
+
+### Known limitations
+- **Untested on Windows:** the detached launch and reattach are tested on Linux only.
+  - On Windows they rely on `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`, and on accelerate's child process inheriting the log-file handles. Accelerate launches it with a plain `subprocess.Popen(cmd, env=...)`.
+  - After reattaching, the exit code may be unavailable. The outcome is then read from the log and the final LoRA's presence instead.
+- Two app instances started at once would both reattach to the same trainer.
+
 ## [v1.1.0-fork.1] - 2026-10-16
 
 Based on upstream commit `cf13c7b` (portable release v1.1.0).
@@ -42,4 +79,4 @@ Based on upstream commit `cf13c7b` (portable release v1.1.0).
 - A resumed run sees the dataset in a different order than an uninterrupted run would.
 - Resume points include the optimizer state and are considerably larger than a LoRA. sd-scripts also saves one when a run finishes, and a Halt resume point between save intervals is never pruned automatically; both are safe to delete.
 - A Halt pressed during latent caching takes effect after the first training step.
-- Bucketing and auto-captioning still run attached to the browser tab.
+- Bucketing and auto-captioning still run attached to the browser tab (fixed in v1.1.0-fork.2).

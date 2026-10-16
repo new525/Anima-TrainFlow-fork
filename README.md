@@ -61,11 +61,19 @@ If you prefer to set up the environment manually instead of using the portable v
 ## Fork Changes
 
 ### Training controls
-* **Refresh-safe training:** Training belongs to the app, not the browser tab. Refreshing, closing or opening a second tab no longer kills or hangs a run; any tab shows the live log, previews and status.
+* **Training survives the app:** The trainer runs as its own process and writes to its own log file. Refreshing or closing the browser tab, or closing and restarting the app itself, doesn't stop a run. A restarted app finds the running trainer and reattaches: log, previews, loss chart and status all continue.
 * **⏸ Pause / ▶ Continue:** Freezes the trainer in place and continues exactly where it stopped. VRAM stays allocated while paused, and a pause does not survive closing the app.
 * **💾 Halt & Save:** Finishes the current step, then saves a LoRA and a full resume point (weights, optimizer, scheduler, RNG, step) and exits, freeing the VRAM.
 * **↩ Resume Run:** Continues the newest unfinished run of the current keyword from its newest resume point, using the settings that run was started with.
 * **Resume points:** With *Save resume points with each checkpoint* on, a resume point is also saved with every checkpoint and the two newest are kept, so a crash costs at most one save interval.
+* **➕ Train More:** Continues the keyword's newest finished run up to the current *Training Steps* value, from its end-of-run resume point. The previous final LoRA is kept, renamed to its step.
+* **Block Swap (Low VRAM):** Keeps up to 26 of the DiT's 28 transformer blocks in system RAM. Each step is slower, but the model fits in less VRAM.
+
+### Choosing a checkpoint
+* **Multiple preview prompts:** Write one prompt per line; the trigger word is added to each.
+* **Checkpoint Grid tab:** Builds one image of every preview step × prompt, marking steps that saved a LoRA.
+* **Loss tab:** Live chart of the moving-average loss. It continues across halts, resumes and app restarts.
+* Previews are captioned with their step and prompt.
 
 ### Outputs
 * **One folder per run:** Each run gets `training/output/<keyword>/<date_time>/`, holding its LoRAs, `sample/`, `configs/`, `logs/` and resume points. Re-running a keyword never overwrites an earlier run. Non-Latin keywords keep their own folder.
@@ -77,6 +85,17 @@ If you prefer to set up the environment manually instead of using the portable v
   * Name clashes (`cat.jpg` + `cat.png`) abort before anything moves.
   * Unreadable files are reported instead of silently vanishing.
 * **Phone photos:** EXIF orientation is applied when bucketing and tagging, so portrait photos are cropped and tagged upright. Training warns about EXIF-rotated images it would otherwise learn sideways.
+
+### Dataset tools
+* **🔎 Inspect Dataset** reports problems before training:
+  * missing, empty or orphaned captions
+  * unreadable, oversized, small or EXIF-rotated images
+  * same-name clashes and repeated tags
+  * captions that already contain the trigger
+  * the 20 most frequent tags, and tags present in every caption
+* If every caption already contains the trigger, training doesn't add it again.
+* Bucketing, auto-captioning and inspection run in the background like training, so a refresh doesn't interrupt them. Progress shows in the log and the status line.
+* `.bmp` is handled consistently: the tagger used to skip it while training required a caption for it.
 
 ### Smaller fixes
 * The trigger word is prefixed as `trigger, tags` (was `trigger,  tags`).
