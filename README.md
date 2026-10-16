@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.2** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.2.1** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.2) |
+| | Upstream (v1.1.0) | This fork (1.2.1) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
@@ -78,7 +78,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 ### Updating
 * **git:** run `git pull`.
 * **Zip:** extract the new release, then copy the *contents* of its top folder over your existing install. The zip doesn't contain your settings (`training/settings.json`), runs (`training/output/`) or installed packages, so they are kept.
-* Re-run `Install_Requirements.bat` only if the changelog says dependencies changed.
+* Re-run `Install_Requirements.bat` when the changelog says dependencies changed. **1.2.1 changed one:** it updates Gradio.
 
 ---
 
@@ -144,7 +144,7 @@ See *Known limitations* in [CHANGELOG.md](CHANGELOG.md), and please open an issu
 
 ## Technical details
 * **Core:** a modified `sd-scripts` for the Anima architecture. This fork adds a halt-request hook and fixes the step count when resuming with gradient accumulation.
-* **UI:** Gradio 6.14. The trainer runs as a separate process launched with `accelerate launch`, and the UI follows its log file.
+* **UI:** Gradio 6.17.3 (the newest release compatible with sd-scripts' pinned `huggingface-hub==0.34.3`). The trainer runs as a separate process launched with `accelerate launch`, and the UI follows its log file.
 * **Defaults:** BF16, latent and text-encoder caching, and the Prodigy optimizer with a constant learning rate; AdamW uses a cosine schedule.
 * **Settings** are auto-saved to `training/settings.json`.
 

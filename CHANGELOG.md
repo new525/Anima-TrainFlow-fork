@@ -3,6 +3,25 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.2.1] - 2026-10-16
+
+**Updating from 1.2:** re-run `Install_Requirements.bat`, or run `python_embeded\python.exe -m pip install gradio==6.17.3`, so the new Gradio version is installed.
+
+### Fixed
+- **Switching tabs (Previews / Checkpoint Grid / Loss) froze, then crashed, the browser tab.**
+  - On Gradio 6.14.0 this app's page went into an endless Svelte update loop (`effect_update_depth_exceeded`, over 1,000 errors in seconds) on any tab switch, whether training or idle.
+  - The trigger was the page-load event that restores saved settings combined with the tabs. A trivial two-tab app doesn't show it.
+  - Reproduced in headless Chromium: the same app also fails on Gradio 6.15.2 and works on 6.17.3 and 6.30.0.
+- Gradio is now pinned to **6.17.3**. From 6.18.0 on, Gradio requires `huggingface-hub>=1.2`, which conflicts with sd-scripts' pinned `huggingface-hub==0.34.3`.
+
+### Verified on 6.17.3
+- On Python 3.10:
+  - the end-to-end and bucketing test suites;
+  - in the browser: switching between all three tabs mid-run;
+  - the loss chart drawing and updating;
+  - previews;
+  - settings still restored after a page refresh.
+
 ## [1.2] - 2026-10-16
 
 ### Documentation
