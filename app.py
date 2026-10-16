@@ -98,6 +98,7 @@ LOG_BLACKLIST = [
 
 
 LOG_BOX__MAX_LINES = 16
+POLL_INTERVAL = 1.0  # seconds between UI refreshes of the log and preview gallery
 GALLERY_HEIGHT = 440
 MAX_LOG_LINES = 500
 
@@ -112,10 +113,190 @@ SETTINGS_FILE = TRAIN_BASE / "settings.json"
 TRAIN_DIR = TRAIN_BASE / "sd-scripts" 
 TRAIN_SCRIPT = TRAIN_DIR / "anima_train_network.py"
 
-training_process = None
-
 for d in [TRAIN_BASE, OUTPUT_BASE]:
     d.mkdir(parents=True, exist_ok=True)
+
+
+# ==========================================
+# SERVER-SIDE CONSOLE
+# The log lives here, not in the browser. Every browser tab just displays it,
+# so a page refresh (or a second tab) shows the same log instead of losing it.
+# ==========================================
+TQDM_RE = re.compile(r"^(?P<desc>.*?)\s*\d+%\|")
+
+
+class Console:
+    def __init__(self, max_lines: int = MAX_LOG_LINES) -> None:
+        self._lines: List[str] = []
+        self._lock = threading.Lock()
+        self._max_lines = max_lines
+        self.version = 0
+
+    def _trim(self) -> None:
+        if len(self._lines) > self._max_lines:
+            del self._lines[:-self._max_lines]
+
+    def clear(self) -> None:
+        with self._lock:
+            self._lines.clear()
+            self.version += 1
+
+    def append(self, line: str) -> None:
+        with self._lock:
+            self._lines.append(line)
+            self._trim()
+            self.version += 1
+
+    def extend(self, lines: List[str]) -> None:
+        with self._lock:
+            self._lines.extend(lines)
+            self._trim()
+            self.version += 1
+
+    def replace_last_if(self, line: str, marker: str) -> None:
+        """Overwrite the last line if it contains `marker`, otherwise append (used for in-place progress)."""
+        with self._lock:
+            if self._lines and marker in self._lines[-1]:
+                self._lines[-1] = line
+            else:
+                self._lines.append(line)
+                self._trim()
+            self.version += 1
+
+    def add_process_line(self, line: str) -> None:
+        """Append a subprocess line, collapsing successive refreshes of the same tqdm bar into one line."""
+        m = TQDM_RE.match(line)
+        with self._lock:
+            if m and self._lines:
+                prev = TQDM_RE.match(self._lines[-1])
+                if prev and prev.group("desc") == m.group("desc"):
+                    self._lines[-1] = line
+                    self.version += 1
+                    return
+            self._lines.append(line)
+            self._trim()
+            self.version += 1
+
+    def text(self) -> str:
+        with self._lock:
+            return "\n".join(self._lines)
+
+    def snapshot(self) -> Tuple[int, str]:
+        with self._lock:
+            return self.version, "\n".join(self._lines)
+
+
+console = Console()
+
+
+# ==========================================
+# TRAINING MANAGER
+# Owns the trainer subprocess for the lifetime of the app, independent of any
+# browser session. A background thread drains the trainer's output continuously;
+# if nothing read it, the trainer would block on a full pipe and hang.
+# ==========================================
+class TrainingManager:
+    def __init__(self, console: Console) -> None:
+        self.console = console
+        self._lock = threading.Lock()
+        self._proc: subprocess.Popen | None = None
+        self._stop_requested = False
+        self.state = "idle"  # idle | running | stopping | finished | stopped | failed
+        self.sample_dir: Path | None = None
+        self.started_at = 0.0
+        self.log_path: Path | None = None
+
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._proc is not None and self._proc.poll() is None
+
+    def gallery_source(self) -> Tuple[Path | None, float]:
+        with self._lock:
+            return self.sample_dir, self.started_at
+
+    def start(self, cmd: List[str], cwd: Path, env: dict, sample_dir: Path, log_path: Path) -> bool:
+        with self._lock:
+            if self._proc is not None and self._proc.poll() is None:
+                return False
+            self._stop_requested = False
+            self.sample_dir = sample_dir
+            self.started_at = time.time()
+            self.log_path = log_path
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            proc = subprocess.Popen(
+                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1,
+                cwd=str(cwd), env=env, encoding="utf-8", errors="ignore",
+            )
+            self._proc = proc
+            self.state = "running"
+        threading.Thread(target=self._pump, args=(proc, log_path), daemon=True, name="train-log-pump").start()
+        return True
+
+    def _pump(self, proc: subprocess.Popen, log_path: Path) -> None:
+        log_file = None
+        try:
+            log_file = open(log_path, "a", encoding="utf-8")
+        except OSError as e:
+            self.console.append(f"⚠️ Could not open log file {log_path}: {e}")
+        try:
+            for raw in iter(proc.stdout.readline, ""):
+                line = raw.replace('\r', '').strip()
+                if not line:
+                    continue
+                if log_file:
+                    log_file.write(line + "\n")
+                    log_file.flush()
+                if any(skip_word in line for skip_word in LOG_BLACKLIST):
+                    continue
+                self.console.add_process_line(line)
+        except Exception as e:
+            self.console.append(f"⚠️ Log reader error: {e}")
+        finally:
+            rc = proc.wait()
+            if log_file:
+                log_file.close()
+            with self._lock:
+                stopped = self._stop_requested
+                if self._proc is proc:
+                    self._proc = None
+                if stopped:
+                    self.state, msg = "stopped", "🛑 Training stopped by user."
+                elif rc == 0:
+                    self.state, msg = "finished", "✅ Training finished."
+                else:
+                    self.state, msg = "failed", f"❌ Trainer exited with code {rc}. Full log: {log_path}"
+            self.console.append(msg)
+
+    def stop(self) -> str:
+        with self._lock:
+            proc = self._proc
+            if proc is None or proc.poll() is not None:
+                return "ℹ️ Not running."
+            self._stop_requested = True
+            self.state = "stopping"
+        try:
+            parent = psutil.Process(proc.pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try: child.terminate()
+                except psutil.NoSuchProcess: pass
+            _, alive = psutil.wait_procs(children, timeout=3)
+            for survivor in alive:
+                try: survivor.kill()
+                except psutil.NoSuchProcess: pass
+            parent.terminate()
+            try:
+                parent.wait(timeout=3)
+            except psutil.TimeoutExpired:
+                parent.kill()
+            return "🛑 Stopping training... (Clearing VRAM)"
+        except psutil.NoSuchProcess:
+            return "ℹ️ Process already finished."
+        except Exception as e:
+            return f"⚠️ Error during stop: {str(e)}"
+
+
+training_manager = TrainingManager(console)
 
 
 DEFAULT_SETTINGS = {
@@ -328,12 +509,21 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
     return str(config_path)
 
 
-def get_latest_images(sample_dir):
-    if not sample_dir.exists(): return []
+def get_latest_images(sample_dir, since: float = 0.0):
+    """Sample images in sample_dir, newest first. `since` hides images left over from earlier runs."""
+    if sample_dir is None or not sample_dir.exists(): return []
     images = glob.glob(str(sample_dir / "*.png")) + glob.glob(str(sample_dir / "*.jpg")) + glob.glob(str(sample_dir / "*.webp"))
-    images.sort(key=os.path.getmtime, reverse=True)
-    
-    return [(img, Path(img).name) for img in images]
+    stamped = []
+    for img in images:
+        try:
+            mtime = os.path.getmtime(img)
+        except OSError:
+            continue  # deleted between glob and stat
+        if mtime >= since - 1.0:
+            stamped.append((mtime, img))
+    stamped.sort(reverse=True)
+
+    return [(img, Path(img).name) for _, img in stamped]
 
 
 # ==========================================
@@ -429,13 +619,12 @@ def generate_bucket_summary(bucket_counts: dict) -> List[str]:
     lines.append("")
     return lines
 
-def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, current_logs: str) -> Generator[str, None, None]:
-    log_lines = current_logs.split('\n') if current_logs else []
+def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float) -> Generator[str, None, None]:
     path = Path(dataset_dir)
     
     if not dataset_dir or not path.exists():
-        log_lines.append("❌ Error: Dataset path invalid!")
-        yield "\n".join(log_lines)
+        console.append("❌ Error: Dataset path invalid!")
+        yield console.text()
         return
 
     backup_dir = path / "original_images"
@@ -443,8 +632,8 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, curren
     valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
 
     available_buckets = smart_cropper.get_valid_buckets(int(side_min), int(side_max))
-    log_lines.append(f"📋 Buckets configured: {len(available_buckets)}")
-    yield "\n".join(log_lines)
+    console.append(f"📋 Buckets configured: {len(available_buckets)}")
+    yield console.text()
 
     # 1. Move new original images
     for f in path.glob('*'):
@@ -480,16 +669,16 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, curren
         except Exception: continue
 
     if not tasks:
-        log_lines.append(f"✅ All {skipped} images are already bucketed correctly.")
-        log_lines.extend(generate_bucket_summary(bucket_counts))
-        yield "\n".join(log_lines)
+        console.append(f"✅ All {skipped} images are already bucketed correctly.")
+        console.extend(generate_bucket_summary(bucket_counts))
+        yield console.text()
         return
 
     # 3. Multi-threaded inference
     try:
-        log_lines.append(f"🚀 Model: {smart_cropper.load_model()}")
-        log_lines.append(f"⚙️ Processing {len(tasks)} images (Skipped: {skipped})...")
-        yield "\n".join(log_lines)
+        console.append(f"🚀 Model: {smart_cropper.load_model()}")
+        console.append(f"⚙️ Processing {len(tasks)} images (Skipped: {skipped})...")
+        yield console.text()
 
         processed = 0
         lock = threading.Lock()
@@ -516,22 +705,21 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, curren
             
             for future in as_completed(futures):
                 err = future.result()
-                if err: log_lines.append(err)
+                if err: console.append(err)
                 
                 if processed % 5 == 0 or processed == len(tasks):
                     msg = f"🔄 Progress: {processed}/{len(tasks)}"
-                    if "Progress:" in log_lines[-1]: log_lines[-1] = msg
-                    else: log_lines.append(msg)
-                    yield "\n".join(log_lines)
+                    console.replace_last_if(msg, "Progress:")
+                    yield console.text()
 
-        log_lines.append(f"✅ Done! Processed: {processed}")
+        console.append(f"✅ Done! Processed: {processed}")
         
     except Exception as e:
-        log_lines.append(f"❌ Error: {str(e)}")
+        console.append(f"❌ Error: {str(e)}")
     finally:
         smart_cropper.unload_model()
-        log_lines.extend(generate_bucket_summary(bucket_counts))
-        yield "\n".join(log_lines)
+        console.extend(generate_bucket_summary(bucket_counts))
+        yield console.text()
 
 
 # ==========================================
@@ -624,12 +812,11 @@ wd_tagger = WDTagger()
 # GUI EXECUTOR FUNCTIONS
 # ==========================================
 
-def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, current_logs):
-    log_lines = current_logs.split('\n') if current_logs else []
+def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
     
     if not dataset_dir or not os.path.exists(dataset_dir):
-        log_lines.append("❌ Tagger Error: Dataset path invalid!")
-        yield "\n".join(log_lines)
+        console.append("❌ Tagger Error: Dataset path invalid!")
+        yield console.text()
         return
 
     valid_exts = {'.png', '.jpg', '.jpeg', '.webp'}
@@ -644,23 +831,23 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, current_lo
             image_files.append(f)
 
     if not image_files and skipped == 0:
-        log_lines.append("❌ Tagger Error: No images found!")
-        yield "\n".join(log_lines)
+        console.append("❌ Tagger Error: No images found!")
+        yield console.text()
         return
         
     if not image_files and skipped > 0:
-        log_lines.append(f"ℹ️ All images already have captions. Skipped: {skipped}")
-        yield "\n".join(log_lines)
+        console.append(f"ℹ️ All images already have captions. Skipped: {skipped}")
+        yield console.text()
         return
 
-    log_lines.append(f"🏷️ Initializing WD-Tagger (Multi-threaded)...")
-    yield "\n".join(log_lines)
+    console.append(f"🏷️ Initializing WD-Tagger (Multi-threaded)...")
+    yield console.text()
     
     try:
         mode = wd_tagger.load_model()
-        log_lines.append(f"🚀 Model loaded using: {mode}")
-        log_lines.append(f"⚙️ Processing {len(image_files)} images in 4 threads... (Skipped: {skipped})")
-        yield "\n".join(log_lines)
+        console.append(f"🚀 Model loaded using: {mode}")
+        console.append(f"⚙️ Processing {len(image_files)} images in 4 threads... (Skipped: {skipped})")
+        yield console.text()
 
         processed_count = 0
         total_to_process = len(image_files)
@@ -684,37 +871,35 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, current_lo
             
             for future in as_completed(futures):
                 error_msg = future.result()
-                if error_msg: log_lines.append(error_msg)
+                if error_msg: console.append(error_msg)
                 
                 if processed_count % 5 == 0 or processed_count == total_to_process:
                     msg = f"🔄 Tag Progress: {processed_count}/{total_to_process} images."
-                    if "Tag Progress:" in log_lines[-1]: log_lines[-1] = msg
-                    else: log_lines.append(msg)
-                    yield "\n".join(log_lines)
+                    console.replace_last_if(msg, "Tag Progress:")
+                    yield console.text()
 
-        log_lines.append(f"✅ Tagging complete! Processed: {processed_count} | Skipped: {skipped}")
+        console.append(f"✅ Tagging complete! Processed: {processed_count} | Skipped: {skipped}")
         
     except Exception as e:
-        log_lines.append(f"❌ Critical Tagger Error: {str(e)}")
+        console.append(f"❌ Critical Tagger Error: {str(e)}")
         
     finally:
         wd_tagger.unload_model()
-        log_lines.append("🧹 VRAM cleared.")
-        yield "\n".join(log_lines)
+        console.append("🧹 VRAM cleared.")
+        yield console.text()
 
 
-def open_dataset_folder_ui(dataset_dir, current_logs):
-    log_lines = current_logs.split('\n') if current_logs else []
+def open_dataset_folder_ui(dataset_dir):
     if not dataset_dir or not os.path.exists(dataset_dir):
-        log_lines.append("❌ Error: Dataset path invalid or empty!")
-        return "\n".join(log_lines)
+        console.append("❌ Error: Dataset path invalid or empty!")
+        return console.text()
     
     target_dir = Path(dataset_dir)
     if platform.system() == "Windows": os.startfile(target_dir)
     else: subprocess.Popen(["xdg-open", str(target_dir)])
     
-    log_lines.append(f"📁 Opened Dataset folder.")
-    return "\n".join(log_lines)
+    console.append(f"📁 Opened Dataset folder.")
+    return console.text()
 
 
 # ==========================================
@@ -722,7 +907,11 @@ def open_dataset_folder_ui(dataset_dir, current_logs):
 # ==========================================
 
 def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc):
-    global training_process
+    """Validate, write configs and hand the run to training_manager. Returns immediately;
+    the trainer keeps running regardless of what happens to the browser tab."""
+    if training_manager.is_running():
+        console.append("⚠️ Training is already running!")
+        return console.text()
 
     model_errors = []
     if not dit_p or not os.path.isfile(dit_p): model_errors.append(f"❌ DiT file not found: {dit_p}")
@@ -767,8 +956,8 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         if dataset_errors:
             full_error += "\n".join(dataset_errors)
             
-        yield full_error.strip(), gr.update()
-        return
+        console.extend(full_error.strip().split("\n"))
+        return console.text()
 
     if not torch.cuda.is_available():
         cuda_error = (
@@ -778,13 +967,9 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
             "- Training on CPU is extremely slow and is not supported by this script.\n\n"
             "Please update your NVIDIA drivers and restart the app."
         )
-        yield cuda_error, gr.update()
-        return
+        console.extend(cuda_error.split("\n"))
+        return console.text()
     
-    if training_process is not None and training_process.poll() is None:
-        yield "⚠️ Training is already running!", gr.update()
-        return
-
     project_name = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_') or "untitled"
 
     project_out_dir = OUTPUT_BASE / project_name
@@ -794,20 +979,20 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     for d in [project_out_dir, sample_dir, project_configs_dir]:
         d.mkdir(parents=True, exist_ok=True)
 
-    log_lines = [f"🚀 Preparing: {project_name}..."]
-    last_image_count = 0
-    step_pattern = re.compile(r"(\d+)/(\d+)") 
-    
-    yield "\n".join(log_lines), gr.update()
-
-    log_lines.append(f"🔍 Analyzing dataset images...")
+    console.clear()
+    console.append(f"🚀 Preparing: {project_name}...")
+    console.append(f"🔍 Analyzing dataset images...")
     base_res, max_bucket = analyze_dataset_resolution(dataset_path)
-    log_lines.append(f"📐 Auto-Resolution Set: Base {base_res}px, Max Bucket {max_bucket}px")
+    console.append(f"📐 Auto-Resolution Set: Base {base_res}px, Max Bucket {max_bucket}px")
 
-    models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
-    prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
-    dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc)
-    training_toml = create_training_toml(project_name, project_configs_dir, project_out_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc)
+    try:
+        models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
+        prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
+        dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc)
+        training_toml = create_training_toml(project_name, project_configs_dir, project_out_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc)
+    except Exception as e:
+        console.append(f"❌ Could not write training config: {e}")
+        return console.text()
 
     cmd = [
         str(PORTABLE_PYTHON.resolve()), "-m", "accelerate.commands.launch", "--num_processes=1", "--mixed_precision=bf16", "--dynamo_backend=no",
@@ -825,77 +1010,18 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     env["CUDA_VISIBLE_DEVICES"] = "0"
     env["ACCELERATE_USE_CPU"] = "False"
 
+    log_path = project_out_dir / "logs" / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    console.append(f"📝 Full log: {log_path}")
     try:
-        training_process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1, cwd=str(TRAIN_DIR.resolve()), env=env, encoding="utf-8", errors="ignore")
-        
-        for line in iter(training_process.stdout.readline, ""):
-            line_str = line.replace('\r', '').strip()
-            if not line_str: continue
-
-            if any(skip_word in line_str for skip_word in LOG_BLACKLIST): continue 
-
-            if "subprocess.CalledProcessError" in line_str and "returned non-zero exit status 15" in line_str:
-                log_lines.append("🛑 Interrupted by user.")
-                yield "\n".join(log_lines), gr.update()
-                break 
-
-            if "steps:" in line_str and "/" in line_str:
-                match = step_pattern.search(line_str)
-                if match:
-                    current_step_info = match.group(0)
-                    if log_lines and "steps:" in log_lines[-1] and current_step_info in log_lines[-1]:
-                        log_lines[-1] = line_str
-                    else:
-                        log_lines.append(line_str)
-                else:
-                    log_lines.append(line_str)
-            else:
-                log_lines.append(line_str)
-            
-            if len(log_lines) > MAX_LOG_LINES: del log_lines[:-MAX_LOG_LINES]
-
-            check_image = any(x in line_str.lower() for x in ["saved", "sample", "%|", "it/s", "s/it"])
-            if check_image:
-                current_images = get_latest_images(sample_dir)
-                if len(current_images) != last_image_count:
-                    last_image_count = len(current_images)
-                    yield "\n".join(log_lines), current_images
-                    continue
-
-            yield "\n".join(log_lines), gr.update()
-            
-        if training_process is not None:
-            training_process.wait()
-            
-        log_lines.append("✅ Process finished or stopped.")
-        yield "\n".join(log_lines), get_latest_images(sample_dir)
-        
+        if not training_manager.start(cmd, TRAIN_DIR.resolve(), env, sample_dir, log_path):
+            console.append("⚠️ Training is already running!")
     except Exception as e:
-        log_lines.append(f"❌ Error: {str(e)}")
-        yield "\n".join(log_lines), gr.update()
-    finally:
-        training_process = None
+        console.append(f"❌ Error: {str(e)}")
+    return console.text()
 
 def stop_training():
-    global training_process
-    if training_process is not None:
-        try:
-            parent = psutil.Process(training_process.pid)
-            for child in parent.children(recursive=True):
-                try: child.terminate()
-                except psutil.NoSuchProcess: pass
-            gone, alive = psutil.wait_procs(parent.children(recursive=True), timeout=3)
-            for survival in alive:
-                try: survival.kill()
-                except psutil.NoSuchProcess: pass
-            parent.terminate()
-            parent.wait(timeout=3)
-            return "🛑 Stopping training... (Clearing VRAM)"
-        except psutil.NoSuchProcess:
-            return "ℹ️ Process already finished."
-        except Exception as e:
-            return f"⚠️ Error during stop: {str(e)}"
-    return "ℹ️ Not running."
+    console.append(training_manager.stop())
+    return console.text()
 
 def open_output_folder(trigger_word):
     proj = re.sub(r'[^a-zA-Z0-9]', '_', trigger_word.strip()).strip('_')
@@ -903,7 +1029,20 @@ def open_output_folder(trigger_word):
     if not target_dir.exists(): target_dir = OUTPUT_BASE
     if platform.system() == "Windows": os.startfile(target_dir)
     else: subprocess.Popen(["xdg-open", str(target_dir)])
-    return "📁 Folder opened."
+    console.append("📁 Folder opened.")
+    return console.text()
+
+def poll_ui(seen):
+    """Timer callback: send the log / gallery only when they changed since this tab last saw them."""
+    seen = seen or {}
+    version, text = console.snapshot()
+    sample_dir, since = training_manager.gallery_source()
+    images = get_latest_images(sample_dir, since) if sample_dir is not None else []
+    gallery_sig = tuple(img for img, _ in images)
+
+    log_out = text if seen.get("log") != version else gr.skip()
+    gallery_out = images if seen.get("gallery") != gallery_sig else gr.skip()
+    return log_out, gallery_out, {"log": version, "gallery": gallery_sig}
 
 def handle_optimizer_change(opt, current_lr, saved_adam_lr):
     if opt == "Prodigy": return "1.0", current_lr
@@ -1005,6 +1144,14 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
 
     ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)    
 
+    # The log and gallery are pulled from the server every second rather than pushed by
+    # the Start handler, so a refreshed (or newly opened) tab picks up a run in progress.
+    poll_seen = gr.State(value=None)
+    poll_timer = gr.Timer(POLL_INTERVAL)
+    poll_outputs = [output_log, preview_gallery, poll_seen]
+    ui.load(fn=poll_ui, inputs=[poll_seen], outputs=poll_outputs)
+    poll_timer.tick(fn=poll_ui, inputs=[poll_seen], outputs=poll_outputs, show_progress="hidden", concurrency_limit=None)
+
     output_log.change(None, None, None, js=JS_SCROLL)
     optimizer_input.change(fn=handle_optimizer_change, inputs=[optimizer_input, lr_input, saved_adam_lr], outputs=[lr_input, saved_adam_lr])
     
@@ -1013,23 +1160,23 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
 
     crop_btn.click(
         fn=run_smart_crop_ui,
-        inputs=[dataset_path, side_min_input, side_max_input, output_log],
+        inputs=[dataset_path, side_min_input, side_max_input],
         outputs=[output_log]
     )
     
     open_ds_btn.click(
         fn=open_dataset_folder_ui,
-        inputs=[dataset_path, output_log],
+        inputs=[dataset_path],
         outputs=[output_log]
     )
     
     tagger_btn.click(
         fn=run_auto_tagging,
-        inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, output_log],
+        inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite],
         outputs=[output_log]
     )
     
-    start_btn.click(fn=start_training, inputs=training_inputs, outputs=[output_log, preview_gallery])
+    start_btn.click(fn=start_training, inputs=training_inputs, outputs=[output_log])
     stop_btn.click(fn=stop_training, outputs=output_log)
     folder_btn.click(fn=open_output_folder, inputs=[trigger_word], outputs=output_log)
 
