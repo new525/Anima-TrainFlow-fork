@@ -90,6 +90,9 @@ function() {
 """
 
 
+# Image types sd-scripts trains on (library/train_util.py IMAGE_EXTENSIONS); every tool uses the same list.
+VALID_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+
 LOG_BLACKLIST = [
     "triton not found",
     "flop counting will not work",
@@ -99,6 +102,7 @@ LOG_BLACKLIST = [
 
 LOG_BOX__MAX_LINES = 16
 POLL_INTERVAL = 1.0  # seconds between UI refreshes of the log and preview gallery
+ANIMA_SWAPPABLE_BLOCKS = 26  # Anima 2B has 28 DiT blocks; sd-scripts allows swapping at most num_blocks - 2
 GALLERY_HEIGHT = 440
 MAX_LOG_LINES = 500
 
@@ -191,35 +195,116 @@ console = Console()
 
 # ==========================================
 # TRAINING MANAGER
-# Owns the trainer subprocess for the lifetime of the app, independent of any
-# browser session. A background thread drains the trainer's output continuously;
-# if nothing read it, the trainer would block on a full pipe and hang.
+# The trainer runs as an independent process: its own process group (no console
+# window on Windows), output written straight to <run>/logs/train_*.log. The app only
+# tails that file. So the trainer survives page refreshes AND closing or restarting the
+# app; <run>/trainer.json lets a restarted app find the running trainer and reattach.
 #
 # Pause  = suspend the trainer's process tree in place (instant; VRAM stays allocated).
 # Halt   = ask the trainer to save a LoRA + resumable state after the current step, then exit.
 # Resume = relaunch a halted (or crashed) run from its newest saved state.
 # ==========================================
 STEP_RE = re.compile(r"^steps:.*?\|\s*(\d+)/(\d+)")
+LOSS_RE = re.compile(r"avr_loss=([-+0-9.eE]+|nan|inf)")
+HALTED_RE = re.compile(r"HALTED at step (\d+)")
+TRAINER_MARKER = "trainer.json"
+
+if platform.system() == "Windows":
+    # Own process group (Ctrl+C in the app console doesn't reach it) and its own hidden console
+    # (closing the app console doesn't kill it). accelerate's child inherits that hidden console
+    # and the log-file handles.
+    DETACH_KWARGS = {"creationflags": getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+                                      | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+else:
+    DETACH_KWARGS = {"start_new_session": True}
+
+
+def iter_log_lines(chunks):
+    """Split raw trainer output into lines on \\n and \\r (tqdm redraws with \\r)."""
+    buf = b""
+    for chunk in chunks:
+        buf += chunk
+        buf = buf.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        *lines, buf = buf.split(b"\n")
+        for raw in lines:
+            yield raw.decode("utf-8", errors="ignore").strip()
+    if buf:
+        yield buf.decode("utf-8", errors="ignore").strip()
+
+
+def parse_losses(log_paths: List[Path]) -> List[Tuple[int, float]]:
+    """(step, moving-average loss) pairs from trainer logs, one per step (last value wins)."""
+    by_step: dict = {}
+    for lp in log_paths:
+        try:
+            with open(lp, "rb") as f:
+                for line in iter_log_lines(iter(lambda: f.read(1 << 20), b"")):
+                    m, lm = STEP_RE.match(line), LOSS_RE.search(line)
+                    if m and lm:
+                        try:
+                            by_step[int(m.group(1))] = float(lm.group(1))
+                        except ValueError:
+                            pass
+        except OSError:
+            continue
+    return sorted(by_step.items())
 
 
 class TrainingManager:
     def __init__(self, console: Console) -> None:
         self.console = console
         self._lock = threading.Lock()
-        self._proc: subprocess.Popen | None = None
+        self._popen: subprocess.Popen | None = None  # set when this app instance launched the trainer
+        self._ps: psutil.Process | None = None        # set for launched and reattached trainers
         self._stop_requested = False
         self._halt_requested = False
+        self._saw_halted = False
         self.state = "idle"  # idle | running | paused | halting | halted | stopping | stopped | finished | failed
         self.run_dir: Path | None = None
         self.sample_dir: Path | None = None
         self.gallery_since = 0.0
         self.log_path: Path | None = None
         self.halt_file: Path | None = None
+        self.output_name = ""
         self.step: Tuple[int, int] | None = None
+        self.losses: List[Tuple[int, float]] = []
+        self.loss_version = 0
+
+    # ---------- process helpers ----------
+    def _alive_locked(self) -> bool:
+        if self._popen is not None:
+            return self._popen.poll() is None
+        if self._ps is not None:
+            try:
+                return self._ps.is_running() and self._ps.status() != psutil.STATUS_ZOMBIE
+            except psutil.NoSuchProcess:
+                return False
+        return False
+
+    def _process_tree(self) -> List[psutil.Process]:
+        if self._ps is None or not self._alive_locked():
+            return []
+        try:
+            return [self._ps] + self._ps.children(recursive=True)
+        except psutil.NoSuchProcess:
+            return []
+
+    def _write_marker_locked(self) -> None:
+        if self.run_dir is None or self._ps is None:
+            return
+        data = {"pid": self._ps.pid, "create_time": self._ps.create_time(), "log_path": str(self.log_path),
+                "halt_file": str(self.halt_file), "gallery_since": self.gallery_since, "output_name": self.output_name,
+                "paused": self.state == "paused", "halt_requested": self._halt_requested}
+        try:
+            tmp = self.run_dir / (TRAINER_MARKER + ".part")
+            tmp.write_text(json.dumps(data, indent=1), encoding="utf-8")
+            os.replace(tmp, self.run_dir / TRAINER_MARKER)
+        except OSError:
+            pass
 
     def is_running(self) -> bool:
         with self._lock:
-            return self._proc is not None and self._proc.poll() is None
+            return self._alive_locked()
 
     def gallery_source(self) -> Tuple[Path | None, float]:
         with self._lock:
@@ -227,87 +312,186 @@ class TrainingManager:
 
     def snapshot(self) -> dict:
         with self._lock:
-            return {"state": self.state, "step": self.step, "run_dir": self.run_dir}
+            return {"state": self.state, "step": self.step, "run_dir": self.run_dir, "output_name": self.output_name}
+
+    def loss_snapshot(self) -> Tuple[int, List[Tuple[int, float]]]:
+        with self._lock:
+            return self.loss_version, list(self.losses)
+
+    # ---------- launch / reattach ----------
+    def _begin_locked(self, run_dir: Path, log_path: Path, halt_file: Path, gallery_since: float, output_name: str) -> None:
+        self._stop_requested = False
+        self._halt_requested = False
+        self._saw_halted = False
+        self.run_dir = run_dir
+        self.sample_dir = run_dir / "sample"  # sd-scripts writes samples to <output_dir>/sample
+        self.gallery_since = gallery_since
+        self.log_path = log_path
+        self.halt_file = halt_file
+        self.output_name = output_name
+        self.step = None
+        # loss history of this run so far (earlier logs, e.g. before a halt) so the chart continues
+        self.losses = parse_losses(sorted((run_dir / "logs").glob("*.log")))
+        self.loss_version += 1
 
     def start(self, cmd: List[str], cwd: Path, env: dict, run_dir: Path, log_path: Path, halt_file: Path,
-              gallery_since: float) -> bool:
+              gallery_since: float, output_name: str = "") -> bool:
         with self._lock:
-            if self._proc is not None and self._proc.poll() is None:
+            if self._alive_locked():
                 return False
             try:
                 halt_file.unlink()  # stale request from an earlier run must not halt this one at step 1
             except FileNotFoundError:
                 pass
             log_path.parent.mkdir(parents=True, exist_ok=True)
-            proc = subprocess.Popen(
-                cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True, bufsize=1,
-                cwd=str(cwd), env=env, encoding="utf-8", errors="ignore",
-            )
+            env = dict(env, PYTHONUNBUFFERED="1")  # the trainer writes to a file now: flush every line
+            with open(log_path, "ab") as log_handle:
+                popen = subprocess.Popen(cmd, stdout=log_handle, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                         cwd=str(cwd), env=env, **DETACH_KWARGS)
             # Only record the run once the process actually launched.
-            self._proc = proc
-            self._stop_requested = False
-            self._halt_requested = False
-            self.run_dir = run_dir
-            self.sample_dir = run_dir / "sample"  # sd-scripts writes samples to <output_dir>/sample
-            self.gallery_since = gallery_since
-            self.log_path = log_path
-            self.halt_file = halt_file
-            self.step = None
+            self._begin_locked(run_dir, log_path, halt_file, gallery_since, output_name)
+            self._popen = popen
+            self._ps = psutil.Process(popen.pid)
             self.state = "running"
-        threading.Thread(target=self._pump, args=(proc, log_path), daemon=True, name="train-log-pump").start()
+            self._write_marker_locked()
+        threading.Thread(target=self._tail, args=(log_path, 0), daemon=True, name="train-log-tail").start()
         return True
 
-    def _pump(self, proc: subprocess.Popen, log_path: Path) -> None:
-        log_file = None
-        try:
-            log_file = open(log_path, "a", encoding="utf-8")
-        except OSError as e:
-            self.console.append(f"⚠️ Could not open log file {log_path}: {e}")
-        try:
-            for raw in iter(proc.stdout.readline, ""):
-                line = raw.replace('\r', '').strip()
-                if not line:
-                    continue
-                if log_file:
-                    log_file.write(line + "\n")
-                    log_file.flush()
-                m = STEP_RE.match(line)
-                if m:
+    def reattach(self, output_base: Path) -> bool:
+        """Find a trainer that outlived a previous app instance and follow it again."""
+        for marker in sorted(output_base.glob(f"*/*/{TRAINER_MARKER}"), key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                data = json.loads(marker.read_text(encoding="utf-8"))
+                ps = psutil.Process(int(data["pid"]))
+                same = abs(ps.create_time() - float(data["create_time"])) < 1.0  # guard against PID reuse
+                alive = same and ps.is_running() and ps.status() != psutil.STATUS_ZOMBIE
+            except (OSError, ValueError, KeyError, psutil.Error):
+                alive = False
+            if not alive:
+                try: marker.unlink()
+                except OSError: pass
+                continue
+            run_dir = marker.parent
+            log_path = Path(data["log_path"])
+            with self._lock:
+                if self._alive_locked():
+                    return False
+                self._begin_locked(run_dir, log_path, Path(data["halt_file"]), float(data.get("gallery_since", 0.0)),
+                                   data.get("output_name", ""))
+                self._popen = None
+                self._ps = ps
+                self._halt_requested = bool(data.get("halt_requested"))
+                self.state = "paused" if data.get("paused") else ("halting" if self._halt_requested else "running")
+            self.console.clear()
+            self.console.append(f"🔌 Reattached to a training run that kept going while the app was closed: "
+                                f"{run_dir.parent.name}/{run_dir.name}")
+            # show recent history, then follow the file from its current end
+            try:
+                size = log_path.stat().st_size
+                with open(log_path, "rb") as f:
+                    f.seek(max(0, size - 256 * 1024))
+                    recent = f.read(size - f.tell())
+                for line in iter_log_lines([recent]):
+                    self._handle_line(line)
+            except OSError:
+                size = 0
+            threading.Thread(target=self._tail, args=(log_path, size), daemon=True, name="train-log-tail").start()
+            return True
+        return False
+
+    # ---------- output following ----------
+    def _handle_line(self, line: str) -> None:
+        if not line:
+            return
+        m = STEP_RE.match(line)
+        if m:
+            step = (int(m.group(1)), int(m.group(2)))
+            lm = LOSS_RE.search(line)
+            with self._lock:
+                self.step = step
+                if lm:
+                    try:
+                        loss = float(lm.group(1))
+                        last = self.losses[-1][0] if self.losses else -1
+                        if step[0] == last:      # tqdm redraws a step several times; keep the latest value
+                            self.losses[-1] = (step[0], loss)
+                            self.loss_version += 1
+                        elif step[0] > last:     # older steps (replayed after reattach) are already in the history
+                            self.losses.append((step[0], loss))
+                            self.loss_version += 1
+                    except ValueError:
+                        pass
+        if HALTED_RE.search(line):
+            with self._lock:
+                self._saw_halted = True
+        if any(skip_word in line for skip_word in LOG_BLACKLIST):
+            return
+        self.console.add_process_line(line)
+
+    def _tail(self, log_path: Path, offset: int) -> None:
+        def chunks():
+            try:
+                f = open(log_path, "rb")
+            except OSError as e:
+                self.console.append(f"⚠️ Could not open trainer log {log_path}: {e}")
+                return
+            with f:
+                f.seek(offset)
+                while True:
+                    data = f.read(65536)
+                    if data:
+                        yield data
+                        continue
                     with self._lock:
-                        self.step = (int(m.group(1)), int(m.group(2)))
-                if any(skip_word in line for skip_word in LOG_BLACKLIST):
-                    continue
-                self.console.add_process_line(line)
+                        alive = self._alive_locked()
+                    if not alive:
+                        rest = f.read()  # output written just before exit
+                        if rest:
+                            yield rest
+                        return
+                    time.sleep(0.2)
+        try:
+            for line in iter_log_lines(chunks()):
+                self._handle_line(line)
         except Exception as e:
             self.console.append(f"⚠️ Log reader error: {e}")
         finally:
-            rc = proc.wait()
-            if log_file:
-                log_file.close()
-            with self._lock:
-                if self._proc is proc:
-                    self._proc = None
-                step_txt = f"{self.step[0]}/{self.step[1]}" if self.step else "?"
-                if self._stop_requested:
-                    self.state, msg = "stopped", "🛑 Training stopped by user."
-                elif rc == 0 and self._halt_requested and self.step and self.step[0] < self.step[1]:
-                    self.state, msg = "halted", f"💾 Halted at step {step_txt}. LoRA and resume state saved — press ↩ Resume Run to continue."
-                elif rc == 0:
-                    self.state, msg = "finished", "✅ Training finished."
-                else:
-                    self.state, msg = "failed", f"❌ Trainer exited with code {rc}. Full log: {log_path}"
-            self.console.append(msg)
+            self._finish(log_path)
 
-    def _process_tree(self) -> List[psutil.Process]:
-        proc = self._proc
-        if proc is None or proc.poll() is not None:
-            return []
+    def _finish(self, log_path: Path) -> None:
+        rc = None
+        with self._lock:
+            popen, ps = self._popen, self._ps
         try:
-            parent = psutil.Process(proc.pid)
-            return [parent] + parent.children(recursive=True)
-        except psutil.NoSuchProcess:
-            return []
+            if popen is not None:
+                rc = popen.wait()
+            elif ps is not None:
+                rc = ps.wait(timeout=5)  # exit code when the OS provides it for a non-child; else None
+        except Exception:
+            rc = None
+        with self._lock:
+            final_lora = None
+            if self.run_dir is not None and self.output_name:
+                final_lora = self.run_dir / f"{self.output_name}.safetensors"
+            step_txt = f"{self.step[0]}/{self.step[1]}" if self.step else "?"
+            if self._stop_requested:
+                self.state, msg = "stopped", "🛑 Training stopped by user."
+            elif self._saw_halted and rc in (0, None):
+                self.state, msg = "halted", f"💾 Halted at step {step_txt}. LoRA and resume state saved — press ↩ Resume Run to continue."
+            elif rc == 0 or (rc is None and final_lora is not None and final_lora.exists()):
+                self.state, msg = "finished", "✅ Training finished."
+            elif rc is None:
+                self.state, msg = "failed", f"❌ Trainer ended without a final LoRA (exit code unavailable). Full log: {log_path}"
+            else:
+                self.state, msg = "failed", f"❌ Trainer exited with code {rc}. Full log: {log_path}"
+            if self.run_dir is not None:
+                try: (self.run_dir / TRAINER_MARKER).unlink()
+                except OSError: pass
+            self._popen = None
+            self._ps = None
+        self.console.append(msg)
 
+    # ---------- controls ----------
     def pause(self) -> str:
         with self._lock:
             if self.state != "running":
@@ -319,6 +503,7 @@ class TrainingManager:
                 try: p.suspend()
                 except psutil.NoSuchProcess: pass
             self.state = "paused"
+            self._write_marker_locked()
         return "⏸ Paused. GPU work is frozen but VRAM stays allocated. Press ▶ Continue to carry on."
 
     def _unpause_locked(self) -> None:
@@ -332,6 +517,7 @@ class TrainingManager:
                 return "ℹ️ Not paused."
             self._unpause_locked()
             self.state = "running"
+            self._write_marker_locked()
         return "▶ Continuing."
 
     def halt(self) -> str:
@@ -349,19 +535,19 @@ class TrainingManager:
                 return f"⚠️ Could not request halt: {e}"
             self._halt_requested = True
             self.state = "halting"
+            self._write_marker_locked()
         return "💾 Halt requested: finishing the current step, then saving the LoRA and resume state..."
 
     def stop(self) -> str:
         with self._lock:
-            proc = self._proc
-            if proc is None or proc.poll() is not None:
+            if not self._alive_locked() or self._ps is None:
                 return "ℹ️ Not running."
             if self.state == "paused":
                 self._unpause_locked()  # a suspended process can't act on terminate
             self._stop_requested = True
             self.state = "stopping"
+            parent = self._ps
         try:
-            parent = psutil.Process(proc.pid)
             children = parent.children(recursive=True)
             for child in children:
                 try: child.terminate()
@@ -383,6 +569,52 @@ class TrainingManager:
 
 
 training_manager = TrainingManager(console)
+
+
+# ==========================================
+# BACKGROUND TOOL JOBS
+# Bucketing, tagging and dataset inspection run in a background thread, like training,
+# so a page refresh doesn't cut them off. Their progress goes to the shared console.
+# ==========================================
+class ToolRunner:
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.current: str | None = None
+
+    def start(self, name: str, gen_fn, *args) -> str:
+        with self._lock:
+            if self.current is not None:
+                return f"⚠️ {self.current} is still running; wait for it to finish."
+            self.current = name
+
+        def run():
+            try:
+                for _ in gen_fn(*args):
+                    pass
+            except Exception as e:
+                console.append(f"❌ {name} crashed: {e}")
+            finally:
+                with self._lock:
+                    self.current = None
+
+        threading.Thread(target=run, daemon=True, name=f"tool-{name}").start()
+        return ""
+
+    def busy(self) -> str | None:
+        with self._lock:
+            return self.current
+
+
+tool_runner = ToolRunner()
+
+
+def start_tool(name: str, gen_fn, *args) -> str:
+    if training_manager.is_running():
+        console.append(f"⚠️ Training is running: {name} will share the GPU with it and may run out of VRAM.")
+    msg = tool_runner.start(name, gen_fn, *args)
+    if msg:
+        console.append(msg)
+    return console.text()
 
 
 # ==========================================
@@ -447,7 +679,7 @@ def find_resume_point(project_dir: Path) -> dict | None:
         if (run_dir / f"{cfg.get('output_name', '')}.{cfg.get('save_model_as', 'safetensors')}").exists():
             return None
         best = None
-        for state_dir in run_dir.glob("*-step*-state"):
+        for state_dir in run_dir.glob("*-state"):  # step states and the end-of-run <name>-state
             step = read_state_step(state_dir)
             if step is not None and step < max_steps and (best is None or step > best[0]):
                 best = (step, state_dir)
@@ -515,7 +747,8 @@ DEFAULT_SETTINGS = {
     "tagger_gen_thresh": 0.35,
     "tagger_char_thresh": 0.85,
     "tagger_overwrite": False,
-    "save_resume_state": True,  # keep this last: settings are zipped with the UI components in order
+    "save_resume_state": True,
+    "blocks_to_swap": 0,  # keep new keys at the end: settings are zipped with the UI components in order
 }
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
@@ -557,7 +790,6 @@ HIDDEN_SETTINGS = {
     "persistent_data_loader_workers": True,
     "max_grad_norm": 1.0,
     "vae_batch_size": 1,
-    "blocks_to_swap": 0,
     "sigmoid_scale": 1.3,
 }
 
@@ -566,7 +798,7 @@ def analyze_dataset_resolution(dataset_path: str) -> Tuple[int, int]:
     path = Path(dataset_path)
     if not path.exists(): return 512, 768
 
-    valid_exts = {'.png', '.jpg', '.jpeg', '.webp'}
+    valid_exts = VALID_IMAGE_EXTS
     image_files = [f for f in path.glob('*') if f.is_file() and f.suffix.lower() in valid_exts]
     if not image_files: return 512, 768
 
@@ -592,25 +824,27 @@ def analyze_dataset_resolution(dataset_path: str) -> Tuple[int, int]:
 def create_sample_prompts(project_name, trigger_word, pos_prompt, neg_prompt, width, height, steps_gen, cfg, seed, out_dir):
     prompt_path = out_dir / f"{project_name}_prompts.txt"
     trigger = trigger_word.strip()
-    user_prompt = pos_prompt.strip().replace("\n", " ")
-    
-    if trigger and not user_prompt.startswith(trigger):
-        actual_pos = f"{trigger}, {user_prompt}" if user_prompt else trigger
-    else:
-        actual_pos = user_prompt if user_prompt else trigger
+    # One preview prompt per line (sd-scripts reads the file line by line; '#' lines are comments).
+    user_prompts = [line.strip() for line in (pos_prompt or "").splitlines() if line.strip()] or [""]
 
     actual_neg = neg_prompt.strip().replace("\n", " ")
-    prompt_str = f"{actual_pos} --n {actual_neg} --w {int(width)} --h {int(height)} --l {float(cfg)} --s {int(steps_gen)} --d {int(seed)}"
-    with open(prompt_path, "w", encoding="utf-8") as f: f.write(prompt_str)
+    lines = []
+    for user_prompt in user_prompts:
+        if trigger and not user_prompt.startswith(trigger):
+            actual_pos = f"{trigger}, {user_prompt}" if user_prompt else trigger
+        else:
+            actual_pos = user_prompt if user_prompt else trigger
+        lines.append(f"{actual_pos} --n {actual_neg} --w {int(width)} --h {int(height)} --l {float(cfg)} --s {int(steps_gen)} --d {int(seed)}")
+    with open(prompt_path, "w", encoding="utf-8") as f: f.write("\n".join(lines) + "\n")
     return str(prompt_path)
 
-def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, out_dir, max_steps, batch_size, grad_acc):
+def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, out_dir, max_steps, batch_size, grad_acc, add_prefix=True):
     config_path = out_dir / f"{project_name}_dataset.toml"
     # sd-scripts builds `caption_prefix + " " + caption`, so no trailing space here ("trigger, tags", not "trigger,  tags")
-    prefix = f"{trigger_word.strip()}," if trigger_word.strip() else None
+    prefix = f"{trigger_word.strip()}," if trigger_word.strip() and add_prefix else None
 
     path = Path(dataset_path)
-    valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+    valid_exts = VALID_IMAGE_EXTS
     num_images = len([f for f in path.glob('*') if f.is_file() and f.suffix.lower() in valid_exts])
 
     if num_images == 0: num_images = 1
@@ -643,7 +877,7 @@ def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_
         toml.dump(dataset_config, f)
     return str(config_path)
 
-def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_request_file, save_resume_state):
+def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_request_file, save_resume_state, blocks_to_swap=0):
     config_path = config_save_dir / f"{project_name}_training.toml"
 
     network_rank = int(rank)
@@ -706,6 +940,9 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
             training_config["save_last_n_steps_state"] = int(save_steps)
     if int(sample_steps) > 0:
         training_config["sample_every_n_steps"] = int(sample_steps)
+    if int(blocks_to_swap or 0) > 0:
+        # Low VRAM: keep this many of the DiT's transformer blocks in system RAM and stream them in (slower).
+        training_config["blocks_to_swap"] = int(blocks_to_swap)
     with open(config_path, "w", encoding="utf-8") as f: toml.dump(training_config, f)
     return str(config_path)
 
@@ -724,7 +961,10 @@ def get_latest_images(sample_dir, since: float = 0.0):
             stamped.append((mtime, img))
     stamped.sort(reverse=True)
 
-    return [(img, Path(img).name) for _, img in stamped]
+    def caption(img):
+        m = SAMPLE_NAME_RE.search(Path(img).name)
+        return f"step {int(m.group(1))} · prompt {int(m.group(2)) + 1}" if m else Path(img).name
+    return [(img, caption(img)) for _, img in stamped]
 
 
 # ==========================================
@@ -890,7 +1130,7 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float) -> Gen
         return
 
     backup_dir = path / "original_images"
-    valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+    valid_exts = VALID_IMAGE_EXTS
 
     available_buckets = smart_cropper.get_valid_buckets(int(side_min), int(side_max))
     console.append(f"📋 Buckets configured: {len(available_buckets)}")
@@ -1145,7 +1385,7 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
         yield console.text()
         return
 
-    valid_exts = {'.png', '.jpg', '.jpeg', '.webp'}
+    valid_exts = VALID_IMAGE_EXTS
     all_files = [f for f in Path(dataset_dir).glob('*') if f.is_file() and f.suffix.lower() in valid_exts]
     
     image_files = []
@@ -1216,6 +1456,21 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
         yield console.text()
 
 
+def start_bucketing(dataset_dir, side_min, side_max):
+    return start_tool("Bucketing", run_smart_crop_ui, dataset_dir, side_min, side_max)
+
+
+def start_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
+    return start_tool("Auto-captioning", run_auto_tagging, dataset_dir, gen_thresh, char_thresh, overwrite)
+
+
+def start_inspect(dataset_dir, trigger_word):
+    msg = tool_runner.start("Dataset inspection", inspect_dataset, dataset_dir, trigger_word)
+    if msg:
+        console.append(msg)
+    return console.text()
+
+
 def open_dataset_folder_ui(dataset_dir):
     if not dataset_dir or not os.path.exists(dataset_dir):
         console.append("❌ Error: Dataset path invalid or empty!")
@@ -1233,7 +1488,340 @@ def open_dataset_folder_ui(dataset_dir):
 # TRAINING FUNCTIONS
 # ==========================================
 
-def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, save_resume_state):
+# ==========================================
+# CAPTIONS / DATASET INSPECTOR
+# ==========================================
+def split_tags(caption: str) -> List[str]:
+    return [t.strip() for t in caption.replace("\n", ",").split(",") if t.strip()]
+
+
+def trigger_caption_counts(dataset_dir: str, trigger_word: str) -> Tuple[int, int]:
+    """(captions that already contain the trigger as a tag, captions read)."""
+    trig = trigger_word.strip().lower()
+    path = Path(dataset_dir) if dataset_dir else None
+    if not trig or path is None or not path.is_dir():
+        return 0, 0
+    with_trigger = total = 0
+    for img in path.iterdir():
+        if img.is_file() and img.suffix.lower() in VALID_IMAGE_EXTS:
+            txt = img.with_suffix(".txt")
+            if txt.is_file():
+                total += 1
+                try:
+                    tags = [t.lower() for t in split_tags(txt.read_text(encoding="utf-8", errors="ignore"))]
+                except OSError:
+                    continue
+                if trig in tags:
+                    with_trigger += 1
+    return with_trigger, total
+
+
+def _examples(names: List[str], n: int = 5) -> str:
+    return ", ".join(names[:n]) + (f" … (+{len(names) - n})" if len(names) > n else "")
+
+
+def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None, None]:
+    path = Path(dataset_dir) if dataset_dir else None
+    if path is None or not path.is_dir():
+        console.append("❌ Inspect: Dataset path invalid!")
+        yield console.text()
+        return
+    console.append(f"🔎 Inspecting {path} ...")
+    yield console.text()
+
+    images = sorted(f for f in path.iterdir() if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTS)
+    stems = {f.stem for f in images}
+    txts = sorted(f for f in path.iterdir() if f.is_file() and f.suffix.lower() == ".txt")
+    missing = [f.name for f in images if not f.with_suffix(".txt").is_file()]
+    orphans = [f.name for f in txts if f.stem not in stems]
+    stem_clash = sorted({f.stem for f in images if sum(1 for g in images if g.stem == f.stem) > 1})
+
+    trig = trigger_word.strip().lower()
+    tag_counts: dict = {}
+    empty, dup_tags, with_trigger, n_caps, tags_total = [], [], 0, 0, 0
+    for img in images:
+        txt = img.with_suffix(".txt")
+        if not txt.is_file():
+            continue
+        try:
+            tags = split_tags(txt.read_text(encoding="utf-8", errors="ignore"))
+        except OSError:
+            continue
+        n_caps += 1
+        tags_total += len(tags)
+        if not tags:
+            empty.append(txt.name)
+        low = [t.lower() for t in tags]
+        if len(set(low)) != len(low):
+            dup_tags.append(txt.name)
+        if trig and trig in low:
+            with_trigger += 1
+        for t in set(low):
+            tag_counts[t] = tag_counts.get(t, 0) + 1
+
+    sizes, rotated, oversized, small, unreadable = [], [], [], [], []
+    for img in images:
+        try:
+            with Image.open(img) as im:
+                w, h = oriented_size(im)
+                if exif_orientation(im) != 1:
+                    rotated.append(img.name)
+                if im.size[0] >= 2048 or im.size[1] >= 2048:
+                    oversized.append(img.name)
+            sizes.append((w, h))
+            if min(w, h) < 512:
+                small.append(img.name)
+        except Exception:
+            unreadable.append(img.name)
+
+    out = [f"📋 Images: {len(images)} | Captions: {n_caps} | Avg tags per caption: {tags_total / n_caps:.1f}" if n_caps
+           else f"📋 Images: {len(images)} | Captions: 0"]
+    if sizes:
+        out.append(f"📐 Short side {min(min(s) for s in sizes)}–{max(min(s) for s in sizes)}px, "
+                   f"long side {min(max(s) for s in sizes)}–{max(max(s) for s in sizes)}px")
+    problems = 0
+    def flag(cond, line):
+        nonlocal problems
+        if cond:
+            problems += 1
+            out.append(line)
+    flag(missing, f"❌ {len(missing)} image(s) without a caption: {_examples(missing)}")
+    flag(unreadable, f"❌ {len(unreadable)} image(s) can't be opened: {_examples(unreadable)}")
+    flag(stem_clash, f"❌ Same name with different extensions (captions are shared, bucketing refuses): {_examples(stem_clash)}")
+    flag(oversized, f"❌ {len(oversized)} image(s) are 2048px or larger (training refuses them): {_examples(oversized)}")
+    flag(empty, f"⚠️ {len(empty)} empty caption(s): {_examples(empty)}")
+    flag(orphans, f"⚠️ {len(orphans)} caption file(s) with no image: {_examples(orphans)}")
+    flag(rotated, f"⚠️ {len(rotated)} image(s) have an EXIF rotation sd-scripts ignores — bucket them first: {_examples(rotated)}")
+    flag(dup_tags, f"⚠️ {len(dup_tags)} caption(s) repeat a tag: {_examples(dup_tags)}")
+    flag(small, f"ℹ️ {len(small)} image(s) have a short side under 512px (trained at their own lower resolution): {_examples(small)}")
+    if trig and n_caps:
+        if with_trigger == n_caps:
+            out.append(f"ℹ️ Every caption already contains '{trigger_word.strip()}': training won't add it again.")
+        elif with_trigger:
+            problems += 1
+            out.append(f"⚠️ {with_trigger}/{n_caps} captions already contain '{trigger_word.strip()}' and will get it twice "
+                       f"(training adds it to every caption). Remove it from those, or add it to all of them.")
+    if tag_counts:
+        top = sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        everywhere = [t for t, c in top if c == n_caps and t != trig]
+        out.append(f"🏷️ {len(tag_counts)} distinct tags. Most frequent:")
+        for t, c in top[:20]:
+            out.append(f"   {c:>4} ({c * 100 // n_caps:>3}%)  {t}")
+        if everywhere:
+            out.append(f"ℹ️ In every caption: {_examples(everywhere, 10)} — tags present everywhere tend to get "
+                       f"absorbed into the trigger rather than stay promptable.")
+    out.append("✅ No problems found." if problems == 0 else f"🔎 Inspection done: {problems} thing(s) to look at.")
+    console.extend(out)
+    yield console.text()
+
+
+# ==========================================
+# CHECKPOINT COMPARISON
+# sd-scripts names previews <output_name>_<step:06d>_<prompt:02d>_<YYYYmmddHHMMSS>[_seed].png
+# ==========================================
+SAMPLE_NAME_RE = re.compile(r"_(\d{6})_(\d{2})_\d{14}(?:_\d+)?\.(?:png|jpg|webp)$", re.IGNORECASE)
+
+
+def collect_samples(sample_dir: Path | None) -> dict:
+    """{(step, prompt_index): newest image path}."""
+    found: dict = {}
+    if sample_dir is None or not sample_dir.is_dir():
+        return found
+    for p in sample_dir.iterdir():
+        m = SAMPLE_NAME_RE.search(p.name)
+        if not m:
+            continue
+        key = (int(m.group(1)), int(m.group(2)))
+        try:
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        if key not in found or mt > found[key][0]:
+            found[key] = (mt, p)
+    return {k: v[1] for k, v in found.items()}
+
+
+def run_dir_for_keyword(trigger_word: str) -> Path | None:
+    """The active run if it belongs to this keyword, else the keyword's newest run."""
+    project_dir = OUTPUT_BASE / project_folder_name(trigger_word)
+    snap = training_manager.snapshot()
+    if snap["run_dir"] is not None and snap["run_dir"].parent == project_dir and snap["run_dir"].exists():
+        return snap["run_dir"]
+    if project_dir.is_dir():
+        runs = sorted((d for d in project_dir.iterdir() if d.is_dir()), key=lambda d: d.name)
+        if runs:
+            return runs[-1]
+    return None
+
+
+def build_checkpoint_grid(run_dir: Path, max_rows: int = 40) -> Tuple[Path | None, str]:
+    samples = collect_samples(run_dir / "sample")
+    if not samples:
+        return None, f"ℹ️ No previews in {run_dir / 'sample'} yet."
+    steps = sorted({s for s, _ in samples})[-max_rows:]
+    prompts = sorted({i for _, i in samples})
+    try:
+        cfg = toml.load(str(sorted((run_dir / "configs").glob("*_training.toml"))[0]))
+        name = cfg.get("output_name", "")
+    except Exception:
+        name = ""
+    with Image.open(next(iter(samples.values()))) as first:
+        aspect = first.height / first.width
+    cell_w = 256
+    cell_h = max(64, int(cell_w * aspect))
+    label_w, header_h, pad = 150, 32, 6
+    W = label_w + len(prompts) * (cell_w + pad) + pad
+    H = header_h + len(steps) * (cell_h + pad) + pad
+    grid = Image.new("RGB", (W, H), (24, 26, 33))
+    from PIL import ImageDraw, ImageFont
+    draw = ImageDraw.Draw(grid)
+    try:
+        font, small_font = ImageFont.load_default(size=18), ImageFont.load_default(size=13)
+    except TypeError:  # Pillow < 10.1
+        font = small_font = ImageFont.load_default()
+    for c, idx in enumerate(prompts):
+        draw.text((label_w + pad + c * (cell_w + pad), 8), f"prompt {idx + 1}", fill=(220, 220, 230), font=font)
+    for r, step in enumerate(steps):
+        y = header_h + pad + r * (cell_h + pad)
+        draw.text((10, y + 6), f"step {step}", fill=(235, 235, 245), font=font)
+        if name and (run_dir / f"{name}-step{step:08d}.safetensors").exists():
+            draw.text((10, y + 30), "LoRA saved", fill=(158, 206, 106), font=small_font)
+        for c, idx in enumerate(prompts):
+            p = samples.get((step, idx))
+            if p is None:
+                continue
+            try:
+                with Image.open(p) as im:
+                    thumb = ImageOps.contain(im.convert("RGB"), (cell_w, cell_h))
+                grid.paste(thumb, (label_w + pad + c * (cell_w + pad), y))
+            except Exception:
+                continue
+    out = run_dir / "checkpoint_grid.png"
+    grid.save(out)
+    return out, f"🧮 Checkpoint grid: {len(steps)} step(s) × {len(prompts)} prompt(s) → {out}"
+
+
+def make_checkpoint_grid(trigger_word):
+    run_dir = run_dir_for_keyword(trigger_word)
+    if run_dir is None:
+        console.append(f"ℹ️ No runs for '{project_folder_name(trigger_word)}' yet.")
+        return gr.skip(), console.text()
+    try:
+        path, msg = build_checkpoint_grid(run_dir)
+    except Exception as e:
+        path, msg = None, f"❌ Could not build the grid: {e}"
+    console.append(msg)
+    return (str(path) if path else gr.skip()), console.text()
+
+
+def loss_frame(points: List[Tuple[int, float]], max_points: int = 600) -> pd.DataFrame:
+    if len(points) > max_points:
+        stride = math.ceil(len(points) / max_points)
+        points = points[::stride] + ([points[-1]] if (len(points) - 1) % stride else [])
+    return pd.DataFrame(points, columns=["step", "avg_loss"])
+
+
+# ==========================================
+# TRAIN MORE (extend a finished run)
+# ==========================================
+def find_extend_point(project_dir: Path) -> dict:
+    runs = sorted((d for d in project_dir.iterdir() if d.is_dir()), key=lambda d: d.name) if project_dir.is_dir() else []
+    if not runs:
+        return {"error": f"no runs for '{project_dir.name}' yet"}
+    run_dir = runs[-1]
+    tomls = sorted((run_dir / "configs").glob("*_training.toml"))
+    datasets = sorted((run_dir / "configs").glob("*_dataset.toml"))
+    if not tomls or not datasets:
+        return {"error": f"{run_dir.name} has no configs"}
+    try:
+        cfg = toml.load(str(tomls[0]))
+    except Exception as e:
+        return {"error": f"could not read {tomls[0].name}: {e}"}
+    name = cfg.get("output_name", "")
+    final = run_dir / f"{name}.safetensors"
+    if not final.exists():
+        return {"error": f"the newest run ({run_dir.name}) isn't finished — use ↩ Resume Run for it"}
+    state_dir = run_dir / f"{name}-state"  # sd-scripts' end-of-run state (save_state)
+    step = read_state_step(state_dir)
+    if step is None:
+        return {"error": f"{run_dir.name} has no end-of-run resume point (it was trained with resume points off)"}
+    return {"run_dir": run_dir, "state_dir": state_dir, "step": step, "max_steps": int(cfg.get("max_train_steps", step)),
+            "training_toml": tomls[0], "dataset_toml": datasets[0], "cfg": cfg, "name": name, "final": final}
+
+
+def extend_training(trigger_word, new_total):
+    """Continue the newest finished run of this keyword up to `new_total` steps, from its end-of-run state.
+    The previous final LoRA is kept (renamed to its step). Prodigy (constant LR) simply continues; with AdamW
+    the cosine schedule is re-evaluated over the new length, so the LR rises again and decays to 0 by the end."""
+    if training_manager.is_running():
+        console.append("⚠️ Training is already running!")
+        return console.text()
+    project_name = project_folder_name(trigger_word)
+    point = find_extend_point(OUTPUT_BASE / project_name)
+    if "error" in point:
+        console.append(f"ℹ️ Can't train more: {point['error']}.")
+        return console.text()
+    try:
+        new_total = int(new_total)
+    except (TypeError, ValueError):
+        new_total = 0
+    if new_total <= point["step"]:
+        console.append(f"ℹ️ Set Training Steps above {point['step']} (what {point['run_dir'].name} already trained), then press ➕ Train More.")
+        return console.text()
+    cfg = point["cfg"]
+    missing = [f"❌ Model file not found: {cfg.get(k)}" for k in ("pretrained_model_name_or_path", "qwen3", "vae") if not cfg.get(k) or not os.path.isfile(cfg.get(k))]
+    if missing:
+        console.extend(missing)
+        return console.text()
+    if not torch.cuda.is_available():
+        console.extend(CUDA_ERROR.split("\n"))
+        return console.text()
+
+    run_dir, name, old = point["run_dir"], point["name"], point["step"]
+    try:
+        # keep the config this run finished with, then raise the step target
+        backup = point["training_toml"].with_name(f"{name}_training.before_extend_{old}.toml")
+        if not backup.exists():
+            shutil.copy2(point["training_toml"], backup)
+        cfg["max_train_steps"] = new_total
+        with open(point["training_toml"], "w", encoding="utf-8") as f:
+            toml.dump(cfg, f)
+        # keep the old final LoRA; sd-scripts would overwrite <name>.safetensors at the new end
+        kept = run_dir / f"{name}-step{old:08d}.safetensors"
+        if kept.exists():
+            kept = run_dir / f"{name}-step{old:08d}-final.safetensors"
+        os.replace(point["final"], kept)
+        meta = run_dir / "run.json"
+        try:
+            info = json.loads(meta.read_text(encoding="utf-8")) if meta.exists() else {}
+        except Exception:
+            info = {}
+        info.setdefault("extensions", []).append({"from": old, "to": new_total, "at": time.strftime("%Y-%m-%d %H:%M:%S")})
+        info["max_train_steps"] = new_total
+        meta.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        console.append(f"❌ Could not prepare the run for more training: {e}")
+        return console.text()
+
+    halt_file = Path(cfg.get("halt_request_file") or (run_dir / ".halt_request"))
+    log_path = run_dir / "logs" / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log"
+    cmd = build_train_command(point["training_toml"], point["dataset_toml"],
+                              ("--resume", point["state_dir"].resolve().as_posix(), "--skip_until_initial_step"))
+    console.clear()
+    console.append(f"➕ Training {project_name} — run {run_dir.name} further: step {old} → {new_total}")
+    console.append(f"   Previous final LoRA kept as {kept.name}")
+    if str(cfg.get("lr_scheduler", "")) == "cosine":
+        console.append(f"   Cosine LR: the schedule is rebuilt for {new_total} steps, so the LR jumps back up to where that schedule is at step {old}, then decays to 0 again.")
+    console.append(f"📁 Run folder: {run_dir}")
+    try:
+        if not training_manager.start(cmd, TRAIN_DIR.resolve(), build_train_env(), run_dir, log_path, halt_file,
+                                      gallery_since=0.0, output_name=name):
+            console.append("⚠️ Training is already running!")
+    except Exception as e:
+        console.append(f"❌ Error: {str(e)}")
+    return console.text()
+
+def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, save_resume_state, blocks_to_swap=0):
     """Validate, write configs into a fresh run folder and hand the run to training_manager. Returns
     immediately; the trainer keeps running regardless of what happens to the browser tab."""
     if training_manager.is_running():
@@ -1250,7 +1838,7 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     if not dataset_path or not os.path.exists(dataset_path): 
         dataset_errors.append(f"❌ Dataset path not found: {dataset_path}")
     else:
-        valid_exts = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
+        valid_exts = VALID_IMAGE_EXTS
         dataset_path_obj = Path(dataset_path)
         image_files = [f for f in dataset_path_obj.glob('*') if f.is_file() and f.suffix.lower() in valid_exts]
         
@@ -1314,12 +1902,21 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     base_res, max_bucket = analyze_dataset_resolution(dataset_path)
     console.append(f"📐 Auto-Resolution Set: Base {base_res}px, Max Bucket {max_bucket}px")
 
+    with_trigger, n_caps = trigger_caption_counts(dataset_path, trigger_word)
+    add_prefix = not (n_caps > 0 and with_trigger == n_caps)
+    if not add_prefix:
+        console.append(f"ℹ️ Every caption already contains '{trigger_word.strip()}', so it isn't added a second time.")
+    elif with_trigger:
+        console.append(f"⚠️ {with_trigger}/{n_caps} captions already contain '{trigger_word.strip()}' and will get it twice. 🔎 Inspect Dataset lists them.")
+    if int(blocks_to_swap or 0) > 0:
+        console.append(f"🧊 Block swap: {int(blocks_to_swap)} of 28 blocks kept in system RAM (less VRAM, slower steps).")
+
     halt_file = run_dir / ".halt_request"
     try:
         models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
         prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
-        dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc)
-        training_toml = create_training_toml(project_name, project_configs_dir, run_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_file, save_resume_state)
+        dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc, add_prefix=add_prefix)
+        training_toml = create_training_toml(project_name, project_configs_dir, run_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_file, save_resume_state, blocks_to_swap)
         with open(run_dir / "run.json", "w", encoding="utf-8") as f:
             json.dump({"keyword": trigger_word.strip(), "output_name": project_name, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                        "dataset_path": str(dataset_path), "max_train_steps": int(t_steps)}, f, indent=2, ensure_ascii=False)
@@ -1334,7 +1931,7 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     console.append(f"📁 Run folder: {run_dir}")
     try:
         if not training_manager.start(build_train_command(training_toml, dataset_toml), TRAIN_DIR.resolve(), build_train_env(),
-                                      run_dir, log_path, halt_file, gallery_since=time.time()):
+                                      run_dir, log_path, halt_file, gallery_since=time.time(), output_name=project_name):
             console.append("⚠️ Training is already running!")
     except Exception as e:
         console.append(f"❌ Error: {str(e)}")
@@ -1378,7 +1975,8 @@ def resume_training(trigger_word):
     console.append(f"   State: {point['state_dir'].name}")
     console.append(f"📁 Run folder: {run_dir}")
     try:
-        if not training_manager.start(cmd, TRAIN_DIR.resolve(), build_train_env(), run_dir, log_path, halt_file, gallery_since=0.0):
+        if not training_manager.start(cmd, TRAIN_DIR.resolve(), build_train_env(), run_dir, log_path, halt_file, gallery_since=0.0,
+                                      output_name=cfg.get("output_name", "")):
             console.append("⚠️ Training is already running!")
     except Exception as e:
         console.append(f"❌ Error: {str(e)}")
@@ -1436,6 +2034,9 @@ def status_line(snap: dict) -> str:
         text += f" · step {snap['step'][0]}/{snap['step'][1]}"
     if snap["run_dir"] is not None:
         text += f" · {snap['run_dir'].parent.name}/{snap['run_dir'].name}"
+    job = tool_runner.busy()
+    if job:
+        text += f" · ⚙️ {job} running"
     return f"**Status:** {text}"
 
 
@@ -1450,11 +2051,15 @@ def poll_ui(seen):
     status = status_line(snap)
     pause_label = "▶ Continue" if snap["state"] == "paused" else "⏸ Pause"
 
+    loss_version, losses = training_manager.loss_snapshot()
+
     log_out = text if seen.get("log") != version else gr.skip()
     gallery_out = images if seen.get("gallery") != gallery_sig else gr.skip()
     status_out = status if seen.get("status") != status else gr.skip()
     pause_out = gr.update(value=pause_label) if seen.get("pause") != pause_label else gr.skip()
-    return log_out, gallery_out, status_out, pause_out, {"log": version, "gallery": gallery_sig, "status": status, "pause": pause_label}
+    loss_out = loss_frame(losses) if seen.get("loss") != loss_version else gr.skip()
+    return log_out, gallery_out, status_out, pause_out, loss_out, {"log": version, "gallery": gallery_sig, "status": status,
+                                                                   "pause": pause_label, "loss": loss_version}
 
 def handle_optimizer_change(opt, current_lr, saved_adam_lr):
     if opt == "Prodigy": return "1.0", current_lr
@@ -1465,6 +2070,9 @@ def handle_optimizer_change(opt, current_lr, saved_adam_lr):
 # UI BUILDER
 # ==========================================
 cs = load_settings()
+
+# A trainer that kept running while the app was closed is picked up again here.
+training_manager.reattach(OUTPUT_BASE)
 
 with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     gr.Markdown(
@@ -1493,6 +2101,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     stop_btn = gr.Button("🛑 Stop", variant="stop")
                 with gr.Row():
                     resume_btn = gr.Button("↩ Resume Run", variant="secondary")
+                    extend_btn = gr.Button("➕ Train More (to Training Steps)", variant="secondary")
                     folder_btn = gr.Button("📁 Checkpoint Folder", variant="secondary")
             with gr.Column(scale=1):
                 with gr.Row():
@@ -1507,8 +2116,12 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     sample_steps_input = gr.Number(label="Preview Every n Steps", value=cs.get("sample_steps", 300), precision=0)
                     grad_acc_input = gr.Number(label="Gradient Accumulation", value=cs.get("gradient_accumulation_steps", 1), precision=0)
                 with gr.Row():
+                    blocks_swap_input = gr.Slider(
+                        0, ANIMA_SWAPPABLE_BLOCKS, value=cs.get("blocks_to_swap", 0), step=1,
+                        label="Block Swap (Low VRAM): DiT blocks kept in system RAM — less VRAM, slower steps (0 = off)",
+                    )
                     save_resume_state_input = gr.Checkbox(
-                        label="Save resume points with each checkpoint (lets ↩ Resume Run recover after a crash; uses extra disk)",
+                        label="Save resume points with each checkpoint (crash recovery, ➕ Train More; uses extra disk)",
                         value=cs.get("save_resume_state", True),
                     )
 
@@ -1534,12 +2147,21 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                 with gr.Row():
                     tagger_btn = gr.Button("Create .txt captions", variant="secondary")        
                     tagger_overwrite = gr.Checkbox(label="Overwrite existing .txt", value=cs.get("tagger_overwrite", False)) 
-                
+                with gr.Row():
+                    inspect_btn = gr.Button("🔎 Inspect Dataset", variant="secondary")
                 
         with gr.Column(scale=1):
-            preview_gallery = gr.Gallery(label="Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
+            with gr.Tabs():
+                with gr.Tab("Previews"):
+                    preview_gallery = gr.Gallery(label="Previews", columns=2, rows=2, height=GALLERY_HEIGHT, object_fit="contain")
+                with gr.Tab("Checkpoint Grid"):
+                    grid_btn = gr.Button("🧮 Build grid for this keyword's run (steps × prompts)", variant="secondary")
+                    grid_image = gr.Image(label="Checkpoint Grid", type="filepath", height=GALLERY_HEIGHT - 50, interactive=False)
+                with gr.Tab("Loss"):
+                    loss_plot = gr.LinePlot(value=loss_frame([]), x="step", y="avg_loss", title="Moving-average training loss",
+                                            x_title="step", y_title="avg loss", height=GALLERY_HEIGHT - 40)
             with gr.Group():
-                pos_prompt = gr.Textbox(label="Prompt (Trigger word added automatically)", lines=2, value=cs.get("pos_prompt", ""))
+                pos_prompt = gr.Textbox(label="Preview Prompts (one per line; trigger word added automatically)", lines=2, value=cs.get("pos_prompt", ""))
                 neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""))
                 with gr.Row():
                     width_input = gr.Number(label="Width", value=cs.get("width", 1024), precision=0, min_width=80)
@@ -1558,8 +2180,10 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
 
     # Order must match DEFAULT_SETTINGS (auto_save_state zips them together).
     all_settings_list = training_inputs + [
-        side_min_input, side_max_input, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, save_resume_state_input
+        side_min_input, side_max_input, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, save_resume_state_input,
+        blocks_swap_input,
     ]
+    assert len(all_settings_list) == len(DEFAULT_SETTINGS), "settings keys and UI components are out of sync"
 
     def load_state_on_refresh():
         current_settings = load_settings()
@@ -1567,11 +2191,11 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
 
     ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)    
 
-    # The log and gallery are pulled from the server every second rather than pushed by
-    # the Start handler, so a refreshed (or newly opened) tab picks up a run in progress.
+    # Log, previews, status and loss are pulled from the server every second rather than pushed by
+    # the button handlers, so a refreshed (or newly opened) tab picks up whatever is running.
     poll_seen = gr.State(value=None)
     poll_timer = gr.Timer(POLL_INTERVAL)
-    poll_outputs = [output_log, preview_gallery, status_md, pause_btn, poll_seen]
+    poll_outputs = [output_log, preview_gallery, status_md, pause_btn, loss_plot, poll_seen]
     ui.load(fn=poll_ui, inputs=[poll_seen], outputs=poll_outputs)
     poll_timer.tick(fn=poll_ui, inputs=[poll_seen], outputs=poll_outputs, show_progress="hidden", concurrency_limit=None)
 
@@ -1581,30 +2205,20 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     for comp in all_settings_list: 
         comp.change(fn=auto_save_state, inputs=all_settings_list)
 
-    crop_btn.click(
-        fn=run_smart_crop_ui,
-        inputs=[dataset_path, side_min_input, side_max_input],
-        outputs=[output_log]
-    )
+    # Bucketing, tagging and inspection run as background jobs (refresh-safe); progress shows in the log.
+    crop_btn.click(fn=start_bucketing, inputs=[dataset_path, side_min_input, side_max_input], outputs=[output_log])
+    open_ds_btn.click(fn=open_dataset_folder_ui, inputs=[dataset_path], outputs=[output_log])
+    tagger_btn.click(fn=start_tagging, inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite], outputs=[output_log])
+    inspect_btn.click(fn=start_inspect, inputs=[dataset_path, trigger_word], outputs=[output_log])
     
-    open_ds_btn.click(
-        fn=open_dataset_folder_ui,
-        inputs=[dataset_path],
-        outputs=[output_log]
-    )
-    
-    tagger_btn.click(
-        fn=run_auto_tagging,
-        inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite],
-        outputs=[output_log]
-    )
-    
-    start_btn.click(fn=start_training, inputs=training_inputs + [save_resume_state_input], outputs=[output_log])
+    start_btn.click(fn=start_training, inputs=training_inputs + [save_resume_state_input, blocks_swap_input], outputs=[output_log])
     pause_btn.click(fn=toggle_pause, outputs=output_log)
     halt_btn.click(fn=halt_training, outputs=output_log)
     stop_btn.click(fn=stop_training, outputs=output_log)
     resume_btn.click(fn=resume_training, inputs=[trigger_word], outputs=output_log)
+    extend_btn.click(fn=extend_training, inputs=[trigger_word, steps_input], outputs=output_log)
     folder_btn.click(fn=open_output_folder, inputs=[trigger_word], outputs=output_log)
+    grid_btn.click(fn=make_checkpoint_grid, inputs=[trigger_word], outputs=[grid_image, output_log])
 
 if __name__ == "__main__":
      ui.launch(inbrowser=True, theme=gr.themes.Soft(), css=CSS)
