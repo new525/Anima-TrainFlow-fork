@@ -58,6 +58,30 @@ If you prefer to set up the environment manually instead of using the portable v
 * **Optimized Defaults:** Pre-configured for BF16 precision and latent caching to ensure maximum performance and stability.
 * **Prodigy Native:** Intelligent Learning Rate handling and optimized defaults for the Prodigy optimizer.
 
+## Fork Changes
+
+### Training controls
+* **Refresh-safe training:** Training belongs to the app, not the browser tab. Refreshing, closing or opening a second tab no longer kills or hangs a run; any tab shows the live log, previews and status.
+* **⏸ Pause / ▶ Continue:** Freezes the trainer in place and continues exactly where it stopped. VRAM stays allocated while paused, and a pause does not survive closing the app.
+* **💾 Halt & Save:** Finishes the current step, then saves a LoRA and a full resume point (weights, optimizer, scheduler, RNG, step) and exits, freeing the VRAM.
+* **↩ Resume Run:** Continues the newest unfinished run of the current keyword from its newest resume point, using the settings that run was started with.
+* **Resume points:** With *Save resume points with each checkpoint* on, a resume point is also saved with every checkpoint and the two newest are kept, so a crash costs at most one save interval.
+
+### Outputs
+* **One folder per run:** Each run gets `training/output/<keyword>/<date_time>/`, holding its LoRAs, `sample/`, `configs/`, `logs/` and resume points. Re-running a keyword never overwrites an earlier run. Non-Latin keywords keep their own folder.
+
+### Dataset fixes
+* **Bucketing is non-destructive:**
+  * Re-running it with different sizes regenerates the dataset PNGs from `original_images/` instead of overwriting the originals.
+  * Edited outputs are left alone.
+  * Name clashes (`cat.jpg` + `cat.png`) abort before anything moves.
+  * Unreadable files are reported instead of silently vanishing.
+* **Phone photos:** EXIF orientation is applied when bucketing and tagging, so portrait photos are cropped and tagged upright. Training warns about EXIF-rotated images it would otherwise learn sideways.
+
+### Smaller fixes
+* The trigger word is prefixed as `trigger, tags` (was `trigger,  tags`).
+* The progress bar updates in place instead of adding a log line every step.
+
 ## Dataset Preparation
 Place all your training images (.png, .jpg, .webp) in a single folder. Every image must have a matching text file with the same name containing its tags/captions (e.g., `image1.png` and `image1.txt`). You can easily generate these text files using the built-in **Auto-Caption Dataset** tool.
 
