@@ -1255,6 +1255,7 @@ class NetworkTrainer:
             ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
 
         epoch_to_start = 0
+        resumed_global_step = 0  # [TrainFlow] optimizer steps completed before this launch (resume)
         if initial_step > 0:
             if args.skip_until_initial_step:
                 # if skip_until_initial_step is specified, load data and discard it to ensure the same data is used
@@ -1263,6 +1264,7 @@ class NetworkTrainer:
                         f"initial_step is specified but not resuming. lr scheduler will be started from the beginning / initial_stepが指定されていますがresumeしていないため、lr schedulerは最初から始まります"
                     )
                 logger.info(f"skipping {initial_step} steps / {initial_step}ステップをスキップします")
+                resumed_global_step = initial_step  # [TrainFlow] optimizer steps already done
                 initial_step *= args.gradient_accumulation_steps
 
                 # set epoch to start to make initial_step less than len(train_dataloader)
@@ -1341,7 +1343,9 @@ class NetworkTrainer:
             for skip_epoch in range(epoch_to_start):  # skip epochs
                 logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
                 initial_step -= len(train_dataloader)
-            global_step = initial_step
+            # [TrainFlow] was `global_step = initial_step`: that is a micro-batch count within the current epoch,
+            # which is wrong for gradient_accumulation_steps > 1 and for resumes past the first epoch.
+            global_step = resumed_global_step
 
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
@@ -1355,8 +1359,13 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            total=args.max_train_steps,
+            initial=resumed_global_step,  # [TrainFlow] show absolute step (e.g. 437/2400) after a resume
+            smoothing=0,
+            disable=not accelerator.is_local_main_process,
+            desc="steps",
         )
+        halted = False  # [TrainFlow] set when a halt was requested and state has been saved
 
         validation_steps = (
             min(args.max_validation_steps, len(val_dataloader)) if args.max_validation_steps is not None else len(val_dataloader)
@@ -1507,6 +1516,26 @@ class NetworkTrainer:
                             if remove_step_no is not None:
                                 remove_ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, remove_step_no)
                                 remove_model(remove_ckpt_name)
+
+                    # [TrainFlow] Halt & save: the GUI creates halt_request_file; finish this step, save a LoRA and
+                    # a full resumable state (weights, optimizer, scheduler, RNG, step), then leave the loop.
+                    # (Ignored on the final step: the run is finishing anyway and should save its normal final outputs.)
+                    if args.halt_request_file and global_step < args.max_train_steps and os.path.exists(args.halt_request_file):
+                        accelerator.wait_for_everyone()
+                        if accelerator.is_main_process:
+                            logger.info(f"halt requested: saving LoRA and resumable state at step {global_step}")
+                            saved_now = args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0
+                            if not saved_now:
+                                ckpt_name = train_util.get_step_ckpt_name(args, "." + args.save_model_as, global_step)
+                                save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
+                            if not (saved_now and args.save_state):
+                                train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+                            try:
+                                os.remove(args.halt_request_file)
+                            except OSError:
+                                pass
+                            logger.info(f"HALTED at step {global_step}")
+                        halted = True
                     optimizer_train_fn()
 
                 current_loss = loss.detach().item()
@@ -1602,8 +1631,11 @@ class NetworkTrainer:
                     accelerator.unwrap_model(network).train()
                     progress_bar.unpause()
 
-                if global_step >= args.max_train_steps:
+                if global_step >= args.max_train_steps or halted:
                     break
+
+            if halted:  # [TrainFlow] skip end-of-epoch validation/saving/sampling
+                break
 
             # EPOCH VALIDATION
             should_validate_epoch = (
@@ -1719,10 +1751,10 @@ class NetworkTrainer:
         accelerator.end_training()
         optimizer_eval_fn()
 
-        if is_main_process and (args.save_state or args.save_state_on_train_end):
+        if is_main_process and not halted and (args.save_state or args.save_state_on_train_end):
             train_util.save_state_on_train_end(args, accelerator)
 
-        if is_main_process:
+        if is_main_process and not halted:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
             save_model(ckpt_name, network, global_step, num_train_epochs, force_sync_upload=True)
 
@@ -1849,6 +1881,12 @@ def setup_parser() -> argparse.ArgumentParser:
         "--no_half_vae",
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
+    )
+    parser.add_argument(
+        "--halt_request_file",
+        type=str,
+        default=None,
+        help="[TrainFlow] if this file appears during training, save a LoRA and resumable state at the end of the current step and exit",
     )
     parser.add_argument(
         "--skip_until_initial_step",
