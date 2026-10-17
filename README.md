@@ -31,7 +31,7 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 The complete list, including smaller fixes, is in [CHANGELOG.md](CHANGELOG.md).
 
 ![Anima TrainFlow interface](preview.png)
-*Screenshot of the upstream v1.1.0 interface. This fork keeps the layout and adds the controls described below.*
+*The fork's interface during a training run, with the Loss tab open (demo run).*
 
 ---
 
@@ -136,6 +136,7 @@ training/output/<keyword>/<YYYYmmdd_HHMMSS>/   one folder per run
 ## Status
 
 * **Tested:** the fork's changes have been tested end to end on Python 3.10, the bundled version, with the real app and a stand-in trainer that mimics the real one's files and output.
+* **Browser-tested:** the interface has been exercised in headless Chromium. That covers switching tabs mid-run, the loss chart updating, previews, and settings surviving a page refresh.
 * **Not yet confirmed:**
   * On a real GPU: halt/resume through the bundled trainer, and block swap's VRAM savings.
   * On Windows: training surviving a closed console window.

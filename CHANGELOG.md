@@ -14,6 +14,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Reproduced in headless Chromium: the same app also fails on Gradio 6.15.2 and works on 6.17.3 and 6.30.0.
 - Gradio is now pinned to **6.17.3**. From 6.18.0 on, Gradio requires `huggingface-hub>=1.2`, which conflicts with sd-scripts' pinned `huggingface-hub==0.34.3`.
 
+### Documentation
+- The README screenshot now shows the fork's own interface, mid-run on the Loss tab (it showed upstream's).
+- README Status lists the browser testing.
+
 ### Verified on 6.17.3
 - On Python 3.10:
   - the end-to-end and bucketing test suites;
