@@ -67,9 +67,6 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The default DiT path now points at `models/anima/dit/anima-base-v1.0.safetensors`; the official model card says LoRAs should be trained on the base model. Saved settings are unaffected.
 
 ### Known limitations
-- Everything above was tested end to end on Python 3.10.20, the version bundled in `python_embeded/`, with Gradio 6.14.0 and a stand-in trainer.
-- **Untested on Windows:** the detached launch and reattach are tested on Linux only.
-  - On Windows they rely on `CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`, and on accelerate's child process inheriting the log-file handles. Accelerate launches it with a plain `subprocess.Popen(cmd, env=...)`.
   - After reattaching, the exit code may be unavailable. The outcome is then read from the log and the final LoRA's presence instead.
 - Two app instances started at once would both reattach to the same trainer.
 
@@ -108,7 +105,6 @@ First fork release. Based on upstream commit `cf13c7b` (upstream portable releas
 - **sd-scripts: resuming with gradient accumulation > 1 stopped short of the step target** (e.g. 2100 of 2400 steps at accumulation 2 after a halt at step 300), because the step counter was restored in micro-batches. It now resumes at the saved optimizer step, and the progress bar shows the absolute step.
 
 ### Known limitations
-- The bundled sd-scripts changes (halt request, resume step count) have not yet been run on a GPU with the real model; they were compiled, simulated and tested against a stand-in trainer. Check with a short run: halt around step 30 of 100, resume, and confirm the log continues at `31/100`.
 - A resumed run sees the dataset in a different order than an uninterrupted run would.
 - Resume points include the optimizer state and are considerably larger than a LoRA. sd-scripts also saves one when a run finishes, and a Halt resume point between save intervals is never pruned automatically; both are safe to delete.
 - A Halt pressed during latent caching takes effect after the first training step.
