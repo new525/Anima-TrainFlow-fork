@@ -3,6 +3,41 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- **✂️ Start Bucketing converts videos, GIFs and AVIF images.** Before cropping, each one becomes a full-resolution PNG original in `original_images/`, and the crop step treats it like any other original.
+  - **What gets saved:** the middle frame of a video or GIF, or the decoded image for an AVIF.
+  - **Source files** are moved to `original_images/` too and never modified or deleted.
+  - **Captions:** a `clip.txt` written for `clip.mp4` pairs with the resulting `clip.png`.
+  - **Videos:** `.mp4`, `.m4v`, `.mov`, `.webm`, `.mkv`, `.avi`, `.wmv`, `.flv`, `.mpg`, `.mpeg`, decoded by the FFmpeg bundled with the pinned `opencv-python` 4.10.0.84.
+    - Phone videos with a rotation flag come out upright.
+    - If a container reports no frame count, the frames are counted by decoding.
+    - On Windows, if OpenCV can't open a non-ASCII path, the 8.3 short path and then a temporary ASCII-named copy are tried.
+  - **GIF and AVIF** are decoded by Pillow 12.3.0, whose Windows wheel includes native AVIF support. Animated files give their middle frame; transparency is flattened onto white.
+- **No new dependencies.**
+
+### Changed
+- **Name clashes:** the bucketing check now covers these files, and aborts before changing anything.
+  - Two sources with the same name (`clip.mp4` + `clip.gif`, or `clip.mp4` + `clip.jpg`).
+  - A new file named like an existing original.
+- **Failed conversions:** an unreadable file is reported and left in the dataset folder unchanged, and retried on the next run.
+- **Unconverted videos, GIFs and AVIFs are pointed out everywhere they matter.** sd-scripts ignores all three formats; it only reads AVIF with the `pillow_avif` plugin, which isn't installed.
+  - 🔎 Inspect Dataset reports them, and no longer calls their captions orphans.
+  - Pre-flight warns that they won't be trained on.
+  - The tagger explains why a folder of videos has "no images".
+
+### Verified
+- On Python 3.10 with the bundled versions (Pillow 12.3.0, opencv 4.10.0.84, Gradio 6.17.3).
+- **Formats:** H.264 MP4, MKV and MOV, VP9 WebM, MJPEG AVI, animated and single-frame GIF, and AVIF with transparency.
+  - Each test frame encodes its index in its brightness, so the exact frame could be checked: frame 31 of 61 every time, including a non-keyframe seek.
+- **A phone clip with a 90° rotation flag** decodes identically to ffmpeg's own output.
+- **Speed:** a 3-minute 1080p H.264 file takes about 0.5 s.
+- **Behaviour:** re-running doesn't reconvert anything, and re-cropping at new sizes works from the frame originals.
+- **Clashes and failures:** both clash cases abort with nothing changed, and a damaged file is reported and left in place.
+- **UI:** run end to end in the browser.
+- **Not tested on Windows:** the non-ASCII path fallbacks. They were only exercised on Linux by making OpenCV refuse the path.
+
 ## [1.2.1] - 2026-10-16
 
 **Updating from 1.2:** re-run `Install_Requirements.bat`, or run `python_embeded\python.exe -m pip install gradio==6.17.3`, so the new Gradio version is installed.
@@ -67,7 +102,7 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - The default DiT path now points at `models/anima/dit/anima-base-v1.0.safetensors`; the official model card says LoRAs should be trained on the base model. Saved settings are unaffected.
 
 ### Known limitations
-  - After reattaching, the exit code may be unavailable. The outcome is then read from the log and the final LoRA's presence instead.
+- After reattaching, the exit code may be unavailable. The outcome is then read from the log and the final LoRA's presence instead.
 - Two app instances started at once would both reattach to the same trainer.
 
 ## [1.1] - 2026-10-16

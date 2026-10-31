@@ -85,14 +85,21 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 ## Using it
 
 ### Prepare the dataset
-Put your images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`) in one folder and set it as **Dataset Path**. Then:
+Put your images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`) in one folder and set it as **Dataset Path**. Videos, GIFs and AVIF images can go in too:
+* **Videos:** `.mp4`, `.m4v`, `.mov`, `.webm`, `.mkv`, `.avi`, `.wmv`, `.flv`, `.mpg`, `.mpeg`
+* **GIFs and AVIF** images
+
+Then:
 
 1. **✂️ Start Bucketing** resizes and crops images to training buckets.
-   * Your originals are moved to `original_images/` and never modified.
+   * First it turns each video or GIF into an image of its middle frame, and converts each AVIF to PNG. Training can't read these formats directly. Phone videos come out upright.
+   * Your originals, including the videos, GIFs and AVIFs, are moved to `original_images/` and never modified.
    * Running it again with different sizes regenerates the crops from those originals.
+   * A caption already written for a video (`clip.txt` next to `clip.mp4`) pairs with the image made from it (`clip.png`).
 2. **Create .txt captions** auto-tags every image with the WD tagger.
 3. **🔎 Inspect Dataset** checks the result before you spend an hour training:
    * missing, empty or orphaned captions
+   * videos, GIFs or AVIFs that haven't been converted yet
    * oversized, small, unreadable or rotated images
    * repeated tags, and the trigger word already in some captions
    * the most frequent tags, and tags present in every caption
