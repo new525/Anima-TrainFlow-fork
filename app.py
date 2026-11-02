@@ -19,6 +19,12 @@ try:
     JXL_PLUGIN = True
 except ImportError:
     JXL_PLUGIN = False
+try:
+    import pillow_heif  # HEIC/HEIF (iPhone photos). Applies the container's rotation and resets EXIF orientation,
+    pillow_heif.register_heif_opener()  # so exif_transpose afterwards doesn't rotate a second time.
+    HEIF_PLUGIN = True
+except ImportError:
+    HEIF_PLUGIN = False
 import pandas as pd
 import time
 import threading
@@ -99,9 +105,9 @@ function() {
 VALID_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
 # Files bucketing turns into a PNG original first: the middle frame of a video or GIF, or the decoded image.
 # Videos are decoded with OpenCV's bundled FFmpeg, everything else with Pillow. AVIF: sd-scripts only reads it
-# with the pillow_avif plugin, which isn't installed. JXL: Pillow needs pillow-jxl-plugin.
+# with the pillow_avif plugin, which isn't installed. JXL: Pillow needs pillow-jxl-plugin. HEIC/HEIF: pillow-heif.
 VIDEO_EXTS = {'.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.wmv', '.flv', '.mpg', '.mpeg'}
-PIL_CONVERT_EXTS = {'.gif', '.avif', '.jxl'}
+PIL_CONVERT_EXTS = {'.gif', '.avif', '.jxl', '.heic', '.heif', '.hif'}
 MEDIA_EXTS = VIDEO_EXTS | PIL_CONVERT_EXTS
 # Any other file in the dataset folder is probed (Pillow, then OpenCV for video) unless it's one of these.
 NEVER_PROBE_EXTS = {
@@ -1123,8 +1129,11 @@ def load_rgb_upright(img_path: Path) -> np.ndarray:
 
 # ---------- videos / GIFs / AVIF / JXL / other formats -> PNG original ----------
 def _pil_middle_frame(path: Path) -> Tuple[np.ndarray, str]:
-    if path.suffix.lower() == ".jxl" and not JXL_PLUGIN:
+    ext = path.suffix.lower()
+    if ext == ".jxl" and not JXL_PLUGIN:
         raise ValueError("JPEG XL needs pillow-jxl-plugin: re-run Install_Requirements.bat")
+    if ext in (".heic", ".heif", ".hif") and not HEIF_PLUGIN:
+        raise ValueError("HEIC/HEIF needs pillow-heif: re-run Install_Requirements.bat")
     with Image.open(path) as im:
         n = max(1, int(getattr(im, "n_frames", 1) or 1))
         animated = n > 1 and im.format in ANIMATED_PIL_FORMATS
@@ -1137,6 +1146,7 @@ def _pil_middle_frame(path: Path) -> Tuple[np.ndarray, str]:
             frame = ImageOps.exif_transpose(im)  # stills: honour EXIF orientation like any photo
             what = ("converted" if n == 1 else f"converted (first page of {n})" if im.format == "TIFF"
                     else "converted (flattened image, not the separate layers)" if im.format == "PSD"
+                    else f"converted (main image of {n})" if im.format == "HEIF"
                     else f"converted (first of {n} images)")
         rgb = _flatten_rgb(frame)
     return rgb, what
@@ -1395,7 +1405,7 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, conver
     if undecodable:
         console.append(f"ℹ️ Left {len(undecodable)} file(s) that aren't images or videos Pillow/OpenCV can read: {_examples([f.name for f in undecodable])}")
     if not convert_other:
-        console.append("ℹ️ Converting other formats is off: only videos, GIF, AVIF and JXL were converted.")
+        console.append("ℹ️ Converting other formats is off: only videos, GIF, AVIF, JXL and HEIC were converted.")
 
     # 2. Move new originals aside. A PNG that is already upright and exactly bucket-sized is kept in place.
     moved = 0
@@ -2366,7 +2376,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
             output_log = gr.Textbox(label="Logs", lines=LOG_BOX__MAX_LINES, max_lines=LOG_BOX__MAX_LINES, interactive=False, autoscroll=True, elem_id="log-container")
             
             with gr.Group():
-                gr.Markdown("### Smart Aspect Ratio Bucketing\nAlso extracts the middle frame of videos and GIFs, and converts AVIF and JXL images.")
+                gr.Markdown("### Smart Aspect Ratio Bucketing\nAlso extracts the middle frame of videos and GIFs, and converts AVIF, JXL and HEIC images.")
                 with gr.Row():
                     side_min_input = gr.Number(label="Min Side (Base)", value=cs.get("side_min", 512), precision=0)
                     side_max_input = gr.Number(label="Max Side (Limit)", value=cs.get("side_max", 768), precision=0)

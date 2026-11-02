@@ -5,10 +5,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-**Updating:** re-run `Install_Requirements.bat`, or run `python_embeded\python.exe -m pip install pillow-jxl-plugin==1.3.8`, for JPEG XL support.
+**Updating:** re-run `Install_Requirements.bat`, or run `python_embeded\python.exe -m pip install pillow-jxl-plugin==1.3.8 pillow-heif==1.8.1`, for JPEG XL and HEIC support.
 
 ### Added
-- **✂️ Start Bucketing converts videos, GIFs, AVIF and JPEG XL images, and by default any other format Pillow or OpenCV can read.** Before cropping, each one becomes a full-resolution PNG original in `original_images/`, and the crop step treats it like any other original.
+- **✂️ Start Bucketing converts videos, GIFs, AVIF, JPEG XL and HEIC/HEIF images, and by default any other format Pillow or OpenCV can read.** Before cropping, each one becomes a full-resolution PNG original in `original_images/`, and the crop step treats it like any other original.
   - **What gets saved:** the middle frame of a video or animation, or the decoded image otherwise.
   - **Other multi-frame files:** a multi-page TIFF gives its first page, and a layered PSD its flattened image rather than a single layer.
   - **Source files** are moved to `original_images/` too and never modified or deleted.
@@ -21,6 +21,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - **JPEG XL** is decoded through **`pillow-jxl-plugin` 1.3.8, a new dependency**. It has a prebuilt Windows wheel for Python 3.10, its only dependency is `packaging`, and it leaves Pillow at 12.3.0.
     - With the plugin installed, sd-scripts also reads `.jxl` itself, so pre-flight doesn't count JXL files as skipped.
     - Without the plugin, a `.jxl` is reported with the fix rather than failing silently.
+  - **HEIC/HEIF** (`.heic`, `.heif`, `.hif`, e.g. iPhone photos) is decoded through **`pillow-heif` 1.8.1, a new dependency**.
+    - Its Windows wheel for Python 3.10 bundles libheif with its decoder. It requires `pillow>=11.1.0`, adds no other packages, and leaves Pillow at 12.3.0.
+    - **Rotation is applied once.** iPhone photos carry both the container's rotation and EXIF orientation 6; pillow-heif applies the rotation and resets the EXIF tag, so the app doesn't rotate them a second time.
+    - A multi-image HEIC gives its main (primary) image.
+    - Without the plugin, a `.heic` is reported with the fix.
   - **Any other file** is probed, unless *Also convert any other format…* is unticked (on by default).
     - Pillow is tried first, then OpenCV for video.
     - Examples: TIFF, PSD, TGA, `.jfif`, `.jpg_large`, and `.3gp`, `.ts` or extensionless videos.
@@ -52,7 +57,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - Left alone: an audio-only `.mka` and a random binary.
   - Not probed at all: `.npz`, `.json` and `Thumbs.db`.
   - Checked both with the checkbox on and off, and with the JXL plugin missing.
-- **Not tested:** animated JXL, since the plugin can't write a test file. Reading one uses the same middle-frame code as GIF.
+- **HEIC:**
+  - A landscape photo stays landscape.
+  - An iPhone-layout portrait (container rotation plus EXIF orientation 6) is rotated exactly once and gets a portrait bucket.
+  - A three-image file whose main image is the second gives that image.
+  - `.heif` and `.hif` work, and a missing plugin is reported.
+- **Not tested:** animated JXL, since the plugin can't write a test file. Reading one uses the same middle-frame code as GIF. HEIC test files were written by pillow-heif rather than taken from an iPhone.
 - **Speed:** a 3-minute 1080p H.264 file takes about 0.5 s.
 - **Behaviour:** re-running doesn't reconvert anything, and re-cropping at new sizes works from the frame originals.
 - **Clashes and failures:** both clash cases abort with nothing changed, and a damaged file is reported and left in place.

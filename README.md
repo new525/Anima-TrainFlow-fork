@@ -80,7 +80,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 * **Zip:** extract the new release, then copy the *contents* of its top folder over your existing install. The zip doesn't contain your settings (`training/settings.json`), runs (`training/output/`) or installed packages, so they are kept.
 * Re-run `Install_Requirements.bat` when the changelog says dependencies changed.
   * **1.2.1** updated Gradio.
-  * The next release adds `pillow-jxl-plugin` for JPEG XL.
+  * The next release adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
 
 ---
 
@@ -89,14 +89,14 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 ### Prepare the dataset
 Put your images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`) in one folder and set it as **Dataset Path**. Other formats can go in too:
 * **Videos:** `.mp4`, `.m4v`, `.mov`, `.webm`, `.mkv`, `.avi`, `.wmv`, `.flv`, `.mpg`, `.mpeg`
-* **GIF, AVIF and JPEG XL (`.jxl`)** images
+* **GIF, AVIF, JPEG XL (`.jxl`) and HEIC/HEIF** (iPhone photos) images
 * **Anything else Pillow or OpenCV can read**, such as TIFF, PSD, TGA, `.jfif`, a saved `.jpg_large`, or `.3gp` and `.ts` videos. This is on by default; untick *Also convert any other format…* to limit conversion to the formats above.
 
 Then:
 
 1. **✂️ Start Bucketing** resizes and crops images to training buckets.
    * First it turns each video or animation into an image of its middle frame, and converts the other formats to PNG. Training can't read these formats directly. Phone videos come out upright.
-   * A multi-page TIFF gives its first page, and a layered PSD its flattened image.
+   * A multi-page TIFF gives its first page, a layered PSD its flattened image, and a multi-image HEIC its main image.
    * Files that nothing can decode are left where they are and listed in the log. This includes audio, documents and caches.
    * Your originals, including the videos, GIFs and AVIFs, are moved to `original_images/` and never modified.
    * Running it again with different sizes regenerates the crops from those originals.
