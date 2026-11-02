@@ -5,9 +5,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+**Updating:** re-run `Install_Requirements.bat`, or run `python_embeded\python.exe -m pip install pillow-jxl-plugin==1.3.8`, for JPEG XL support.
+
 ### Added
-- **✂️ Start Bucketing converts videos, GIFs and AVIF images.** Before cropping, each one becomes a full-resolution PNG original in `original_images/`, and the crop step treats it like any other original.
-  - **What gets saved:** the middle frame of a video or GIF, or the decoded image for an AVIF.
+- **✂️ Start Bucketing converts videos, GIFs, AVIF and JPEG XL images, and by default any other format Pillow or OpenCV can read.** Before cropping, each one becomes a full-resolution PNG original in `original_images/`, and the crop step treats it like any other original.
+  - **What gets saved:** the middle frame of a video or animation, or the decoded image otherwise.
+  - **Other multi-frame files:** a multi-page TIFF gives its first page, and a layered PSD its flattened image rather than a single layer.
   - **Source files** are moved to `original_images/` too and never modified or deleted.
   - **Captions:** a `clip.txt` written for `clip.mp4` pairs with the resulting `clip.png`.
   - **Videos:** `.mp4`, `.m4v`, `.mov`, `.webm`, `.mkv`, `.avi`, `.wmv`, `.flv`, `.mpg`, `.mpeg`, decoded by the FFmpeg bundled with the pinned `opencv-python` 4.10.0.84.
@@ -15,14 +18,22 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
     - If a container reports no frame count, the frames are counted by decoding.
     - On Windows, if OpenCV can't open a non-ASCII path, the 8.3 short path and then a temporary ASCII-named copy are tried.
   - **GIF and AVIF** are decoded by Pillow 12.3.0, whose Windows wheel includes native AVIF support. Animated files give their middle frame; transparency is flattened onto white.
-- **No new dependencies.**
+  - **JPEG XL** is decoded through **`pillow-jxl-plugin` 1.3.8, a new dependency**. It has a prebuilt Windows wheel for Python 3.10, its only dependency is `packaging`, and it leaves Pillow at 12.3.0.
+    - With the plugin installed, sd-scripts also reads `.jxl` itself, so pre-flight doesn't count JXL files as skipped.
+    - Without the plugin, a `.jxl` is reported with the fix rather than failing silently.
+  - **Any other file** is probed, unless *Also convert any other format…* is unticked (on by default).
+    - Pillow is tried first, then OpenCV for video.
+    - Examples: TIFF, PSD, TGA, `.jfif`, `.jpg_large`, and `.3gp`, `.ts` or extensionless videos.
+    - The log names the detected format (`TIFF scan.tiff → converted (first page of 2)`).
+    - Files nothing can decode stay where they are, with one log line. Audio-only files aren't mistaken for video.
+    - Caches, captions, configs and archives aren't probed at all. Neither are playlist and subtitle files, which FFmpeg would try to follow.
 
 ### Changed
 - **Name clashes:** the bucketing check now covers these files, and aborts before changing anything.
   - Two sources with the same name (`clip.mp4` + `clip.gif`, or `clip.mp4` + `clip.jpg`).
   - A new file named like an existing original.
 - **Failed conversions:** an unreadable file is reported and left in the dataset folder unchanged, and retried on the next run.
-- **Unconverted videos, GIFs and AVIFs are pointed out everywhere they matter.** sd-scripts ignores all three formats; it only reads AVIF with the `pillow_avif` plugin, which isn't installed.
+- **Unconverted files are pointed out everywhere they matter.** sd-scripts ignores all of these formats except `.jxl` with the plugin; it only reads AVIF with the `pillow_avif` plugin, which isn't installed.
   - 🔎 Inspect Dataset reports them, and no longer calls their captions orphans.
   - Pre-flight warns that they won't be trained on.
   - The tagger explains why a folder of videos has "no images".
@@ -32,6 +43,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Formats:** H.264 MP4, MKV and MOV, VP9 WebM, MJPEG AVI, animated and single-frame GIF, and AVIF with transparency.
   - Each test frame encodes its index in its brightness, so the exact frame could be checked: frame 31 of 61 every time, including a non-keyframe seek.
 - **A phone clip with a 90° rotation flag** decodes identically to ffmpeg's own output.
+- **Other formats:**
+  - JXL with transparency.
+  - A 2-page TIFF, checked by page brightness.
+  - A two-layer PSD, checked by pixel values that the composite was saved.
+  - TGA, `.jfif` and `.jpg_large`.
+  - `.3gp`, `.ts` and extensionless videos, all giving frame 31 of 61.
+  - Left alone: an audio-only `.mka` and a random binary.
+  - Not probed at all: `.npz`, `.json` and `Thumbs.db`.
+  - Checked both with the checkbox on and off, and with the JXL plugin missing.
+- **Not tested:** animated JXL, since the plugin can't write a test file. Reading one uses the same middle-frame code as GIF.
 - **Speed:** a 3-minute 1080p H.264 file takes about 0.5 s.
 - **Behaviour:** re-running doesn't reconvert anything, and re-cropping at new sizes works from the frame originals.
 - **Clashes and failures:** both clash cases abort with nothing changed, and a damaged file is reported and left in place.

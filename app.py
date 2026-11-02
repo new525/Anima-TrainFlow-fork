@@ -14,6 +14,11 @@ from PIL import Image, ImageOps
 import torch
 import numpy as np
 import onnxruntime as rt
+try:
+    import pillow_jxl  # noqa: F401 — registers JPEG XL with Pillow (pillow-jxl-plugin)
+    JXL_PLUGIN = True
+except ImportError:
+    JXL_PLUGIN = False
 import pandas as pd
 import time
 import threading
@@ -92,12 +97,24 @@ function() {
 
 # Image types sd-scripts trains on (library/train_util.py IMAGE_EXTENSIONS); every tool uses the same list.
 VALID_IMAGE_EXTS = {'.png', '.jpg', '.jpeg', '.webp', '.bmp'}
-# Files bucketing turns into a PNG original first: the middle frame of a video or GIF, or the decoded image for
-# AVIF (sd-scripts only reads .avif when the pillow_avif plugin is installed, which it isn't here). Videos are
-# decoded with OpenCV's bundled FFmpeg, GIF and AVIF with Pillow.
+# Files bucketing turns into a PNG original first: the middle frame of a video or GIF, or the decoded image.
+# Videos are decoded with OpenCV's bundled FFmpeg, everything else with Pillow. AVIF: sd-scripts only reads it
+# with the pillow_avif plugin, which isn't installed. JXL: Pillow needs pillow-jxl-plugin.
 VIDEO_EXTS = {'.mp4', '.m4v', '.mov', '.webm', '.mkv', '.avi', '.wmv', '.flv', '.mpg', '.mpeg'}
-PIL_CONVERT_EXTS = {'.gif', '.avif'}
+PIL_CONVERT_EXTS = {'.gif', '.avif', '.jxl'}
 MEDIA_EXTS = VIDEO_EXTS | PIL_CONVERT_EXTS
+# Any other file in the dataset folder is probed (Pillow, then OpenCV for video) unless it's one of these.
+NEVER_PROBE_EXTS = {
+    '.txt', '.caption', '.json', '.toml', '.yaml', '.yml', '.csv', '.md', '.log', '.ini', '.xml', '.html', '.htm',
+    '.npz', '.npy', '.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.onnx', '.part', '.tmp', '.bak',
+    '.zip', '.7z', '.rar', '.tar', '.gz', '.exe', '.dll', '.bat', '.py', '.lnk', '.url', '.db',
+    '.m3u', '.m3u8', '.pls', '.cue', '.srt', '.ass', '.ssa', '.vtt', '.sub',      # FFmpeg would follow playlists
+    '.mp3', '.wav', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wma',             # audio, no frames
+}
+NEVER_PROBE_NAMES = {'thumbs.db', 'desktop.ini', '.ds_store'}
+# Pillow formats whose extra frames are an animation (middle frame wanted). Others keep the frame Pillow opens
+# by default: a TIFF's first page, a PSD's flattened composite (its other "frames" are single layers).
+ANIMATED_PIL_FORMATS = {'GIF', 'WEBP', 'PNG', 'APNG', 'AVIF', 'JXL', 'FLI', 'MPO'}
 
 LOG_BLACKLIST = [
     "triton not found",
@@ -754,7 +771,8 @@ DEFAULT_SETTINGS = {
     "tagger_char_thresh": 0.85,
     "tagger_overwrite": False,
     "save_resume_state": True,
-    "blocks_to_swap": 0,  # keep new keys at the end: settings are zipped with the UI components in order
+    "blocks_to_swap": 0,
+    "convert_other_formats": True,  # keep new keys at the end: settings are zipped with the UI components in order
 }
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
@@ -1103,20 +1121,28 @@ def load_rgb_upright(img_path: Path) -> np.ndarray:
         return _flatten_rgb(ImageOps.exif_transpose(im))
 
 
-# ---------- videos / GIFs / AVIF -> PNG original ----------
+# ---------- videos / GIFs / AVIF / JXL / other formats -> PNG original ----------
 def _pil_middle_frame(path: Path) -> Tuple[np.ndarray, str]:
+    if path.suffix.lower() == ".jxl" and not JXL_PLUGIN:
+        raise ValueError("JPEG XL needs pillow-jxl-plugin: re-run Install_Requirements.bat")
     with Image.open(path) as im:
         n = max(1, int(getattr(im, "n_frames", 1) or 1))
-        idx = n // 2
-        if idx:
+        animated = n > 1 and im.format in ANIMATED_PIL_FORMATS
+        if animated:
+            idx = n // 2
             im.seek(idx)  # Pillow composites GIF frames (disposal, partial updates) into full frames
             frame = im.copy()
+            what = f"frame {idx + 1} of {n}"
         else:
             frame = ImageOps.exif_transpose(im)  # stills: honour EXIF orientation like any photo
-        return _flatten_rgb(frame), (f"frame {idx + 1} of {n}" if n > 1 else "converted")
+            what = ("converted" if n == 1 else f"converted (first page of {n})" if im.format == "TIFF"
+                    else "converted (flattened image, not the separate layers)" if im.format == "PSD"
+                    else f"converted (first of {n} images)")
+        rgb = _flatten_rgb(frame)
+    return rgb, what
 
 
-def _open_video(path: Path):
+def _open_video(path: Path, allow_copy: bool = True):
     """cv2.VideoCapture, with fallbacks for paths OpenCV/FFmpeg can't open on Windows (non-ASCII names):
     the 8.3 short path, then a temporary ASCII-named copy. Returns (capture, path_used, temp_copy_or_None)."""
     cap = cv2.VideoCapture(str(path))
@@ -1136,6 +1162,8 @@ def _open_video(path: Path):
                 cap.release()
         except Exception:
             pass
+    if not allow_copy:
+        return None, None, None
     import tempfile
     for base in (tempfile.gettempdir(), os.environ.get("SystemDrive", "C:") + os.sep if platform.system() == "Windows" else "/tmp"):
         if not base.isascii():
@@ -1192,21 +1220,67 @@ def _video_middle_frame(path: Path) -> Tuple[np.ndarray, str]:
             shutil.rmtree(tmp.parent, ignore_errors=True)
 
 
-def extract_media_frame(path: Path) -> Tuple[np.ndarray, str]:
-    """RGB still for a video / GIF / AVIF: the middle frame of anything animated."""
-    if path.suffix.lower() in VIDEO_EXTS:
+def extract_media_frame(path: Path, kind: str | None = None) -> Tuple[np.ndarray, str]:
+    """RGB still for a video / GIF / AVIF / JXL / other format: the middle frame of anything animated."""
+    if (kind or ("video" if path.suffix.lower() in VIDEO_EXTS else "image")) == "video":
         return _video_middle_frame(path)
     return _pil_middle_frame(path)
 
 
+def _probe(path: Path) -> Tuple[str, str] | None:
+    """(kind, label) if Pillow or OpenCV can decode this file, else None. Reads headers only."""
+    try:
+        with Image.open(path) as im:
+            return "image", im.format or path.suffix.lstrip(".").upper()
+    except Exception:
+        pass
+    cap = None
+    try:
+        cap, _, _ = _open_video(path, allow_copy=False)
+        if cap is not None and int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0) > 0:  # audio-only files have no width
+            if int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0) > 0 or cap.read()[0]:
+                return "video", "video"
+    except Exception:
+        pass
+    finally:
+        if cap is not None:
+            cap.release()
+    return None
+
+
+def find_convertible(folder: Path, probe_unknown: bool = True) -> Tuple[List[Tuple[Path, str, str]], List[Path]]:
+    """Files in the dataset folder that bucketing turns into PNG originals, as (path, kind, label), and the
+    unknown files that nothing could decode. Known video/GIF/AVIF/JXL extensions always count; with
+    probe_unknown, so does any other file Pillow or OpenCV can decode (TIFF, TGA, PSD, .jfif, .jpg_large, ...)."""
+    found, undecodable = [], []
+    if not folder.is_dir():
+        return found, undecodable
+    for f in sorted(folder.iterdir()):
+        if not f.is_file():
+            continue
+        ext, name = f.suffix.lower(), f.name.lower()
+        if ext in VIDEO_EXTS:
+            found.append((f, "video", "video"))
+        elif ext in PIL_CONVERT_EXTS:
+            found.append((f, "image", ext.lstrip(".").upper()))
+        elif (probe_unknown and ext not in VALID_IMAGE_EXTS and ext not in NEVER_PROBE_EXTS
+              and name not in NEVER_PROBE_NAMES and not name.startswith(".")):
+            hit = _probe(f)
+            if hit:
+                found.append((f, *hit))
+            else:
+                undecodable.append(f)
+    return found, undecodable
+
+
 def unconverted_media(folder: Path) -> List[Path]:
-    """Videos / GIFs / AVIF still in the dataset folder (bucketing hasn't converted them yet)."""
-    return sorted(f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in MEDIA_EXTS) if folder.is_dir() else []
+    """Files bucketing would still convert (videos, GIFs, AVIF, JXL, other decodable formats)."""
+    return [f for f, _, _ in find_convertible(folder)[0]]
 
 
-def _media_kind(path: Path) -> str:
-    ext = path.suffix.lower()
-    return "video" if ext in VIDEO_EXTS else ("GIF" if ext == ".gif" else "AVIF")
+def trainer_skips(f: Path) -> bool:
+    """sd-scripts can't read this file as-is (it reads .jxl itself when pillow_jxl is installed)."""
+    return not (f.suffix.lower() == ".jxl" and JXL_PLUGIN)
 
 
 def _file_fingerprint(p: Path) -> dict:
@@ -1234,7 +1308,7 @@ def _save_manifest(backup_dir: Path, manifest: dict) -> None:
     os.replace(tmp, mf)
 
 
-def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float) -> Generator[str, None, None]:
+def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, convert_other: bool = True) -> Generator[str, None, None]:
     """Bucket the dataset. Originals live in <dataset>/original_images and are never overwritten; the
     dataset folder holds one <stem>.png per original, generated from it. Re-running with different sizes
     regenerates those PNGs from the originals instead of treating them as new originals."""
@@ -1262,12 +1336,11 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float) -> Gen
     #    bucketing. If it no longer matches what bucketing wrote (per the manifest), someone edited or
     #    replaced it: leave it alone rather than overwrite it.
     new_originals: List[Path] = []
-    media: List[Path] = []
+    convertible, undecodable = find_convertible(path, probe_unknown=bool(convert_other))
+    media = [f for f, _, _ in convertible]
+    kinds = {f: (kind, label) for f, kind, label in convertible}
     edited: set = set()
     for f in sorted(path.iterdir()):
-        if f.is_file() and f.suffix.lower() in MEDIA_EXTS:
-            media.append(f)
-            continue
         if not f.is_file() or f.suffix.lower() not in valid_exts:
             continue
         if f.stem in backup_stems:
@@ -1295,12 +1368,12 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float) -> Gen
     # 1b. Videos / GIFs / AVIF: save a PNG original (middle frame, or the decoded image) in original_images/,
     #     then move the source file there too. The crop step below treats the PNG like any other original.
     if media:
-        console.append(f"🎞️ Converting {len(media)} video/GIF/AVIF file(s) to PNG originals...")
+        console.append(f"🎞️ Converting {len(media)} video/GIF/other-format file(s) to PNG originals...")
         yield console.text()
         converted, failed_media = 0, 0
         for f in media:
             try:
-                rgb, what = extract_media_frame(f)
+                rgb, what = extract_media_frame(f, kinds[f][0])
                 backup_dir.mkdir(parents=True, exist_ok=True)
                 frame_png = backup_dir / f"{f.stem}.png"
                 tmp = frame_png.with_name(frame_png.name + ".part")
@@ -1311,7 +1384,7 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float) -> Gen
                     dest, n = backup_dir / f"{f.stem}_{n}{f.suffix}", n + 1
                 shutil.move(str(f), str(dest))
                 converted += 1
-                console.append(f"   {_media_kind(f)} {f.name} → {what}, {rgb.shape[1]}×{rgb.shape[0]}")
+                console.append(f"   {kinds[f][1]} {f.name} → {what}, {rgb.shape[1]}×{rgb.shape[0]}")
             except Exception as e:
                 failed_media += 1
                 console.append(f"⚠️ {f.name}: {e} — left in the dataset folder, unchanged.")
@@ -1319,6 +1392,10 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float) -> Gen
         console.append(f"🎞️ Converted {converted}" + (f", ❌ failed {failed_media}" if failed_media else "")
                        + (". Sources moved to original_images/." if converted else "."))
         yield console.text()
+    if undecodable:
+        console.append(f"ℹ️ Left {len(undecodable)} file(s) that aren't images or videos Pillow/OpenCV can read: {_examples([f.name for f in undecodable])}")
+    if not convert_other:
+        console.append("ℹ️ Converting other formats is off: only videos, GIF, AVIF and JXL were converted.")
 
     # 2. Move new originals aside. A PNG that is already upright and exactly bucket-sized is kept in place.
     moved = 0
@@ -1548,11 +1625,11 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
 
     media = unconverted_media(Path(dataset_dir))
     if not image_files and skipped == 0:
-        console.append("❌ Tagger Error: No images found!" + (f" ({len(media)} video/GIF/AVIF file(s) found: run ✂️ Start Bucketing first to turn them into images.)" if media else ""))
+        console.append("❌ Tagger Error: No images found!" + (f" ({len(media)} video/GIF/other-format file(s) found: run ✂️ Start Bucketing first to turn them into images.)" if media else ""))
         yield console.text()
         return
     if media:
-        console.append(f"ℹ️ Skipping {len(media)} video/GIF/AVIF file(s): ✂️ Start Bucketing turns them into images, which can then be captioned.")
+        console.append(f"ℹ️ Skipping {len(media)} video/GIF/other-format file(s): ✂️ Start Bucketing turns them into images, which can then be captioned.")
         
     if not image_files and skipped > 0:
         console.append(f"ℹ️ All images already have captions. Skipped: {skipped}")
@@ -1609,8 +1686,8 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
         yield console.text()
 
 
-def start_bucketing(dataset_dir, side_min, side_max):
-    return start_tool("Bucketing", run_smart_crop_ui, dataset_dir, side_min, side_max)
+def start_bucketing(dataset_dir, side_min, side_max, convert_other=True):
+    return start_tool("Bucketing", run_smart_crop_ui, dataset_dir, side_min, side_max, convert_other)
 
 
 def start_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
@@ -1739,7 +1816,7 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
         if cond:
             problems += 1
             out.append(line)
-    flag(media, f"⚠️ {len(media)} video/GIF/AVIF file(s) that training ignores — ✂️ Start Bucketing extracts/converts them to images: {_examples([f.name for f in media])}")
+    flag(media, f"⚠️ {len(media)} video/GIF/other-format file(s) not converted yet — ✂️ Start Bucketing turns them into PNG images: {_examples([f.name for f in media])}")
     flag(missing, f"❌ {len(missing)} image(s) without a caption: {_examples(missing)}")
     flag(unreadable, f"❌ {len(unreadable)} image(s) can't be opened: {_examples(unreadable)}")
     flag(stem_clash, f"❌ Same name with different extensions (captions are shared, bucketing refuses): {_examples(stem_clash)}")
@@ -1997,12 +2074,12 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         dataset_path_obj = Path(dataset_path)
         image_files = [f for f in dataset_path_obj.glob('*') if f.is_file() and f.suffix.lower() in valid_exts]
         
-        media = unconverted_media(dataset_path_obj)
+        media = [f for f in unconverted_media(dataset_path_obj) if trainer_skips(f)]
         if media:
-            preflight_warnings.append(f"⚠️ {len(media)} video/GIF/AVIF file(s) won't be trained on: run ✂️ Start Bucketing to turn them into images first, e.g. {', '.join(f.name for f in media[:3])}")
+            preflight_warnings.append(f"⚠️ {len(media)} video/GIF/other-format file(s) won't be trained on: run ✂️ Start Bucketing to turn them into images first, e.g. {', '.join(f.name for f in media[:3])}")
         if not image_files:
             dataset_errors.append(f"❌ No valid images found in the dataset path."
-                                  + (" Only videos/GIFs/AVIF were found: run ✂️ Start Bucketing first." if media else ""))
+                                  + (" Only videos/GIFs/other formats were found: run ✂️ Start Bucketing first." if media else ""))
         else:
             # Check for missing text files (captions)
             missing_captions = [img.name for img in image_files if not img.with_suffix('.txt').exists()]
@@ -2289,10 +2366,14 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
             output_log = gr.Textbox(label="Logs", lines=LOG_BOX__MAX_LINES, max_lines=LOG_BOX__MAX_LINES, interactive=False, autoscroll=True, elem_id="log-container")
             
             with gr.Group():
-                gr.Markdown("### Smart Aspect Ratio Bucketing\nAlso extracts the middle frame of videos and GIFs, and converts AVIF images.")
+                gr.Markdown("### Smart Aspect Ratio Bucketing\nAlso extracts the middle frame of videos and GIFs, and converts AVIF and JXL images.")
                 with gr.Row():
                     side_min_input = gr.Number(label="Min Side (Base)", value=cs.get("side_min", 512), precision=0)
                     side_max_input = gr.Number(label="Max Side (Limit)", value=cs.get("side_max", 768), precision=0)
+                convert_other_input = gr.Checkbox(
+                    label="Also convert any other format Pillow or OpenCV can read (TIFF, PSD, TGA, .jfif, other videos…)",
+                    value=cs.get("convert_other_formats", True),
+                )
                 with gr.Row():
                     crop_btn = gr.Button("✂️ Start Bucketing", variant="secondary")
                     open_ds_btn = gr.Button("📂 Open Dataset", variant="secondary")
@@ -2340,7 +2421,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     # Order must match DEFAULT_SETTINGS (auto_save_state zips them together).
     all_settings_list = training_inputs + [
         side_min_input, side_max_input, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, save_resume_state_input,
-        blocks_swap_input,
+        blocks_swap_input, convert_other_input,
     ]
     assert len(all_settings_list) == len(DEFAULT_SETTINGS), "settings keys and UI components are out of sync"
 
@@ -2365,7 +2446,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         comp.change(fn=auto_save_state, inputs=all_settings_list)
 
     # Bucketing, tagging and inspection run as background jobs (refresh-safe); progress shows in the log.
-    crop_btn.click(fn=start_bucketing, inputs=[dataset_path, side_min_input, side_max_input], outputs=[output_log])
+    crop_btn.click(fn=start_bucketing, inputs=[dataset_path, side_min_input, side_max_input, convert_other_input], outputs=[output_log])
     open_ds_btn.click(fn=open_dataset_folder_ui, inputs=[dataset_path], outputs=[output_log])
     tagger_btn.click(fn=start_tagging, inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite], outputs=[output_log])
     inspect_btn.click(fn=start_inspect, inputs=[dataset_path, trigger_word], outputs=[output_log])

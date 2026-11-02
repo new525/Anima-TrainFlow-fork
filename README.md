@@ -78,28 +78,33 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 ### Updating
 * **git:** run `git pull`.
 * **Zip:** extract the new release, then copy the *contents* of its top folder over your existing install. The zip doesn't contain your settings (`training/settings.json`), runs (`training/output/`) or installed packages, so they are kept.
-* Re-run `Install_Requirements.bat` when the changelog says dependencies changed. **1.2.1 changed one:** it updates Gradio.
+* Re-run `Install_Requirements.bat` when the changelog says dependencies changed.
+  * **1.2.1** updated Gradio.
+  * The next release adds `pillow-jxl-plugin` for JPEG XL.
 
 ---
 
 ## Using it
 
 ### Prepare the dataset
-Put your images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`) in one folder and set it as **Dataset Path**. Videos, GIFs and AVIF images can go in too:
+Put your images (`.png`, `.jpg`, `.jpeg`, `.webp`, `.bmp`) in one folder and set it as **Dataset Path**. Other formats can go in too:
 * **Videos:** `.mp4`, `.m4v`, `.mov`, `.webm`, `.mkv`, `.avi`, `.wmv`, `.flv`, `.mpg`, `.mpeg`
-* **GIFs and AVIF** images
+* **GIF, AVIF and JPEG XL (`.jxl`)** images
+* **Anything else Pillow or OpenCV can read**, such as TIFF, PSD, TGA, `.jfif`, a saved `.jpg_large`, or `.3gp` and `.ts` videos. This is on by default; untick *Also convert any other format…* to limit conversion to the formats above.
 
 Then:
 
 1. **✂️ Start Bucketing** resizes and crops images to training buckets.
-   * First it turns each video or GIF into an image of its middle frame, and converts each AVIF to PNG. Training can't read these formats directly. Phone videos come out upright.
+   * First it turns each video or animation into an image of its middle frame, and converts the other formats to PNG. Training can't read these formats directly. Phone videos come out upright.
+   * A multi-page TIFF gives its first page, and a layered PSD its flattened image.
+   * Files that nothing can decode are left where they are and listed in the log. This includes audio, documents and caches.
    * Your originals, including the videos, GIFs and AVIFs, are moved to `original_images/` and never modified.
    * Running it again with different sizes regenerates the crops from those originals.
    * A caption already written for a video (`clip.txt` next to `clip.mp4`) pairs with the image made from it (`clip.png`).
 2. **Create .txt captions** auto-tags every image with the WD tagger.
 3. **🔎 Inspect Dataset** checks the result before you spend an hour training:
    * missing, empty or orphaned captions
-   * videos, GIFs or AVIFs that haven't been converted yet
+   * videos, GIFs or other formats that haven't been converted yet
    * oversized, small, unreadable or rotated images
    * repeated tags, and the trigger word already in some captions
    * the most frequent tags, and tags present in every caption
