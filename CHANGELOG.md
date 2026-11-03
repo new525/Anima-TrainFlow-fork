@@ -3,7 +3,7 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [1.4] - 2026-11-02
 
 **Updating:** re-run `Install_Requirements.bat`, or run `python_embeded\python.exe -m pip install pillow-jxl-plugin==1.3.8 pillow-heif==1.8.1`, for JPEG XL and HEIC support.
 
@@ -70,6 +70,8 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **Not tested on Windows:** the non-ASCII path fallbacks. They were only exercised on Linux by making OpenCV refuse the path.
 
 ## [1.2.1] - 2026-10-16
+
+Published as GitHub release `1.3`.
 
 **Updating from 1.2:** re-run `Install_Requirements.bat`, or run `python_embeded\python.exe -m pip install gradio==6.17.3`, so the new Gradio version is installed.
 

@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.2.1** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.4** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.2.1) |
+| | Upstream (v1.1.0) | This fork (1.4) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
@@ -24,6 +24,7 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 | **Picking a checkpoint** | One preview prompt, unlabelled gallery | Several prompts, step × prompt grid, live loss chart, labelled previews |
 | **Re-running bucketing with new sizes** | Can overwrite your original images with crops | Non-destructive; originals are never touched |
 | **Phone photos** | Bucket chosen from unrotated size: cropped the wrong way | Rotated upright first |
+| **Dataset formats** | PNG, JPG, WebP, BMP (the tagger skipped BMP) | Also videos and GIFs (their middle frame), AVIF, JPEG XL, HEIC, and anything else Pillow or OpenCV can read |
 | **Dataset checks** | Pre-flight (its oversized-image check never fired) | Working pre-flight plus 🔎 Inspect Dataset |
 | **Bucketing / tagging during a refresh** | Interrupted with the tab | Run in the background |
 | **Trigger word prefix** | `trigger,  tags` (double space); added even if captions already contain it | `trigger, tags`; skipped when every caption has it |
@@ -79,8 +80,8 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 * **git:** run `git pull`.
 * **Zip:** extract the new release, then copy the *contents* of its top folder over your existing install. The zip doesn't contain your settings (`training/settings.json`), runs (`training/output/`) or installed packages, so they are kept.
 * Re-run `Install_Requirements.bat` when the changelog says dependencies changed.
-  * **1.2.1** updated Gradio.
-  * The next release adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
+  * **1.2.1** (GitHub release 1.3) updated Gradio.
+  * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
 
 ---
 
