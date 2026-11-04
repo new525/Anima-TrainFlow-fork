@@ -3,6 +3,47 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.5] - 2026-11-04
+
+### Added
+- **Captions from embedded tags.** *Create .txt captions* first uses tags already saved in the image, e.g. by Grabber, and runs the WD tagger only for images without any. When every image has them, the WD model isn't loaded at all.
+  - **Read from**, matching what Grabber writes through exiftool (`-sep ";"`) or the Windows Property System:
+    - XMP `dc:subject` (`Subject`), or XMP `pdf:Keywords` (`Keywords` on GIF/MP4)
+    - IPTC Keywords (`Keywords` on JPG/PNG; exiftool hex-encodes it inside PNG)
+    - EXIF `XPKeywords` (Windows `System.Keywords`)
+    - `.xmp` sidecars named `image.jpg.xmp` or `image.xmp`
+  - **The original is read too.** After bucketing, the caption comes from the original or source in `original_images/`, so tags saved in GIFs and MP4s are used for their extracted frame.
+  - **One source per image.** The `exiftool -Keywords -Subject -w txt` approach writes both fields, so a file with both gets every tag twice; here only one is used.
+  - **Splitting:** comma, semicolon and space-separated lists are all handled, which covers Grabber's default `%all%` and `%all:separator=,%` and replaces a comma-fixing pass.
+  - **Anima caption format**, from the model card:
+    - Lowercase, with spaces instead of underscores; score tags and kaomoji keep their underscores.
+    - Artists get an `@` prefix.
+    - Order: meta, 1girl/1boy/1other, character, series, artist, general. Count tags are moved to the front even without namespaces.
+    - Parentheses aren't escaped (`hatsune miku (cosplay)`).
+  - **Namespaces:** Grabber's `%all:includenamespace,unsafe%` form (`artist:name`) is understood, mapped from Grabber's own categories (artist/circle → artist, character/model, copyright → series, meta, general/species/…).
+    - The underscore form without `unsafe` (`artist_name`) is only treated as namespaced when every tag carries one, because real tags such as `artist name` look the same.
+  - Checkbox *Use tags embedded in the images first*, on by default and saved with your settings.
+  - 🔎 Inspect Dataset reports how many images carry embedded tags.
+- **🔢 Rename to Numbers.** Renames images to `001`, `002`, … in filename order, like a pair-renaming script, but keeps everything linked.
+  - Captions, originals and sources in `original_images/`, `.xmp` sidecars and the bucketing manifest are renamed together, so re-bucketing finds nothing new and captioning still finds embedded tags.
+  - It goes through temporary names, so overlapping names (`002` → `001` while `1` → `002`) can't collide.
+  - It writes `rename_map_<time>.json` first.
+  - It changes nothing when another file already uses a new name, such as an orphan `002.txt` that would otherwise become an image's caption.
+  - It refuses to run during training.
+
+### Changed
+- `.xmp` sidecars are no longer probed as images by bucketing.
+
+### Verified
+- **Test files:** written by exiftool 13.60 with Grabber's exact arguments.
+  - Your comma-separated `Keywords`, both fields on one file, and the namespaced colon and underscore forms.
+  - A Japanese tag via XMP, sidecars in both naming styles, Windows keywords with a score tag, kaomoji, IPTC inside PNG, parentheses.
+  - GIF and MP4 sources read after bucketing.
+- **Captioning paths:** all embedded (WD never loads), the checkbox off, and existing captions kept.
+- **Rename:** it keeps re-bucketing and captioning working, and handles overlapping names. An orphan caption or sidecar with a target name aborts it.
+- **UI:** run end to end in the browser.
+- **Confirmed:** exiftool stores non-ASCII IPTC keywords as `?`, and rejects the dotted key names from Grabber's docs.
+
 ## [1.4] - 2026-11-02
 
 **Updating:** re-run `Install_Requirements.bat`, or run `python_embeded\python.exe -m pip install pillow-jxl-plugin==1.3.8 pillow-heif==1.8.1`, for JPEG XL and HEIC support.

@@ -112,7 +112,7 @@ MEDIA_EXTS = VIDEO_EXTS | PIL_CONVERT_EXTS
 # Any other file in the dataset folder is probed (Pillow, then OpenCV for video) unless it's one of these.
 NEVER_PROBE_EXTS = {
     '.txt', '.caption', '.json', '.toml', '.yaml', '.yml', '.csv', '.md', '.log', '.ini', '.xml', '.html', '.htm',
-    '.npz', '.npy', '.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.onnx', '.part', '.tmp', '.bak',
+    '.npz', '.npy', '.safetensors', '.ckpt', '.pt', '.pth', '.bin', '.onnx', '.part', '.tmp', '.bak', '.xmp',
     '.zip', '.7z', '.rar', '.tar', '.gz', '.exe', '.dll', '.bat', '.py', '.lnk', '.url', '.db',
     '.m3u', '.m3u8', '.pls', '.cue', '.srt', '.ass', '.ssa', '.vtt', '.sub',      # FFmpeg would follow playlists
     '.mp3', '.wav', '.flac', '.ogg', '.opus', '.m4a', '.aac', '.wma',             # audio, no frames
@@ -778,7 +778,8 @@ DEFAULT_SETTINGS = {
     "tagger_overwrite": False,
     "save_resume_state": True,
     "blocks_to_swap": 0,
-    "convert_other_formats": True,  # keep new keys at the end: settings are zipped with the UI components in order
+    "convert_other_formats": True,
+    "use_embedded_tags": True,  # keep new keys at the end: settings are zipped with the UI components in order
 }
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
@@ -1526,6 +1527,217 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, conver
 
 
 # ==========================================
+# EMBEDDED TAGS (Grabber / exiftool / Windows keywords)
+# Grabber stores tags via exiftool (-sep ";") or the Windows Property System. They end up in XMP dc:subject,
+# XMP pdf:Keywords (GIF/MP4 "Keywords"), IPTC Keywords, EXIF XPKeywords, or an .xmp sidecar. Bucketing re-encodes
+# the dataset PNGs, so the original in original_images/ (and any sidecar) is read too.
+# Captions follow Anima's model card: lowercase, spaces instead of underscores (score tags keep them), artists
+# prefixed with @, order [meta] [1girl/1boy...] [character] [series] [artist] [general].
+# ==========================================
+KAOMOJIS = ["0_0", "(o)_(o)", "+_+", "+_-", "._.", "<o>_<o>", "<|>_<|>", "=_=", ">_<", "3_3", "6_9", ">_o", "@_@", "^_^", "o_o", "u_u", "x_x", "|_|", "||_||"]
+# Grabber's namespace names (tags/tag.cpp) -> Anima caption section
+TAG_NAMESPACES = {
+    "artist": "artist", "circle": "artist",
+    "character": "character", "model": "character",
+    "copyright": "series", "series": "series",
+    "meta": "meta",
+    "general": "general", "species": "general", "photo_set": "general", "unknown": "general", "lore": "general", "invalid": "general",
+}
+CAPTION_SECTIONS = ["meta", "count", "character", "series", "artist", "general"]
+_COUNT_TAG = re.compile(r"^(?:\d+\+?|multiple )(?:girl|boy|other)s?$")
+_SCORE_TAG = re.compile(r"^score_\d+(?:_up)?$")
+_XMP_PACKET = re.compile(rb"<x:xmpmeta.*?</x:xmpmeta>", re.S)
+_XMP_SUBJECT = re.compile(r"<dc:subject\b[^>]*>(.*?)</dc:subject>", re.S)
+_XMP_LI = re.compile(r"<rdf:li\b[^>]*>(.*?)</rdf:li>", re.S)
+_XMP_PDF_KW = re.compile(r"<pdf:Keywords\b[^>]*>(.*?)</pdf:Keywords>|\bpdf:Keywords\s*=\s*(['\"])(.*?)\2", re.S)
+_XMP_SCAN_WHOLE = 64 * 1024 * 1024  # bigger files (videos): scan the first and last 32 MB, where containers keep metadata
+
+
+def _decode_text(raw: bytes) -> str:
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("cp1252", errors="replace")  # exiftool writes IPTC as Latin unless told otherwise
+
+
+def _xmp_items_from_text(text: str) -> List[str]:
+    import html
+    for m in _XMP_SUBJECT.finditer(text):
+        items = [html.unescape(li).strip() for li in _XMP_LI.findall(m.group(1))]
+        if any(items):
+            return items
+    for m in _XMP_PDF_KW.finditer(text):
+        value = m.group(1) if m.group(1) is not None else m.group(3)
+        if value and value.strip():
+            return [html.unescape(value).strip()]
+    return []
+
+
+def _xmp_items_from_file(path: Path) -> List[str]:
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            if size <= _XMP_SCAN_WHOLE:
+                blobs = [f.read()]
+            else:
+                head = f.read(_XMP_SCAN_WHOLE // 2)
+                f.seek(size - _XMP_SCAN_WHOLE // 2)
+                blobs = [head, f.read()]
+    except OSError:
+        return []
+    for blob in blobs:
+        for packet in _XMP_PACKET.findall(blob):
+            items = _xmp_items_from_text(packet.decode("utf-8", errors="replace"))
+            if items:
+                return items
+    return []
+
+
+def _iim_keywords(blob: bytes) -> List[str]:
+    """IPTC IIM record 2, dataset 25 (Keywords)."""
+    out, i = [], 0
+    while True:
+        i = blob.find(b"\x1c\x02\x19", i)
+        if i < 0 or i + 5 > len(blob):
+            return out
+        n = int.from_bytes(blob[i + 3:i + 5], "big")
+        start = i + 5
+        if n & 0x8000:  # extended dataset length
+            k = n & 0x7FFF
+            n, start = int.from_bytes(blob[start:start + k], "big"), start + k
+        out.append(_decode_text(blob[start:start + n]).strip())
+        i = start + n
+
+
+def _pil_keyword_items(path: Path) -> Tuple[List[str], str]:
+    """IPTC Keywords and EXIF XPKeywords (Windows keywords) through Pillow."""
+    from PIL import IptcImagePlugin
+    try:
+        with Image.open(path) as im:
+            items: List[str] = []
+            if im.format in ("JPEG", "TIFF", "MPO"):
+                info = IptcImagePlugin.getiptcinfo(im) or {}
+                v = info.get((2, 25))
+                if v:
+                    items = [_decode_text(x).strip() for x in (v if isinstance(v, list) else [v])]
+            elif "Raw profile type iptc" in im.info:  # exiftool writes PNG IPTC as a hex text chunk
+                lines = str(im.info["Raw profile type iptc"]).strip().splitlines()
+                items = _iim_keywords(bytes.fromhex("".join(lines[2:])))
+            if any(items):
+                return items, "IPTC"
+            xp = im.getexif().get(0x9C9E)
+            if xp:
+                text = (xp if isinstance(xp, bytes) else bytes(xp)).decode("utf-16-le", errors="ignore").rstrip("\x00").strip()
+                if text:
+                    return [text], "Windows keywords"
+    except Exception:
+        pass
+    return [], ""
+
+
+def _split_tag_items(items: List[str]) -> List[str]:
+    items = [s.strip() for s in items if s and s.strip()]
+    out: List[str] = []
+    for s in items:
+        if re.search(r"[,;\n]", s):
+            out += re.split(r"[,;\n]+", s)          # one keyword holding a comma/semicolon list
+        elif len(items) == 1:
+            out += s.split()                          # Grabber's default %all%: space-separated booru tags
+        else:
+            out.append(s)                             # one tag per keyword
+    return [t.strip() for t in out if t.strip()]
+
+
+def _split_namespaces(tags: List[str]) -> List[Tuple[str | None, str]]:
+    def colon(t):
+        ns, sep, rest = t.partition(":")
+        return (ns.lower(), rest) if sep and rest and ns.lower() in TAG_NAMESPACES else (None, t)
+    parsed = [colon(t) for t in tags]
+    if any(ns for ns, _ in parsed):
+        return parsed                                 # %all:includenamespace,unsafe% -> artist:name
+    # %all:includenamespace% without unsafe gives artist_name. Real tags look like that too (artist_name,
+    # character_doll), so this form only counts when every tag carries a namespace.
+    known = sorted(TAG_NAMESPACES, key=len, reverse=True)
+    def underscore(t):
+        for ns in known:
+            if t.lower().startswith(ns + "_") and len(t) > len(ns) + 1:
+                return ns, t[len(ns) + 1:]
+        return None
+    us = [underscore(t) for t in tags]
+    if tags and all(us):
+        return us
+    return [(None, t) for t in tags]
+
+
+def format_embedded_tags(items: List[str]) -> str:
+    """Raw keyword values -> Anima-style caption."""
+    sections: dict = {s: [] for s in CAPTION_SECTIONS}
+    seen = set()
+    for ns, tag in _split_namespaces(_split_tag_items(items)):
+        t = tag.strip()
+        if t in KAOMOJIS:
+            section, text = "general", t
+        else:
+            text = t.lower()
+            if not _SCORE_TAG.match(text):
+                text = re.sub(r"\s+", " ", text.replace("_", " ")).strip()
+            section = TAG_NAMESPACES.get(ns, "general") if ns else "general"
+            if section == "artist" or text.startswith("@"):
+                section, text = "artist", "@" + text.lstrip("@").strip()
+            elif section == "general" and _COUNT_TAG.match(text):
+                section = "count"
+        if text and text != "@" and text not in seen:
+            seen.add(text)
+            sections[section].append(text)
+    return ", ".join(t for s in CAPTION_SECTIONS for t in sections[s])
+
+
+class EmbeddedTagIndex:
+    """Finds the embedded tags for a dataset image: in the file itself, its original in original_images/, or an
+    .xmp sidecar (image.jpg.xmp or image.xmp) next to either."""
+    def __init__(self, dataset_dir: Path):
+        self.root = dataset_dir
+        self.backup = dataset_dir / "original_images"
+        self.by_stem: dict = {}
+        self.sidecars: dict = {}
+        for folder in (self.root, self.backup):
+            if not folder.is_dir():
+                continue
+            for f in folder.iterdir():
+                if not f.is_file():
+                    continue
+                if f.suffix.lower() == ".xmp":
+                    base = f.name[:-4]
+                    for key in {base.lower(), Path(base).stem.lower()}:
+                        self.sidecars.setdefault(key, []).append(f)
+                elif f.name != BUCKET_MANIFEST and f.suffix.lower() not in (".txt", ".part"):
+                    self.by_stem.setdefault(f.stem.lower(), []).append(f)
+
+    def items_for(self, image: Path) -> Tuple[List[str], str]:
+        key = image.stem.lower()
+        candidates = [image] + sorted((f for f in self.by_stem.get(key, []) if f != image), key=lambda p: (p.parent != self.backup, p.name))
+        for c in candidates:
+            items = _xmp_items_from_file(c)
+            if items:
+                return items, "XMP" if c == image else "XMP (original)"
+            items, src = _pil_keyword_items(c)
+            if items:
+                return items, src if c == image else f"{src} (original)"
+        for sc in sorted(set(self.sidecars.get(key, []) + [s for c in candidates for s in self.sidecars.get(c.name.lower(), [])])):
+            try:
+                items = _xmp_items_from_text(sc.read_text(encoding="utf-8", errors="replace"))
+            except OSError:
+                items = []
+            if items:
+                return items, "XMP sidecar"
+        return [], ""
+
+    def caption_for(self, image: Path) -> Tuple[str, str]:
+        items, src = self.items_for(image)
+        return (format_embedded_tags(items), src) if items else ("", "")
+
+
+# ==========================================
 # TAGGER CLASS (WD14)
 # ==========================================
 class WDTagger:
@@ -1538,7 +1750,7 @@ class WDTagger:
         self.model_dir = ROOT / "models" / "wd-eva02-large-tagger-v3"
         self.model_path = self.model_dir / "model.onnx"
         self.csv_path = self.model_dir / "selected_tags.csv"
-        self.kaomojis = ["0_0", "(o)_(o)", "+_+", "+_-", "._.", "<o>_<o>", "<|>_<|>", "=_=", ">_<", "3_3", "6_9", ">_o", "@_@", "^_^", "o_o", "u_u", "x_x", "|_|", "||_||"]
+        self.kaomojis = KAOMOJIS
 
     def load_model(self):
         if self.model is not None:
@@ -1615,7 +1827,7 @@ wd_tagger = WDTagger()
 # GUI EXECUTOR FUNCTIONS
 # ==========================================
 
-def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
+def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, use_embedded=True):
     
     if not dataset_dir or not os.path.exists(dataset_dir):
         console.append("❌ Tagger Error: Dataset path invalid!")
@@ -1645,6 +1857,42 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
         console.append(f"ℹ️ All images already have captions. Skipped: {skipped}")
         yield console.text()
         return
+
+    from_embedded = 0
+    if use_embedded:
+        console.append(f"🔎 Looking for tags embedded in {len(image_files)} image(s) (Grabber/exiftool/Windows keywords)...")
+        yield console.text()
+        index = EmbeddedTagIndex(Path(dataset_dir))
+        remaining, by_source, example = [], {}, None
+        for n, f in enumerate(image_files, start=1):
+            try:
+                caption, src = index.caption_for(f)
+            except Exception:
+                caption, src = "", ""
+            if caption:
+                tmp = f.with_name(f.stem + ".txt.part")
+                tmp.write_text(caption, encoding="utf-8")
+                os.replace(tmp, f.with_suffix(".txt"))
+                from_embedded += 1
+                by_source[src] = by_source.get(src, 0) + 1
+                example = example or (f.name, caption)
+            else:
+                remaining.append(f)
+            if n % 25 == 0:
+                console.replace_last_if(f"🔎 Embedded tags: checked {n}/{len(image_files)}", "Embedded tags: checked")
+                yield console.text()
+        image_files = remaining
+        if from_embedded:
+            console.append(f"🏷️ Captioned {from_embedded} image(s) from embedded tags ("
+                           + ", ".join(f"{k}: {v}" for k, v in sorted(by_source.items())) + ").")
+            console.append(f"   e.g. {example[0]}: {example[1][:160]}{'…' if len(example[1]) > 160 else ''}")
+        else:
+            console.append("ℹ️ No embedded tags found.")
+        if not image_files:
+            console.append(f"✅ Tagging complete! From embedded tags: {from_embedded} | Skipped: {skipped} (WD tagger not needed)")
+            yield console.text()
+            return
+        console.append(f"🏷️ {len(image_files)} image(s) without embedded tags go to the WD tagger.")
 
     console.append(f"🏷️ Initializing WD-Tagger (Multi-threaded)...")
     yield console.text()
@@ -1685,7 +1933,7 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
                     console.replace_last_if(msg, "Tag Progress:")
                     yield console.text()
 
-        console.append(f"✅ Tagging complete! Processed: {processed_count} | Skipped: {skipped}")
+        console.append(f"✅ Tagging complete! Processed: {processed_count}" + (f" | From embedded tags: {from_embedded}" if from_embedded else "") + f" | Skipped: {skipped}")
         
     except Exception as e:
         console.append(f"❌ Critical Tagger Error: {str(e)}")
@@ -1696,12 +1944,105 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
         yield console.text()
 
 
+def rename_dataset_sequential(dataset_dir: str) -> Generator[str, None, None]:
+    """Rename every image (and everything tied to it) to 001, 002, ... in filename order: the image, its caption,
+    its original and source in original_images/, .xmp sidecars, and bucketing's manifest. Writes the old->new map
+    to rename_map_<time>.json first, and refuses (changing nothing) if a new name would replace an unrelated file."""
+    path = Path(dataset_dir) if dataset_dir else None
+    if path is None or not path.is_dir():
+        console.append("❌ Rename: Dataset path invalid!")
+        yield console.text()
+        return
+    if training_manager.is_running():
+        console.append("⚠️ Rename: training is running and reads these files — stop or wait for it first.")
+        yield console.text()
+        return
+    backup = path / "original_images"
+    folders = [d for d in (path, backup) if d.is_dir()]
+    stems = sorted({f.stem for f in path.iterdir() if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTS | MEDIA_EXTS},
+                   key=lambda s: s.lower())
+    if not stems:
+        console.append("❌ Rename: no images in the dataset folder.")
+        yield console.text()
+        return
+    width = max(3, len(str(len(stems))))
+    new_stem = {s: f"{i:0{width}d}" for i, s in enumerate(stems, start=1)}
+    if all(s == n for s, n in new_stem.items()):
+        console.append(f"✅ Rename: already numbered 1–{len(stems)}.")
+        yield console.text()
+        return
+
+    def owner(f: Path) -> str | None:
+        if f.suffix.lower() == ".xmp":                 # image.jpg.xmp or image.xmp
+            base = f.name[:-4]
+            for cand in (base, Path(base).stem):
+                if cand in new_stem:
+                    return cand
+            return None
+        return f.stem if f.stem in new_stem else None
+
+    moves = []  # (old, new)
+    for d in folders:
+        for f in sorted(d.iterdir()):
+            s = owner(f) if f.is_file() and f.name != BUCKET_MANIFEST else None
+            if s is not None and new_stem[s] != s:
+                moves.append((f, d / (new_stem[s] + f.name[len(s):])))
+    moving = {old for old, _ in moves}
+    # Any other file already using a new name would get attached to the renamed image (an orphan 002.txt would
+    # become 002.jpg's caption), so it blocks the rename, whatever its extension.
+    targets = {new_stem[s] for s in stems if new_stem[s] != s}
+    def stem_of(f: Path) -> str:
+        if f.suffix.lower() == ".xmp":
+            base = f.name[:-4]
+            return base if base in targets else Path(base).stem
+        return f.stem
+    blocked = [f for d in folders for f in sorted(d.iterdir())
+               if f.is_file() and f not in moving and f.name != BUCKET_MANIFEST and stem_of(f) in targets]
+    if blocked:
+        console.append("❌ Rename aborted, nothing was changed. These files already use the new names and would get attached to the wrong image:")
+        console.extend([f"  • {b.relative_to(path)}" for b in blocked[:10]])
+        yield console.text()
+        return
+
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    map_file = path / f"rename_map_{stamp}.json"
+    with open(map_file, "w", encoding="utf-8") as fh:
+        json.dump({str(o.relative_to(path)): str(n.relative_to(path)) for o, n in moves}, fh, indent=1, ensure_ascii=False)
+    # two phases through hidden temporary names, so 002 -> 001 and 001 -> 002 can't collide
+    temps = []
+    for i, (old, new) in enumerate(moves):
+        tmp = old.with_name(f".tf_rename_{stamp}_{i}{old.suffix}")
+        os.replace(old, tmp)
+        temps.append((tmp, new))
+    for tmp, new in temps:
+        os.replace(tmp, new)
+
+    manifest = _load_manifest(backup) if backup.is_dir() else {}
+    if manifest:
+        renamed = {}
+        for key, rec in manifest.items():
+            k = Path(key)
+            nk = new_stem.get(k.stem, k.stem) + k.suffix
+            if isinstance(rec, dict) and "source" in rec:
+                src = Path(rec["source"])
+                rec = dict(rec, source=new_stem.get(src.stem, src.stem) + src.suffix)
+            renamed[nk] = rec
+        _save_manifest(backup, renamed)
+    console.append(f"🔢 Renamed {len(stems)} image(s) to {'0' * (width - 1)}1–{len(stems):0{width}d} ({len(moves)} files, including captions, originals and sidecars).")
+    console.append(f"   Old → new names saved in {map_file.name}. Latent caches are rebuilt on the next training run.")
+    yield console.text()
+
+
+def start_rename(dataset_dir):
+    return start_tool("Renaming", rename_dataset_sequential, dataset_dir)
+
+
 def start_bucketing(dataset_dir, side_min, side_max, convert_other=True):
     return start_tool("Bucketing", run_smart_crop_ui, dataset_dir, side_min, side_max, convert_other)
 
 
-def start_tagging(dataset_dir, gen_thresh, char_thresh, overwrite):
-    return start_tool("Auto-captioning", run_auto_tagging, dataset_dir, gen_thresh, char_thresh, overwrite)
+def start_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, use_embedded=True):
+    return start_tool("Auto-captioning", run_auto_tagging, dataset_dir, gen_thresh, char_thresh, overwrite, use_embedded)
 
 
 def start_inspect(dataset_dir, trigger_word):
@@ -1826,6 +2167,13 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
         if cond:
             problems += 1
             out.append(line)
+    try:
+        index = EmbeddedTagIndex(path)
+        with_embedded = sum(1 for img in images if index.items_for(img)[0])
+    except Exception:
+        with_embedded = 0
+    if with_embedded:
+        out.append(f"🏷️ {with_embedded} of {len(images)} image(s) carry embedded tags (Grabber/exiftool): Auto-Caption uses those instead of the WD tagger.")
     flag(media, f"⚠️ {len(media)} video/GIF/other-format file(s) not converted yet — ✂️ Start Bucketing turns them into PNG images: {_examples([f.name for f in media])}")
     flag(missing, f"❌ {len(missing)} image(s) without a caption: {_examples(missing)}")
     flag(unreadable, f"❌ {len(unreadable)} image(s) can't be opened: {_examples(unreadable)}")
@@ -2387,6 +2735,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                 with gr.Row():
                     crop_btn = gr.Button("✂️ Start Bucketing", variant="secondary")
                     open_ds_btn = gr.Button("📂 Open Dataset", variant="secondary")
+                    rename_btn = gr.Button("🔢 Rename to Numbers", variant="secondary")
                     
             # --- AUTO CAPTION ---
             with gr.Group():
@@ -2397,6 +2746,10 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                 with gr.Row():
                     tagger_btn = gr.Button("Create .txt captions", variant="secondary")        
                     tagger_overwrite = gr.Checkbox(label="Overwrite existing .txt", value=cs.get("tagger_overwrite", False)) 
+                use_embedded_input = gr.Checkbox(
+                    label="Use tags embedded in the images first (Grabber / exiftool / Windows keywords), WD tagger for the rest",
+                    value=cs.get("use_embedded_tags", True),
+                )
                 with gr.Row():
                     inspect_btn = gr.Button("🔎 Inspect Dataset", variant="secondary")
                 
@@ -2431,7 +2784,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     # Order must match DEFAULT_SETTINGS (auto_save_state zips them together).
     all_settings_list = training_inputs + [
         side_min_input, side_max_input, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, save_resume_state_input,
-        blocks_swap_input, convert_other_input,
+        blocks_swap_input, convert_other_input, use_embedded_input,
     ]
     assert len(all_settings_list) == len(DEFAULT_SETTINGS), "settings keys and UI components are out of sync"
 
@@ -2458,7 +2811,8 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     # Bucketing, tagging and inspection run as background jobs (refresh-safe); progress shows in the log.
     crop_btn.click(fn=start_bucketing, inputs=[dataset_path, side_min_input, side_max_input, convert_other_input], outputs=[output_log])
     open_ds_btn.click(fn=open_dataset_folder_ui, inputs=[dataset_path], outputs=[output_log])
-    tagger_btn.click(fn=start_tagging, inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite], outputs=[output_log])
+    tagger_btn.click(fn=start_tagging, inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, use_embedded_input], outputs=[output_log])
+    rename_btn.click(fn=start_rename, inputs=[dataset_path], outputs=[output_log])
     inspect_btn.click(fn=start_inspect, inputs=[dataset_path, trigger_word], outputs=[output_log])
     
     start_btn.click(fn=start_training, inputs=training_inputs + [save_resume_state_input, blocks_swap_input], outputs=[output_log])
