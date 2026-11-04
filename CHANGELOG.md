@@ -3,6 +3,37 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.6] - 2026-11-04
+
+### Added
+- **Duplicate check in ✂️ Start Bucketing.** It covers every image in the dataset, new and from earlier runs.
+  - **Exact duplicates:** the same SHA-256.
+  - **Likely duplicates** — re-saved, resized, JPEG/WebP-recompressed, watermarked or mirrored copies — must pass every test:
+    - a 64-bit difference hash within 10 bits, and the same aspect ratio within 2%;
+    - **colour:** the 90th percentile of per-pixel colour difference between 16×16 thumbnails ≤ 18/255. This tells colour variants apart (same drawing, different hair colour), which a grayscale hash can't;
+    - **structure:** the correlation of contrast-normalised 64×64 grayscale ≥ 0.93. This tells different line-art sketches apart, which thumbnails can't, because thin lines vanish when shrunk;
+    - images with no structure at all (solid fills) only match within 4 levels of colour.
+  - **Keeping:** the copy with the most pixels is kept; on a tie, the one with a caption, then the larger file. When a new download is larger than an image bucketed earlier, the new one is kept.
+  - **Set duplicates aside** (on by default, saved with your settings) moves the other copies to `duplicates/`, with their dataset files, captions, originals, sources and `.xmp` sidecars, and drops them from bucketing's records. Nothing is deleted. Unticked, the groups are only listed.
+  - Results are cached in `original_images/.duplicate_check_cache.json`, keyed by file size and modification time.
+- 🔎 Inspect Dataset lists duplicate groups.
+
+### Fixed
+- The bucketing summary's "Total Dataset Size" left out PNGs that were already bucket-sized, which bucketing leaves in place.
+
+### Verified
+- **No false positives** in 12,346 pairs of different images, including hash-similar pairs and mirrored comparisons:
+  - real photos, including a stereo pair (`motorcycle_left`/`right`);
+  - 120 flat-colour artworks with near-identical layouts;
+  - 80 same-pose line-art sketches;
+  - solid colours.
+- **Caught:** half-size, JPEG 60, WebP 70, half-size + JPEG 80, watermarked and mirrored copies of every test image.
+  - Misses: 2 of 186 quarter-size + JPEG 70 copies, and a 1-pixel chessboard pattern that aliases when halved.
+  - Brightness edits and crops are mostly not flagged, by design.
+- **Design history:** a first version that used only a grayscale hash and colour thumbnails flagged every pair of different sketches (3,213 of 3,213). That's why the structure test exists.
+- **In the bucketing flow:** a new copy larger than an image bucketed earlier, and a smaller one, the report-only mode, re-runs (nothing more found, nothing regenerated, cache untouched), Rename to Numbers afterwards, the inspector, and the browser UI.
+- **Speed:** 600 full-size JPEGs take 2.1 s on the first check and 0.03 s cached.
+
 ## [1.5] - 2026-11-04
 
 ### Added

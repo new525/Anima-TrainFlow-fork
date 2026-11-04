@@ -779,7 +779,8 @@ DEFAULT_SETTINGS = {
     "save_resume_state": True,
     "blocks_to_swap": 0,
     "convert_other_formats": True,
-    "use_embedded_tags": True,  # keep new keys at the end: settings are zipped with the UI components in order
+    "use_embedded_tags": True,
+    "set_duplicates_aside": True,  # keep new keys at the end: settings are zipped with the UI components in order
 }
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
@@ -1319,7 +1320,209 @@ def _save_manifest(backup_dir: Path, manifest: dict) -> None:
     os.replace(tmp, mf)
 
 
-def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, convert_other: bool = True) -> Generator[str, None, None]:
+# ---------- duplicate check ----------
+# Exact duplicates: same SHA-256. Likely duplicates (re-saved, resized, recompressed, watermarked or mirrored
+# copies) must pass every check:
+#   - 64-bit difference hash within DUP_DHASH_MAX bits and aspect ratio within DUP_ASPECT_TOL (fast pre-filter);
+#   - colour: 90th percentile of per-pixel colour difference between 16x16 thumbnails <= DUP_THUMB_MAX. Tells anime
+#     colour variants (same composition, different hair colour) apart, which a grayscale hash can't;
+#   - structure: correlation of contrast-normalised 64x64 grayscale >= DUP_NCC_MIN. Tells different line-art
+#     sketches apart, which thumbnails can't (thin lines vanish when shrunk);
+#   - images with no structure at all (solid fills) only match within DUP_FLAT_MAX levels of colour.
+# Measured on real photos, near-identical flat artworks, same-pose sketches and solid colours: no false positives in
+# 12,346 pairs; re-saves (resize, JPEG/WebP, watermark, mirror) caught; brightness edits and crops aren't flagged.
+DUPLICATES_DIR = "duplicates"
+DUP_CACHE = ".duplicate_check_cache.json"
+DUP_DHASH_MAX = 10
+DUP_THUMB_MAX = 18.0
+DUP_NCC_MIN = 0.93     # re-saved sketches >= 0.982; closest different sketches 0.857
+DUP_FLAT_STD = 2.0     # 64x64 grayscale std below this = no structure
+DUP_FLAT_MAX = 4
+DUP_ASPECT_TOL = 0.02
+
+
+def _image_signature(path: Path) -> dict:
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    with Image.open(path) as im:
+        w, h_ = oriented_size(im)
+        if im.format == "JPEG":
+            im.draft("RGB", (128, 128))  # decode at reduced size; plenty for a 16x16 thumbnail
+        rgb = Image.fromarray(_flatten_rgb(ImageOps.exif_transpose(im)))
+    import base64
+    gray = np.asarray(rgb.convert("L").resize((9, 8), Image.LANCZOS), np.int16)
+    bits = lambda a: int("".join("1" if b else "0" for b in (a[:, 1:] > a[:, :-1]).flatten()), 2)
+    thumb = np.asarray(rgb.resize((16, 16), Image.BOX), np.uint8)
+    g64 = np.asarray(rgb.convert("L").resize((64, 64), Image.BOX), np.uint8)
+    return {"v": 2, "sha": h.hexdigest(), "w": w, "h": h_, "dh": bits(gray), "dhm": bits(gray[:, ::-1]),
+            "thumb": thumb.tobytes().hex(), "g64": base64.b64encode(g64.tobytes()).decode("ascii")}
+
+
+def dataset_items(path: Path) -> dict:
+    """{stem: original file} for every image in the dataset: its original in original_images/ when there is one,
+    otherwise the file in the dataset folder (not bucketed yet, or a PNG bucketing kept in place)."""
+    backup = path / "original_images"
+    items: dict = {}
+    if backup.is_dir():
+        for f in sorted(backup.iterdir()):
+            if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTS:
+                items.setdefault(f.stem, f)
+    for f in sorted(path.iterdir()):
+        if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTS:
+            items.setdefault(f.stem, f)
+    return items
+
+
+def find_duplicates(path: Path) -> List[dict]:
+    """Groups of duplicates among the dataset's images, each {"keep": stem, "drop": [(stem, reason)], "info": {...}}."""
+    items = dataset_items(path)
+    if len(items) < 2:
+        return []
+    cache_dir = path / "original_images" if (path / "original_images").is_dir() else path
+    cache_file = cache_dir / DUP_CACHE
+    try:
+        cache = json.loads(cache_file.read_text(encoding="utf-8")) if cache_file.exists() else {}
+    except Exception:
+        cache = {}
+    sigs, fresh = {}, {}
+    for stem, f in items.items():
+        key = str(f.relative_to(path))
+        st = f.stat()
+        rec = cache.get(key)
+        if not (rec and rec.get("v") == 2 and rec.get("bytes") == st.st_size and rec.get("mtime_ns") == st.st_mtime_ns):
+            try:
+                rec = dict(_image_signature(f), bytes=st.st_size, mtime_ns=st.st_mtime_ns)
+            except Exception:
+                continue  # unreadable files are reported by bucketing itself
+        fresh[key] = rec
+        sigs[stem] = rec
+    if fresh != cache:  # don't touch the file when nothing changed
+        try:
+            tmp = cache_file.with_name(cache_file.name + ".part")
+            tmp.write_text(json.dumps(fresh), encoding="utf-8")
+            os.replace(tmp, cache_file)
+        except OSError:
+            pass
+
+    stems = list(sigs)
+    n = len(stems)
+    parent = list(range(n))
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]; i = parent[i]
+        return i
+    match: dict = {}  # (i, j) -> reason
+    by_sha: dict = {}
+    for i, s in enumerate(stems):
+        by_sha.setdefault(sigs[s]["sha"], []).append(i)
+    for idx in by_sha.values():
+        for j in idx[1:]:
+            parent[find(j)] = find(idx[0]); match[(idx[0], j)] = "identical file"
+    dh = np.array([sigs[s]["dh"] for s in stems], np.uint64)
+    dhm = np.array([sigs[s]["dhm"] for s in stems], np.uint64)
+    thumbs = np.stack([np.frombuffer(bytes.fromhex(sigs[s]["thumb"]), np.uint8).reshape(16, 16, 3) for s in stems]).astype(np.int16)
+    aspect = np.array([sigs[s]["w"] / max(1, sigs[s]["h"]) for s in stems])
+    import base64
+    g64 = np.stack([np.frombuffer(base64.b64decode(sigs[s]["g64"]), np.uint8).reshape(64, 64) for s in stems]).astype(np.float32)
+    flat = g64.reshape(n, -1).std(axis=1) < DUP_FLAT_STD
+    z = g64 - g64.mean(axis=(1, 2), keepdims=True)
+    z /= np.maximum(np.linalg.norm(z.reshape(n, -1), axis=1), 1e-6)[:, None, None]
+    mean_rgb = thumbs.mean(axis=(1, 2))
+    popcount = np.bitwise_count if hasattr(np, "bitwise_count") else (lambda x: np.array([bin(int(v)).count("1") for v in x]))
+    for i in range(n - 1):
+        j = np.arange(i + 1, n)
+        ok_aspect = np.abs(aspect[j] / aspect[i] - 1) <= DUP_ASPECT_TOL
+        for flipped, hashes, label in ((False, dh, "same picture"), (True, dhm, "mirrored copy")):
+            cand = j[ok_aspect & (popcount(dh[i] ^ hashes[j]) <= DUP_DHASH_MAX)]
+            if cand.size == 0:
+                continue
+            if flat[i]:   # no structure: only another flat image of (almost) the same colour
+                close = cand[flat[cand] & (np.abs(mean_rgb[cand] - mean_rgb[i]).max(axis=1) <= DUP_FLAT_MAX)]
+            else:
+                cand = cand[~flat[cand]]
+                other = thumbs[cand][:, :, ::-1] if flipped else thumbs[cand]
+                worst = np.abs(other - thumbs[i]).max(axis=3).reshape(len(cand), -1)  # per-pixel worst channel
+                cand = cand[np.percentile(worst, 90, axis=1) <= DUP_THUMB_MAX] if len(cand) else cand
+                zo = z[cand][:, :, ::-1] if flipped else z[cand]
+                close = cand[(zo * z[i]).sum(axis=(1, 2)) >= DUP_NCC_MIN] if len(cand) else cand
+            for k in close:
+                k = int(k)
+                if (i, k) not in match:
+                    match[(i, k)] = label
+                parent[find(k)] = find(i)
+    groups: dict = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    out = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        def score(i):
+            s = stems[i]
+            return (sigs[s]["w"] * sigs[s]["h"], (path / f"{s}.txt").exists(), sigs[s]["bytes"], -i)
+        keep = max(members, key=score)
+        drop = []
+        for i in members:
+            if i == keep:
+                continue
+            reason = (match.get((min(i, keep), max(i, keep)))
+                      or ("identical file" if sigs[stems[i]]["sha"] == sigs[stems[keep]]["sha"] else "same picture (via another copy)"))
+            drop.append((stems[i], reason))
+        out.append({"keep": stems[keep], "drop": drop,
+                    "info": {stems[i]: (items[stems[i]].name, sigs[stems[i]]["w"], sigs[stems[i]]["h"]) for i in members}})
+    return sorted(out, key=lambda g: g["keep"].lower())
+
+
+def _set_aside(path: Path, stem: str, manifest: dict) -> int:
+    """Move everything tied to an image (dataset files, original, source, sidecars) into duplicates/."""
+    moved = 0
+    for src_dir, dest_dir in ((path, path / DUPLICATES_DIR), (path / "original_images", path / DUPLICATES_DIR / "original_images")):
+        if not src_dir.is_dir():
+            continue
+        for f in sorted(src_dir.iterdir()):
+            if not f.is_file() or f.name in (BUCKET_MANIFEST, DUP_CACHE):
+                continue
+            base = f.name[:-4] if f.suffix.lower() == ".xmp" else None
+            if f.stem == stem or (base is not None and (base == stem or Path(base).stem == stem)):
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                dest, n = dest_dir / f.name, 2
+                while dest.exists():
+                    dest, n = dest_dir / f"{f.stem}_{n}{f.suffix}", n + 1
+                shutil.move(str(f), str(dest))
+                moved += 1
+    manifest.pop(f"{stem}.png", None)
+    return moved
+
+
+def report_duplicates(path: Path, set_aside: bool, manifest: dict | None = None) -> Generator[str, None, None]:
+    console.append("🔍 Checking for duplicates...")
+    yield console.text()
+    groups = find_duplicates(path)
+    if not groups:
+        console.replace_last_if("🔍 Duplicate check: none found.", "Checking for duplicates")
+        yield console.text()
+        return
+    n_drop = sum(len(g["drop"]) for g in groups)
+    console.replace_last_if(f"🔍 Duplicate check: {len(groups)} group(s), {n_drop} extra cop{'y' if n_drop == 1 else 'ies'}:", "Checking for duplicates")
+    for g in groups[:30]:
+        name, w, h = g["info"][g["keep"]]
+        drops = ", ".join(f"{g['info'][s][0]} ({g['info'][s][1]}×{g['info'][s][2]}, {why})" for s, why in g["drop"])
+        console.append(f"   kept {name} ({w}×{h}) — {'set aside' if set_aside else 'duplicates'}: {drops}")
+    if len(groups) > 30:
+        console.append(f"   … and {len(groups) - 30} more group(s)")
+    if set_aside:
+        files = sum(_set_aside(path, s, manifest if manifest is not None else {}) for g in groups for s, _ in g["drop"])
+        console.append(f"   Moved {n_drop} image(s) ({files} files: captions, originals and sidecars too) to {DUPLICATES_DIR}/. Move them back to restore.")
+    else:
+        console.append("   Nothing moved (Set duplicates aside is off).")
+    yield console.text()
+
+
+def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, convert_other: bool = True,
+                      set_aside_duplicates: bool = True) -> Generator[str, None, None]:
     """Bucket the dataset. Originals live in <dataset>/original_images and are never overwritten; the
     dataset folder holds one <stem>.png per original, generated from it. Re-running with different sizes
     regenerates those PNGs from the originals instead of treating them as new originals."""
@@ -1428,6 +1631,14 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, conver
     if moved:
         console.append(f"📦 Moved {moved} new originals to original_images/")
 
+    # 2b. Duplicates among all originals (new and from earlier runs); extra copies go to duplicates/.
+    try:
+        yield from report_duplicates(path, bool(set_aside_duplicates), manifest)
+        if set_aside_duplicates and backup_dir.is_dir():
+            _save_manifest(backup_dir, manifest)
+    except Exception as e:
+        console.append(f"⚠️ Duplicate check failed: {e}")
+
     # 3. Task preparation (Idempotency + Statistics collection)
     originals = sorted(f for f in backup_dir.glob('*') if f.is_file() and f.suffix.lower() in valid_exts) if backup_dir.is_dir() else []
     tasks = []
@@ -1455,6 +1666,17 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, conver
             tasks.append((orig, out_p, tw, th))
         except Exception as e:
             unreadable.append(f"{orig.name}: {e}")
+
+    # PNGs that were already bucket-sized stay in the dataset folder as their own original: count them too.
+    backup_now = {f.stem for f in originals}
+    for f in path.iterdir():
+        if f.is_file() and f.suffix.lower() == ".png" and f.stem not in backup_now:
+            try:
+                with Image.open(f) as im:
+                    if im.size in available_buckets:
+                        bucket_counts[im.size] = bucket_counts.get(im.size, 0) + 1
+            except Exception:
+                pass
 
     for name in unreadable:
         console.append(f"⚠️ Could not read original {name}")
@@ -2037,8 +2259,8 @@ def start_rename(dataset_dir):
     return start_tool("Renaming", rename_dataset_sequential, dataset_dir)
 
 
-def start_bucketing(dataset_dir, side_min, side_max, convert_other=True):
-    return start_tool("Bucketing", run_smart_crop_ui, dataset_dir, side_min, side_max, convert_other)
+def start_bucketing(dataset_dir, side_min, side_max, convert_other=True, set_aside_duplicates=True):
+    return start_tool("Bucketing", run_smart_crop_ui, dataset_dir, side_min, side_max, convert_other, set_aside_duplicates)
 
 
 def start_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, use_embedded=True):
@@ -2174,6 +2396,12 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
         with_embedded = 0
     if with_embedded:
         out.append(f"🏷️ {with_embedded} of {len(images)} image(s) carry embedded tags (Grabber/exiftool): Auto-Caption uses those instead of the WD tagger.")
+    try:
+        dups = find_duplicates(path)
+    except Exception:
+        dups = []
+    flag(dups, f"⚠️ {len(dups)} group(s) of duplicate images ({sum(len(g['drop']) for g in dups)} extra copies) — ✂️ Start Bucketing sets the extra copies aside: "
+               + _examples([" = ".join(g["info"][s][0] for s in [g["keep"]] + [d for d, _ in g["drop"]]) for g in dups], 3))
     flag(media, f"⚠️ {len(media)} video/GIF/other-format file(s) not converted yet — ✂️ Start Bucketing turns them into PNG images: {_examples([f.name for f in media])}")
     flag(missing, f"❌ {len(missing)} image(s) without a caption: {_examples(missing)}")
     flag(unreadable, f"❌ {len(unreadable)} image(s) can't be opened: {_examples(unreadable)}")
@@ -2732,6 +2960,10 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     label="Also convert any other format Pillow or OpenCV can read (TIFF, PSD, TGA, .jfif, other videos…)",
                     value=cs.get("convert_other_formats", True),
                 )
+                dup_aside_input = gr.Checkbox(
+                    label="Set duplicates aside: identical files and re-saved, resized or mirrored copies go to duplicates/, keeping the largest",
+                    value=cs.get("set_duplicates_aside", True),
+                )
                 with gr.Row():
                     crop_btn = gr.Button("✂️ Start Bucketing", variant="secondary")
                     open_ds_btn = gr.Button("📂 Open Dataset", variant="secondary")
@@ -2784,7 +3016,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     # Order must match DEFAULT_SETTINGS (auto_save_state zips them together).
     all_settings_list = training_inputs + [
         side_min_input, side_max_input, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, save_resume_state_input,
-        blocks_swap_input, convert_other_input, use_embedded_input,
+        blocks_swap_input, convert_other_input, use_embedded_input, dup_aside_input,
     ]
     assert len(all_settings_list) == len(DEFAULT_SETTINGS), "settings keys and UI components are out of sync"
 
@@ -2809,7 +3041,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
         comp.change(fn=auto_save_state, inputs=all_settings_list)
 
     # Bucketing, tagging and inspection run as background jobs (refresh-safe); progress shows in the log.
-    crop_btn.click(fn=start_bucketing, inputs=[dataset_path, side_min_input, side_max_input, convert_other_input], outputs=[output_log])
+    crop_btn.click(fn=start_bucketing, inputs=[dataset_path, side_min_input, side_max_input, convert_other_input, dup_aside_input], outputs=[output_log])
     open_ds_btn.click(fn=open_dataset_folder_ui, inputs=[dataset_path], outputs=[output_log])
     tagger_btn.click(fn=start_tagging, inputs=[dataset_path, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, use_embedded_input], outputs=[output_log])
     rename_btn.click(fn=start_rename, inputs=[dataset_path], outputs=[output_log])

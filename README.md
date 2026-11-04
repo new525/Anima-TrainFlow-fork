@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.5** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.6** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.5) |
+| | Upstream (v1.1.0) | This fork (1.6) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
@@ -22,6 +22,7 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 | **Low VRAM** | No block swapping | Block Swap slider (up to 26 of 28 DiT blocks in system RAM) |
 | **Output folders** | One folder per keyword, shared by every run (earlier checkpoints overwritten); keywords with no Latin letters or digits all go to `untitled` | One folder per run: `output/<keyword>/<date_time>/`; any keyword |
 | **Picking a checkpoint** | One preview prompt, unlabelled gallery | Several prompts, step × prompt grid, live loss chart, labelled previews |
+| **Duplicate images** | Not checked | Identical files and re-saved, resized or mirrored copies found during bucketing and set aside, keeping the largest |
 | **Re-running bucketing with new sizes** | Can overwrite your original images with crops | Non-destructive; originals are never touched |
 | **Phone photos** | Bucket chosen from unrotated size: cropped the wrong way | Rotated upright first |
 | **Captions** | WD tagger only | Tags already embedded by Grabber/exiftool first, written in Anima's caption format; WD tagger for the rest |
@@ -83,7 +84,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 * Re-run `Install_Requirements.bat` when the changelog says dependencies changed.
   * **1.2.1** (GitHub release 1.3) updated Gradio.
   * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
-  * **1.5** adds no dependencies.
+  * **1.5** and **1.6** add no dependencies.
 
 ---
 
@@ -104,6 +105,11 @@ Then:
    * Your originals, including the videos, GIFs and AVIFs, are moved to `original_images/` and never modified.
    * Running it again with different sizes regenerates the crops from those originals.
    * A caption already written for a video (`clip.txt` next to `clip.mp4`) pairs with the image made from it (`clip.png`).
+   * **Duplicates are checked** across the whole dataset, including images bucketed in earlier runs.
+     * **What counts:** identical files, plus re-saved, resized, recompressed, watermarked or mirrored copies — the typical result of downloading one post from two sites, or a sample alongside the full size.
+     * **What happens:** the copy with the most pixels is kept; on a tie, the one with a caption. *Set duplicates aside* (on by default) moves the other copies to `duplicates/`, together with their captions, originals and sidecars. Nothing is deleted; move a file back to restore it.
+     * **Untick it** to only list the groups in the log.
+     * **What isn't a duplicate:** colour variants of the same drawing, different sketches with the same pose, and brightness-edited or cropped versions.
 2. **Create .txt captions** writes a `.txt` for every image.
    * **Embedded tags come first.** Tags that a downloader such as Grabber saved inside the image are used as they are, and the WD tagger only handles images without any.
      * **Where it looks:** XMP Subject/Keywords, IPTC Keywords, Windows keywords, or an `.xmp` sidecar. It reads the original in `original_images/` too, so it works after bucketing. It also reads tags saved in GIFs and videos.
@@ -115,6 +121,7 @@ Then:
      * Grabber's docs write keys as `XMP.Subject`; exiftool rejects that form, so use `Subject` or `XMP:Subject`.
 3. **🔎 Inspect Dataset** checks the result before you spend an hour training:
    * missing, empty or orphaned captions
+   * duplicate images
    * videos, GIFs or other formats that haven't been converted yet
    * oversized, small, unreadable or rotated images
    * repeated tags, and the trigger word already in some captions
