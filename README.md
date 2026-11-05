@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.7** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.8** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.7) |
+| | Upstream (v1.1.0) | This fork (1.8) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
@@ -85,7 +85,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 * Re-run `Install_Requirements.bat` when the changelog says dependencies changed.
   * **1.2.1** (GitHub release 1.3) updated Gradio.
   * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
-  * **1.5**, **1.6** and **1.7** add no dependencies.
+  * **1.5** through **1.8** add no dependencies.
 
 ---
 
@@ -109,7 +109,12 @@ Then:
    * **Duplicates are checked** across the whole dataset, including images bucketed in earlier runs.
      * **What counts:** identical files, plus re-saved, resized, recompressed, watermarked or mirrored copies — the typical result of downloading one post from two sites, or a sample alongside the full size.
      * **What happens:** the copy with the most pixels is kept; on a tie, the one with a caption. *Set duplicates aside* (on by default) moves the other copies to `duplicates/`, together with their captions, originals and sidecars. Nothing is deleted; move a file back to restore it.
-     * **Untick it** to only list the groups in the log.
+     * **Untick it** to only list the groups.
+     * **`duplicates.log`:** every check that finds duplicates appends the full list to this file in the dataset folder, whether or not they were moved.
+       * Each group shows the kept file and every copy, with its size and why it matched.
+       * Copies are listed with their path, or where they were moved.
+       * A report-only result identical to the previous one isn't appended again.
+       * It's a `.log` rather than a `.txt` so it isn't mistaken for a caption.
      * **What isn't a duplicate:** colour variants of the same drawing, different sketches with the same pose, and brightness-edited or cropped versions.
 2. **Create .txt captions** writes a `.txt` for every image.
    * **Embedded tags come first.** Tags that a downloader such as Grabber saved inside the image are used as they are, and the WD tagger only handles images without any.

@@ -3,6 +3,23 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.8] - 2026-11-05
+
+### Added
+- **`duplicates.log`.** Each duplicate check that finds something appends a timestamped section to `<dataset>/duplicates.log`, whether or not *Set duplicates aside* is on.
+  - **Contents:** every group, with the `KEEP` line, then a `COPY` line per extra copy giving its size, the reason (`identical file`, `same picture`, `mirrored copy`) and its path.
+  - **Set-aside copies** point to where the original went, e.g. `-> duplicates/original_images/x.jpg`.
+  - **Complete:** the on-screen log stops at 30 groups; the file doesn't.
+  - **No repeats:** a report-only result identical to the previous section isn't appended again, so re-running bucketing without moving anything doesn't fill the file.
+  - **Nothing found, nothing written.**
+  - It's a `.log` rather than a `.txt`, so the inspector, captioning and training don't treat it as a caption; format probing and 🔢 Rename to Numbers ignore it too.
+
+### Verified
+- Report-only and set-aside sections, the unchanged report-only re-run, 35 groups written in full, and no file when nothing is found.
+- The inspector, bucketing and the rename tool all leave the log alone.
+- Report-only mode in the browser.
+- All earlier test suites pass.
+
 ## [1.7] - 2026-11-04
 
 ### Added

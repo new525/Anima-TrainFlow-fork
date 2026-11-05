@@ -1342,6 +1342,7 @@ def _save_manifest(backup_dir: Path, manifest: dict) -> None:
 # Measured on real photos, near-identical flat artworks, same-pose sketches and solid colours: no false positives in
 # 12,346 pairs; re-saves (resize, JPEG/WebP, watermark, mirror) caught; brightness edits and crops aren't flagged.
 DUPLICATES_DIR = "duplicates"
+DUPLICATES_LOG = "duplicates.log"  # not .txt: in a dataset folder that would be read as a caption
 DUP_CACHE = ".duplicate_check_cache.json"
 DUP_DHASH_MAX = 10
 DUP_THUMB_MAX = 18.0
@@ -1486,9 +1487,10 @@ def find_duplicates(path: Path) -> List[dict]:
     return sorted(out, key=lambda g: g["keep"].lower())
 
 
-def _set_aside(path: Path, stem: str, manifest: dict) -> int:
-    """Move everything tied to an image (dataset files, original, source, sidecars) into duplicates/."""
-    moved = 0
+def _set_aside(path: Path, stem: str, manifest: dict) -> List[Tuple[Path, Path]]:
+    """Move everything tied to an image (dataset files, original, source, sidecars) into duplicates/.
+    Returns the (from, to) pairs."""
+    moved: List[Tuple[Path, Path]] = []
     for src_dir, dest_dir in ((path, path / DUPLICATES_DIR), (path / "original_images", path / DUPLICATES_DIR / "original_images")):
         if not src_dir.is_dir():
             continue
@@ -1502,9 +1504,48 @@ def _set_aside(path: Path, stem: str, manifest: dict) -> int:
                 while dest.exists():
                     dest, n = dest_dir / f"{f.stem}_{n}{f.suffix}", n + 1
                 shutil.move(str(f), str(dest))
-                moved += 1
+                moved.append((f, dest))
     manifest.pop(f"{stem}.png", None)
     return moved
+
+
+def _write_duplicates_log(path: Path, groups: List[dict], set_aside: bool, moved: dict) -> Path | None:
+    """Append this check's groups to <dataset>/duplicates.log. A report-only result identical to the last one
+    isn't appended again."""
+    log_file = path / DUPLICATES_LOG
+    rel = lambda p: str(p.relative_to(path)).replace(os.sep, "/")
+    items = dataset_items(path)  # after any set-aside: kept images are still here
+    rows = []
+    for g in groups:
+        name, w, h = g["info"][g["keep"]]
+        keep_path = items.get(g["keep"])
+        rows.append(f"KEEP  {name}  {w}x{h}" + (f"  {rel(keep_path)}" if keep_path is not None else ""))
+        for s, why in g["drop"]:
+            n, w2, h2 = g["info"][s]
+            line = f"COPY  {n}  {w2}x{h2}  {why}"
+            if set_aside:
+                # point at the original (what you'd move back), not the cropped copy that shares its name
+                pairs = sorted(moved.get(s, []), key=lambda sd: (sd[0].name != n, sd[0].parent.name != "original_images"))
+                dests = [d for _, d in pairs]
+                if dests:
+                    line += f"  -> {rel(dests[0])}"
+            elif items.get(s) is not None:
+                line += f"  {rel(items[s])}"
+            rows.append(line)
+        rows.append("")
+    n_drop = sum(len(g["drop"]) for g in groups)
+    summary = (f"{len(groups)} group(s), {n_drop} extra cop{'y' if n_drop == 1 else 'ies'} — "
+               + ("set aside to duplicates/" if set_aside else "not moved (Set duplicates aside is off)"))
+    body = summary + "\n" + "\n".join(rows)
+    try:
+        previous = log_file.read_text(encoding="utf-8") if log_file.exists() else ""
+        if not set_aside and previous.rstrip().endswith(body.rstrip()):
+            return log_file  # same report-only result as last time
+        with open(log_file, "a", encoding="utf-8") as fh:
+            fh.write(("\n" if previous else "") + f"=== {time.strftime('%Y-%m-%d %H:%M:%S')}  {body}")
+        return log_file
+    except OSError:
+        return None
 
 
 def report_duplicates(path: Path, set_aside: bool, manifest: dict | None = None) -> Generator[str, None, None]:
@@ -1523,11 +1564,18 @@ def report_duplicates(path: Path, set_aside: bool, manifest: dict | None = None)
         console.append(f"   kept {name} ({w}×{h}) — {'set aside' if set_aside else 'duplicates'}: {drops}")
     if len(groups) > 30:
         console.append(f"   … and {len(groups) - 30} more group(s)")
+    moved: dict = {}
     if set_aside:
-        files = sum(_set_aside(path, s, manifest if manifest is not None else {}) for g in groups for s, _ in g["drop"])
+        for g in groups:
+            for s, _ in g["drop"]:
+                moved[s] = _set_aside(path, s, manifest if manifest is not None else {})
+        files = sum(len(v) for v in moved.values())
         console.append(f"   Moved {n_drop} image(s) ({files} files: captions, originals and sidecars too) to {DUPLICATES_DIR}/. Move them back to restore.")
     else:
         console.append("   Nothing moved (Set duplicates aside is off).")
+    log_file = _write_duplicates_log(path, groups, set_aside, moved)
+    if log_file is not None:
+        console.append(f"   📝 Full list in {log_file.name}")
     yield console.text()
 
 
