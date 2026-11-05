@@ -3,6 +3,21 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.7] - 2026-11-04
+
+### Added
+- **Network Alpha** field next to Network Rank, saved with your settings.
+  - Before this, the app always wrote `network_alpha = network_rank`, so the LoRA output scale, alpha ÷ rank, was fixed at 1.0.
+  - The default, **0**, means "same as rank" and keeps exactly that behaviour, so existing setups train as before.
+  - Any positive value is passed through, fractional or above the rank.
+  - The start of each run logs the rank, the alpha and the resulting scale.
+  - ↩ Resume Run and ➕ Train More keep the alpha the run was started with, because they use that run's own config.
+
+### Verified
+- The generated config for alpha left at 0, empty, 8 at rank 32, 0.5, and 64 above the rank.
+- In the browser, the field keeps its value across a page refresh, and tab switching has no loop errors.
+- All earlier test suites pass.
+
 ## [1.6] - 2026-11-04
 
 ### Added

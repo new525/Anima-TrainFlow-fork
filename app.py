@@ -780,7 +780,8 @@ DEFAULT_SETTINGS = {
     "blocks_to_swap": 0,
     "convert_other_formats": True,
     "use_embedded_tags": True,
-    "set_duplicates_aside": True,  # keep new keys at the end: settings are zipped with the UI components in order
+    "set_duplicates_aside": True,
+    "network_alpha": 0,  # 0 = same as rank. Keep new keys at the end: settings are zipped with the UI components in order
 }
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
@@ -909,11 +910,20 @@ def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_
         toml.dump(dataset_config, f)
     return str(config_path)
 
-def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_request_file, save_resume_state, blocks_to_swap=0):
+def resolve_network_alpha(rank, alpha) -> float:
+    """0 or empty = same as rank (LoRA output scale alpha/rank = 1.0, the app's behaviour before this setting)."""
+    try:
+        a = float(alpha)
+    except (TypeError, ValueError):
+        a = 0.0
+    return float(int(rank)) if a <= 0 else a
+
+
+def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_request_file, save_resume_state, blocks_to_swap=0, network_alpha=0):
     config_path = config_save_dir / f"{project_name}_training.toml"
 
     network_rank = int(rank)
-    network_alpha = network_rank
+    network_alpha = resolve_network_alpha(network_rank, network_alpha)
     
     opt_args = ["weight_decay=0.01"]
     if optimizer == "Prodigy":
@@ -2639,7 +2649,7 @@ def extend_training(trigger_word, new_total):
         console.append(f"❌ Error: {str(e)}")
     return console.text()
 
-def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, save_resume_state, blocks_to_swap=0):
+def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, save_resume_state, blocks_to_swap=0, network_alpha=0):
     """Validate, write configs into a fresh run folder and hand the run to training_manager. Returns
     immediately; the trainer keeps running regardless of what happens to the browser tab."""
     if training_manager.is_running():
@@ -2732,13 +2742,16 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         console.append(f"⚠️ {with_trigger}/{n_caps} captions already contain '{trigger_word.strip()}' and will get it twice. 🔎 Inspect Dataset lists them.")
     if int(blocks_to_swap or 0) > 0:
         console.append(f"🧊 Block swap: {int(blocks_to_swap)} of 28 blocks kept in system RAM (less VRAM, slower steps).")
+    alpha_used = resolve_network_alpha(rank, network_alpha)
+    console.append(f"🔧 Network rank {int(rank)}, alpha {alpha_used:g} → LoRA output scale {alpha_used / int(rank):g}"
+                   + (" (alpha = rank)" if alpha_used == int(rank) else ""))
 
     halt_file = run_dir / ".halt_request"
     try:
         models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
         prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
         dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc, add_prefix=add_prefix)
-        training_toml = create_training_toml(project_name, project_configs_dir, run_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_file, save_resume_state, blocks_to_swap)
+        training_toml = create_training_toml(project_name, project_configs_dir, run_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_file, save_resume_state, blocks_to_swap, network_alpha)
         with open(run_dir / "run.json", "w", encoding="utf-8") as f:
             json.dump({"keyword": trigger_word.strip(), "output_name": project_name, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                        "dataset_path": str(dataset_path), "max_train_steps": int(t_steps)}, f, indent=2, ensure_ascii=False)
@@ -2928,6 +2941,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
             with gr.Column(scale=1):
                 with gr.Row():
                     rank_input = gr.Number(label="Network Rank", value=cs.get("network_rank", 16), precision=0)
+                    alpha_input = gr.Number(label="Network Alpha (0 = same as rank)", value=cs.get("network_alpha", 0), minimum=0)
                     lr_input = gr.Textbox(label="Learning Rate", value=cs.get("learning_rate", "1.0"))
                     optimizer_input = gr.Dropdown(label="Optimizer", choices=["Prodigy", "AdamW8bit", "AdamW"], value=cs.get("optimizer", "Prodigy"))
                     train_seed_val = gr.Number(value=cs.get("train_seed", 42), visible=False)
@@ -3016,7 +3030,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     # Order must match DEFAULT_SETTINGS (auto_save_state zips them together).
     all_settings_list = training_inputs + [
         side_min_input, side_max_input, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, save_resume_state_input,
-        blocks_swap_input, convert_other_input, use_embedded_input, dup_aside_input,
+        blocks_swap_input, convert_other_input, use_embedded_input, dup_aside_input, alpha_input,
     ]
     assert len(all_settings_list) == len(DEFAULT_SETTINGS), "settings keys and UI components are out of sync"
 
@@ -3047,7 +3061,7 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     rename_btn.click(fn=start_rename, inputs=[dataset_path], outputs=[output_log])
     inspect_btn.click(fn=start_inspect, inputs=[dataset_path, trigger_word], outputs=[output_log])
     
-    start_btn.click(fn=start_training, inputs=training_inputs + [save_resume_state_input, blocks_swap_input], outputs=[output_log])
+    start_btn.click(fn=start_training, inputs=training_inputs + [save_resume_state_input, blocks_swap_input, alpha_input], outputs=[output_log])
     pause_btn.click(fn=toggle_pause, outputs=output_log)
     halt_btn.click(fn=halt_training, outputs=output_log)
     stop_btn.click(fn=stop_training, outputs=output_log)

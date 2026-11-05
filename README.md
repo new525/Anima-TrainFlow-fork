@@ -6,19 +6,20 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.6** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.7** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.6) |
+| | Upstream (v1.1.0) | This fork (1.7) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
 | **Interrupting a run** | Stop only (progress lost) | ⏸ Pause, 💾 Halt & Save, ↩ Resume Run, crash recovery from resume points |
 | **Continuing a finished run** | — | ➕ Train More extends it to a higher step count |
+| **Network alpha** | Fixed to the rank | Settable (default: same as rank) |
 | **Low VRAM** | No block swapping | Block Swap slider (up to 26 of 28 DiT blocks in system RAM) |
 | **Output folders** | One folder per keyword, shared by every run (earlier checkpoints overwritten); keywords with no Latin letters or digits all go to `untitled` | One folder per run: `output/<keyword>/<date_time>/`; any keyword |
 | **Picking a checkpoint** | One preview prompt, unlabelled gallery | Several prompts, step × prompt grid, live loss chart, labelled previews |
@@ -84,7 +85,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 * Re-run `Install_Requirements.bat` when the changelog says dependencies changed.
   * **1.2.1** (GitHub release 1.3) updated Gradio.
   * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
-  * **1.5** and **1.6** add no dependencies.
+  * **1.5**, **1.6** and **1.7** add no dependencies.
 
 ---
 
@@ -146,6 +147,11 @@ Set a **Trigger Word**, which also names the run's folder, then press **🚀 Sta
 | ➕ **Train More** | Extends the keyword's newest *finished* run up to the current **Training Steps** value. The previous final LoRA is kept. |
 
 More options:
+* **Network Alpha:** the LoRA's output is scaled by alpha ÷ rank.
+  * **0** (the default) means "same as rank", giving a scale of 1.0, which is how the app always trained before this setting existed.
+  * **With AdamW:** Adam's steps don't depend on how large the gradients are, so the scale acts as a multiplier on the effective learning rate. Alpha 16 at rank 32 is roughly half the effective learning rate.
+  * **With Prodigy:** Prodigy estimates its own step size, so it should largely compensate for a different alpha. Leaving it at 0 is the safe choice.
+  * The log shows the alpha and scale each run uses.
 * **Block Swap (Low VRAM):** keeps that many of the 28 DiT blocks in system RAM. This lowers VRAM use at the cost of slower steps. Use it if training runs out of memory.
 * **Save resume points with each checkpoint** (on by default): saves a resume point with every checkpoint and keeps the newest two. A crash then costs at most one save interval, and ➕ Train More becomes possible.
 * You can refresh the page, close it, or even close the console window and restart the app. Training keeps going, and the restarted app reconnects to it.
