@@ -609,12 +609,13 @@ class ToolRunner:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.current: str | None = None
+        self.folder: str | None = None
 
-    def start(self, name: str, gen_fn, *args) -> str:
+    def start(self, name: str, gen_fn, *args, folder: str | None = None) -> str:
         with self._lock:
             if self.current is not None:
                 return f"⚠️ {self.current} is still running; wait for it to finish."
-            self.current = name
+            self.current, self.folder = name, folder
 
         def run():
             try:
@@ -624,7 +625,7 @@ class ToolRunner:
                 console.append(f"❌ {name} crashed: {e}")
             finally:
                 with self._lock:
-                    self.current = None
+                    self.current, self.folder = None, None
 
         threading.Thread(target=run, daemon=True, name=f"tool-{name}").start()
         return ""
@@ -633,14 +634,60 @@ class ToolRunner:
         with self._lock:
             return self.current
 
+    def busy_info(self) -> Tuple[str | None, str | None]:
+        with self._lock:
+            return self.current, self.folder
+
 
 tool_runner = ToolRunner()
+READ_ONLY_TOOLS = {"Dataset inspection"}
+GPU_TOOLS = {"Bucketing", "Auto-captioning"}
 
 
-def start_tool(name: str, gen_fn, *args) -> str:
-    if training_manager.is_running():
+def same_folder(a, b) -> bool:
+    try:
+        return os.path.normcase(os.path.realpath(str(a))) == os.path.normcase(os.path.realpath(str(b)))
+    except Exception:
+        return False
+
+
+def run_dataset_dir(run_dir: Path | None) -> Path | None:
+    """The image folder a run trains on, from its dataset config."""
+    if run_dir is None:
+        return None
+    for cfg in sorted((Path(run_dir) / "configs").glob("*_dataset.toml")):
+        try:
+            return Path(toml.load(str(cfg))["datasets"][0]["subsets"][0]["image_dir"])
+        except Exception:
+            continue
+    return None
+
+
+def training_uses_folder(folder) -> bool:
+    """True while a trainer is running on this dataset folder (or on one we can't identify, to be safe)."""
+    if not training_manager.is_running():
+        return False
+    used = run_dataset_dir(training_manager.snapshot()["run_dir"])
+    return used is None or same_folder(used, folder)
+
+
+def tool_blocks_training(dataset_dir) -> Tuple[str | None, str | None]:
+    """(reason training can't start now, warning to show). A dataset tool that moves or rewrites files in the
+    folder about to be trained on must finish first; one on another folder only competes for VRAM."""
+    name, folder = tool_runner.busy_info()
+    if name is None or name in READ_ONLY_TOOLS:
+        return None, None
+    if folder is None or dataset_dir is None or same_folder(folder, dataset_dir):
+        return f"⚠️ {name} is still running on this dataset — wait for it to finish, then start training.", None
+    if name in GPU_TOOLS:
+        return None, f"⚠️ {name} is running on another dataset and shares the GPU: training may run out of VRAM."
+    return None, None
+
+
+def start_tool(name: str, gen_fn, *args, folder: str | None = None) -> str:
+    if name in GPU_TOOLS and training_manager.is_running() and not training_uses_folder(folder):
         console.append(f"⚠️ Training is running: {name} will share the GPU with it and may run out of VRAM.")
-    msg = tool_runner.start(name, gen_fn, *args)
+    msg = tool_runner.start(name, gen_fn, *args, folder=folder)
     if msg:
         console.append(msg)
     return console.text()
@@ -783,19 +830,46 @@ DEFAULT_SETTINGS = {
     "set_duplicates_aside": True,
     "network_alpha": 0,  # 0 = same as rank. Keep new keys at the end: settings are zipped with the UI components in order
 }
+_settings_lock = threading.Lock()
+
+
 def load_settings():
     settings = DEFAULT_SETTINGS.copy()
     if SETTINGS_FILE.exists():
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                settings.update(json.load(f))
-        except Exception:
-            pass
+                loaded = json.load(f)
+            if not isinstance(loaded, dict):
+                raise ValueError("not a JSON object")
+            settings.update(loaded)
+        except Exception as e:
+            # Keep the unreadable file: otherwise the next auto-save would replace it with these defaults.
+            kept = SETTINGS_FILE.with_name(f"{SETTINGS_FILE.stem}.unreadable_{time.strftime('%Y%m%d_%H%M%S')}.json")
+            try:
+                with _settings_lock:
+                    os.replace(SETTINGS_FILE, kept)
+                console.append(f"⚠️ settings.json could not be read ({e}). Defaults were loaded; "
+                               f"the old file was kept as training/{kept.name}.")
+            except OSError as move_err:
+                console.append(f"⚠️ settings.json could not be read ({e}) or set aside ({move_err}). Defaults were loaded.")
     return settings
 
 def save_settings(settings_dict):
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(settings_dict, f, indent=4)
+    # Write a temporary file and swap it in, so the app being closed mid-write can't leave a truncated settings.json.
+    with _settings_lock:
+        tmp = SETTINGS_FILE.with_name(SETTINGS_FILE.name + ".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(settings_dict, f, indent=4)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(5):
+            try:
+                os.replace(tmp, SETTINGS_FILE)
+                return
+            except PermissionError:  # Windows: briefly held open by a virus scanner or indexer
+                if attempt == 4:
+                    raise
+                time.sleep(0.1)
 
 def auto_save_state(*args):
     keys = list(DEFAULT_SETTINGS.keys())
@@ -812,7 +886,6 @@ HIDDEN_SETTINGS = {
     "network_train_unet_only": True,
     "timestep_sampling": "sigmoid",
     "discrete_flow_shift": 1.0,
-    "weighting_scheme": "none",
     "cache_latents": True,
     "cache_latents_to_disk": True,
     "cache_text_encoder_outputs_to_disk": True,
@@ -863,7 +936,8 @@ def create_sample_prompts(project_name, trigger_word, pos_prompt, neg_prompt, wi
     actual_neg = neg_prompt.strip().replace("\n", " ")
     lines = []
     for user_prompt in user_prompts:
-        if trigger and not user_prompt.startswith(trigger):
+        # Tag match, not a text prefix: trigger "cat" must still be added to "catgirl, smile".
+        if trigger and trigger.lower() not in (t.lower() for t in split_tags(user_prompt)):
             actual_pos = f"{trigger}, {user_prompt}" if user_prompt else trigger
         else:
             actual_pos = user_prompt if user_prompt else trigger
@@ -1387,8 +1461,9 @@ def dataset_items(path: Path) -> dict:
     return items
 
 
-def find_duplicates(path: Path) -> List[dict]:
-    """Groups of duplicates among the dataset's images, each {"keep": stem, "drop": [(stem, reason)], "info": {...}}."""
+def find_duplicates(path: Path, write_cache: bool = True) -> List[dict]:
+    """Groups of duplicates among the dataset's images, each {"keep": stem, "drop": [(stem, reason)], "info": {...}}.
+    write_cache=False leaves the folder untouched (the inspector only reads)."""
     items = dataset_items(path)
     if len(items) < 2:
         return []
@@ -1410,7 +1485,7 @@ def find_duplicates(path: Path) -> List[dict]:
                 continue  # unreadable files are reported by bucketing itself
         fresh[key] = rec
         sigs[stem] = rec
-    if fresh != cache:  # don't touch the file when nothing changed
+    if write_cache and fresh != cache:  # don't touch the file when nothing changed
         try:
             tmp = cache_file.with_name(cache_file.name + ".part")
             tmp.write_text(json.dumps(fresh), encoding="utf-8")
@@ -1494,11 +1569,12 @@ def _set_aside(path: Path, stem: str, manifest: dict) -> List[Tuple[Path, Path]]
     for src_dir, dest_dir in ((path, path / DUPLICATES_DIR), (path / "original_images", path / DUPLICATES_DIR / "original_images")):
         if not src_dir.is_dir():
             continue
+        key = stem.casefold()  # Windows: cat.png's caption may be saved as Cat.txt
         for f in sorted(src_dir.iterdir()):
             if not f.is_file() or f.name in (BUCKET_MANIFEST, DUP_CACHE):
                 continue
             base = f.name[:-4] if f.suffix.lower() == ".xmp" else None
-            if f.stem == stem or (base is not None and (base == stem or Path(base).stem == stem)):
+            if f.stem.casefold() == key or (base is not None and key in (base.casefold(), Path(base).stem.casefold())):
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 dest, n = dest_dir / f.name, 2
                 while dest.exists():
@@ -1509,7 +1585,7 @@ def _set_aside(path: Path, stem: str, manifest: dict) -> List[Tuple[Path, Path]]
     return moved
 
 
-def _write_duplicates_log(path: Path, groups: List[dict], set_aside: bool, moved: dict) -> Path | None:
+def _write_duplicates_log(path: Path, groups: List[dict], set_aside: bool, moved: dict, carried: dict | None = None) -> Path | None:
     """Append this check's groups to <dataset>/duplicates.log. A report-only result identical to the last one
     isn't appended again."""
     log_file = path / DUPLICATES_LOG
@@ -1519,7 +1595,8 @@ def _write_duplicates_log(path: Path, groups: List[dict], set_aside: bool, moved
     for g in groups:
         name, w, h = g["info"][g["keep"]]
         keep_path = items.get(g["keep"])
-        rows.append(f"KEEP  {name}  {w}x{h}" + (f"  {rel(keep_path)}" if keep_path is not None else ""))
+        rows.append(f"KEEP  {name}  {w}x{h}" + (f"  {rel(keep_path)}" if keep_path is not None else "")
+                    + (f"  (caption copied from {carried[g['keep']]})" if carried and g["keep"] in carried else ""))
         for s, why in g["drop"]:
             n, w2, h2 = g["info"][s]
             line = f"COPY  {n}  {w2}x{h2}  {why}"
@@ -1565,15 +1642,29 @@ def report_duplicates(path: Path, set_aside: bool, manifest: dict | None = None)
     if len(groups) > 30:
         console.append(f"   … and {len(groups) - 30} more group(s)")
     moved: dict = {}
+    carried: dict = {}
     if set_aside:
         for g in groups:
+            # The largest copy is kept. If only a copy being set aside has a caption, the kept one takes it over
+            # (copied: the set-aside copy keeps its own).
+            keep_txt = path / f"{g['keep']}.txt"
+            if not keep_txt.is_file():
+                by_size = sorted(g["drop"], key=lambda d: -(g["info"][d[0]][1] * g["info"][d[0]][2]))
+                donor = next((path / f"{s}.txt" for s, _ in by_size if (path / f"{s}.txt").is_file()), None)
+                if donor is not None:
+                    try:
+                        shutil.copy2(donor, keep_txt)
+                        carried[g["keep"]] = donor.name
+                        console.append(f"   📝 {g['info'][g['keep']][0]} had no caption: copied {donor.name} to {keep_txt.name}.")
+                    except OSError as e:
+                        console.append(f"   ⚠️ Could not copy {donor.name} to {keep_txt.name}: {e}")
             for s, _ in g["drop"]:
                 moved[s] = _set_aside(path, s, manifest if manifest is not None else {})
         files = sum(len(v) for v in moved.values())
         console.append(f"   Moved {n_drop} image(s) ({files} files: captions, originals and sidecars too) to {DUPLICATES_DIR}/. Move them back to restore.")
     else:
         console.append("   Nothing moved (Set duplicates aside is off).")
-    log_file = _write_duplicates_log(path, groups, set_aside, moved)
+    log_file = _write_duplicates_log(path, groups, set_aside, moved, carried)
     if log_file is not None:
         console.append(f"   📝 Full list in {log_file.name}")
     yield console.text()
@@ -1590,23 +1681,50 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, conver
         console.append("❌ Error: Dataset path invalid!")
         yield console.text()
         return
+    if training_uses_folder(path):
+        console.append("⚠️ Bucketing: training is running on this dataset and reads these files — stop or wait for it first.")
+        yield console.text()
+        return
 
     backup_dir = path / "original_images"
     valid_exts = VALID_IMAGE_EXTS
 
-    available_buckets = smart_cropper.get_valid_buckets(int(side_min), int(side_max))
+    # Bucket sides must be multiples of 64 (sd-scripts' bucket step). Round Min up and Max down so the
+    # buckets stay inside what was entered.
+    try:
+        entered_min, entered_max = int(side_min), int(side_max)
+    except (TypeError, ValueError):
+        console.append("❌ Min Side and Max Side must be numbers.")
+        yield console.text()
+        return
+    side_lo = max(64, -(-entered_min // 64) * 64)
+    side_hi = max(64, entered_max // 64 * 64)
+    if (side_lo, side_hi) != (entered_min, entered_max):
+        console.append(f"ℹ️ Bucket sides are multiples of 64: using Min Side {side_lo} and Max Side {side_hi} "
+                       f"(entered {entered_min} and {entered_max}).")
+    if side_lo > side_hi:
+        console.append(f"❌ Min Side ({side_lo}) is larger than Max Side ({side_hi}). Nothing was changed.")
+        yield console.text()
+        return
+
+    available_buckets = smart_cropper.get_valid_buckets(side_lo, side_hi)
     console.append(f"📋 Buckets configured: {len(available_buckets)}")
     yield console.text()
 
     manifest = _load_manifest(backup_dir)
-    backup_stems = set()
-    if backup_dir.is_dir():
-        backup_stems = {f.stem for f in backup_dir.iterdir() if f.is_file() and f.suffix.lower() in valid_exts}
+    # Names are compared ignoring letter case: Windows treats Cat.png and cat.png as the same file, so two
+    # originals that differ only in case would be bucketed onto one output and share one caption.
+    backup_files = sorted(f for f in backup_dir.iterdir() if f.is_file() and f.suffix.lower() in valid_exts) if backup_dir.is_dir() else []
+    backup_by_key: dict = {}
+    for f in backup_files:
+        backup_by_key.setdefault(f.stem.casefold(), []).append(f)
+    backup_stems = {f.stem for f in backup_files}
+    clashes = [", ".join(f"original_images/{f.name}" for f in files) for files in backup_by_key.values() if len(files) > 1]
 
     # 1. Classify what is in the dataset folder.
-    #    A <stem> that already has an original in original_images/ means the file here was produced by
-    #    bucketing. If it no longer matches what bucketing wrote (per the manifest), someone edited or
-    #    replaced it: leave it alone rather than overwrite it.
+    #    <stem>.png next to an original named <stem> is what bucketing wrote for it. If it no longer matches
+    #    what bucketing wrote (per the manifest), someone edited or replaced it: leave it alone rather than
+    #    overwrite it. Any other file whose name matches an original is a new file that would collide with it.
     new_originals: List[Path] = []
     convertible, undecodable = find_convertible(path, probe_unknown=bool(convert_other))
     media = [f for f, _, _ in convertible]
@@ -1615,20 +1733,25 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, conver
     for f in sorted(path.iterdir()):
         if not f.is_file() or f.suffix.lower() not in valid_exts:
             continue
-        if f.stem in backup_stems:
-            rec = manifest.get(f.name)
-            if rec is not None and {"bytes": rec.get("bytes"), "mtime_ns": rec.get("mtime_ns")} != _file_fingerprint(f):
-                edited.add(f.name)
-            continue  # produced by an earlier run (or pre-manifest output): regenerate from the original if needed
+        key = f.stem.casefold()
+        if key in backup_by_key:
+            if f.stem in backup_stems and f.suffix.lower() == ".png":
+                rec = manifest.get(f.name)
+                if rec is not None and {"bytes": rec.get("bytes"), "mtime_ns": rec.get("mtime_ns")} != _file_fingerprint(f):
+                    edited.add(f.name)
+                continue  # produced by an earlier run (or pre-manifest output): regenerate from the original if needed
+            clashes.append(f"{f.name} (an original named '{backup_by_key[key][0].name}' is already in original_images/)")
+            continue
         new_originals.append(f)
 
-    # Two new originals with the same stem (cat.jpg + cat.png, or cat.mp4 + cat.gif) would both become cat.png.
-    # A video/GIF/AVIF whose name matches an existing original would replace it.
+    # Two new originals with the same name (cat.jpg + cat.png, cat.mp4 + cat.gif, Cat.png + cat.jpg) would both
+    # become cat.png. A video/GIF/other format whose name matches an existing original would replace it.
     stems: dict = {}
     for f in new_originals + media:
-        stems.setdefault(f.stem, []).append(f.name)
-    clashes = [", ".join(names) for names in stems.values() if len(names) > 1]
-    clashes += [f"{f.name} (an original named '{f.stem}' is already in original_images/)" for f in media if f.stem in backup_stems]
+        stems.setdefault(f.stem.casefold(), []).append(f.name)
+    clashes += [", ".join(names) for names in stems.values() if len(names) > 1]
+    clashes += [f"{f.name} (an original named '{backup_by_key[f.stem.casefold()][0].name}' is already in original_images/)"
+                for f in media if f.stem.casefold() in backup_by_key]
     if clashes:
         console.append("❌ Bucketing aborted, nothing was changed. These files share a name and would overwrite each other:")
         for names in clashes:
@@ -1654,7 +1777,13 @@ def run_smart_crop_ui(dataset_dir: str, side_min: float, side_max: float, conver
                 dest, n = backup_dir / f.name, 2
                 while dest.exists():  # keep every source; never overwrite one
                     dest, n = backup_dir / f"{f.stem}_{n}{f.suffix}", n + 1
-                shutil.move(str(f), str(dest))
+                try:
+                    shutil.move(str(f), str(dest))
+                except Exception:
+                    # Undo the PNG original: the source stays where it was, so the next run converts it again
+                    # instead of finding a clash with its own leftover frame.
+                    frame_png.unlink(missing_ok=True)
+                    raise
                 converted += 1
                 console.append(f"   {kinds[f][1]} {f.name} → {what}, {rgb.shape[1]}×{rgb.shape[0]}")
             except Exception as e:
@@ -2083,12 +2212,14 @@ class WDTagger:
         general_tags = [self.tag_names[i] for i in self.general_indexes if i < len(preds) and preds[i] > gen_thresh]
         char_tags = [self.tag_names[i] for i in self.character_indexes if i < len(preds) and preds[i] > char_thresh]
         
-        char_tags = [char.replace("(", r"\(").replace(")", r"\)") for char in char_tags]
         general_tags = sorted(general_tags, key=lambda x: preds[self.tag_names.index(x)], reverse=True)
-        
+
+        # Parentheses stay plain, e.g. "hatsune miku (cosplay)": sd-scripts feeds captions to the text encoder
+        # verbatim, and Forge/ComfyUI turn a prompt's \( back into ( before encoding. A \( in a caption would
+        # train on backslashes that never reach the model at generation time.
         final_list = []
         if char_tags: final_list.append(", ".join(char_tags))
-        if general_tags: final_list.append(", ".join(general_tags).replace("(", r"\(").replace(")", r"\)"))
+        if general_tags: final_list.append(", ".join(general_tags))
         return ", ".join(final_list)
 
     def unload_model(self):
@@ -2227,50 +2358,65 @@ def run_auto_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, use_embedd
 def rename_dataset_sequential(dataset_dir: str) -> Generator[str, None, None]:
     """Rename every image (and everything tied to it) to 001, 002, ... in filename order: the image, its caption,
     its original and source in original_images/, .xmp sidecars, and bucketing's manifest. Writes the old->new map
-    to rename_map_<time>.json first, and refuses (changing nothing) if a new name would replace an unrelated file."""
+    to rename_map_<time>.json first, and refuses (changing nothing) if a new name would replace an unrelated file.
+    Files belong to an image regardless of letter case (Cat.txt is cat.png's caption on Windows). If any rename
+    fails part-way (a file locked by another program), everything already renamed is put back."""
     path = Path(dataset_dir) if dataset_dir else None
     if path is None or not path.is_dir():
         console.append("❌ Rename: Dataset path invalid!")
         yield console.text()
         return
-    if training_manager.is_running():
-        console.append("⚠️ Rename: training is running and reads these files — stop or wait for it first.")
+    if training_uses_folder(path):
+        console.append("⚠️ Rename: training is running on this dataset and reads these files — stop or wait for it first.")
         yield console.text()
         return
     backup = path / "original_images"
     folders = [d for d in (path, backup) if d.is_dir()]
     stems = sorted({f.stem for f in path.iterdir() if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTS | MEDIA_EXTS},
-                   key=lambda s: s.lower())
+                   key=lambda s: (s.lower(), s))
     if not stems:
         console.append("❌ Rename: no images in the dataset folder.")
         yield console.text()
         return
+    by_key: dict = {}
+    for st in stems:
+        by_key.setdefault(st.casefold(), []).append(st)
+    case_twins = [names for names in by_key.values() if len(names) > 1]
+    if case_twins:
+        console.append("❌ Rename aborted, nothing was changed. These images' names differ only in letter case, so on "
+                       "Windows they share one caption — rename one of each pair by hand first:")
+        console.extend([f"  • {' / '.join(names)}" for names in case_twins[:10]])
+        yield console.text()
+        return
     width = max(3, len(str(len(stems))))
-    new_stem = {s: f"{i:0{width}d}" for i, s in enumerate(stems, start=1)}
-    if all(s == n for s, n in new_stem.items()):
+    new_stem = {st: f"{i:0{width}d}" for i, st in enumerate(stems, start=1)}
+    if all(st == n for st, n in new_stem.items()):
         console.append(f"✅ Rename: already numbered 1–{len(stems)}.")
         yield console.text()
         return
+    stem_by_key = {st.casefold(): st for st in stems}
 
-    def owner(f: Path) -> str | None:
+    def owner(f: Path) -> Tuple[str, int] | None:
+        """(image stem this file belongs to, length of the part of its name that is that stem)."""
         if f.suffix.lower() == ".xmp":                 # image.jpg.xmp or image.xmp
             base = f.name[:-4]
             for cand in (base, Path(base).stem):
-                if cand in new_stem:
-                    return cand
+                if cand.casefold() in stem_by_key:
+                    return stem_by_key[cand.casefold()], len(cand)
             return None
-        return f.stem if f.stem in new_stem else None
+        st = stem_by_key.get(f.stem.casefold())
+        return (st, len(f.stem)) if st is not None else None
 
     moves = []  # (old, new)
     for d in folders:
         for f in sorted(d.iterdir()):
-            s = owner(f) if f.is_file() and f.name != BUCKET_MANIFEST else None
-            if s is not None and new_stem[s] != s:
-                moves.append((f, d / (new_stem[s] + f.name[len(s):])))
+            o = owner(f) if f.is_file() and f.name != BUCKET_MANIFEST else None
+            if o is not None and new_stem[o[0]] != f.name[:o[1]]:
+                moves.append((f, d / (new_stem[o[0]] + f.name[o[1]:])))
     moving = {old for old, _ in moves}
     # Any other file already using a new name would get attached to the renamed image (an orphan 002.txt would
     # become 002.jpg's caption), so it blocks the rename, whatever its extension.
-    targets = {new_stem[s] for s in stems if new_stem[s] != s}
+    targets = {new_stem[st] for st in stems if new_stem[st] != st}
     def stem_of(f: Path) -> str:
         if f.suffix.lower() == ".xmp":
             base = f.name[:-4]
@@ -2288,45 +2434,106 @@ def rename_dataset_sequential(dataset_dir: str) -> Generator[str, None, None]:
     map_file = path / f"rename_map_{stamp}.json"
     with open(map_file, "w", encoding="utf-8") as fh:
         json.dump({str(o.relative_to(path)): str(n.relative_to(path)) for o, n in moves}, fh, indent=1, ensure_ascii=False)
-    # two phases through hidden temporary names, so 002 -> 001 and 001 -> 002 can't collide
-    temps = []
-    for i, (old, new) in enumerate(moves):
-        tmp = old.with_name(f".tf_rename_{stamp}_{i}{old.suffix}")
-        os.replace(old, tmp)
-        temps.append((tmp, new))
-    for tmp, new in temps:
-        os.replace(tmp, new)
+    # Two phases through hidden temporary names, so 002 -> 001 and 001 -> 002 can't collide. Where each file is
+    # and every completed step are tracked, so a failure part-way (a file locked by another program) is undone.
+    where = {i: old for i, (old, _) in enumerate(moves)}
+    done: List[Tuple[int, Path, Path]] = []
+    try:
+        for i, (old, new) in enumerate(moves):
+            tmp = old.with_name(f".tf_rename_{stamp}_{i}{old.suffix}")
+            os.replace(old, tmp)
+            where[i] = tmp
+            done.append((i, old, tmp))
+        for i, (old, new) in enumerate(moves):
+            tmp = where[i]
+            os.replace(tmp, new)
+            where[i] = new
+            done.append((i, tmp, new))
+    except OSError as e:
+        for i, src, dst in reversed(done):
+            if where[i] != dst:
+                continue  # an earlier undo step for this file failed; it stays where it is
+            if any(where[j] == src for j in where if j != i):
+                continue  # another file still sits there (its undo failed): never overwrite it
+            try:
+                os.replace(dst, src)
+                where[i] = src
+            except OSError:
+                pass
+        # A file whose old name was still taken by another file can follow once that one has moved back.
+        progress = True
+        while progress:
+            progress = False
+            for i, (old, _) in enumerate(moves):
+                if where[i] != old and not any(where[j] == old for j in where if j != i):
+                    try:
+                        os.replace(where[i], old)
+                        where[i] = old
+                        progress = True
+                    except OSError:
+                        pass
+        # What's left must be fixed by hand: list the steps in an order that never overwrites a file
+        # (a file waits until whoever sits on its old name has moved; a cycle goes through a spare name).
+        pending = {where[i]: old for i, (old, _) in enumerate(moves) if where[i] != old}
+        stuck: List[Tuple[Path, Path]] = []
+        while pending:
+            ready = [(cur, dst) for cur, dst in pending.items() if dst not in pending]
+            if not ready:
+                cur, dst = next(iter(pending.items()))
+                spare = cur.with_name(f".tf_rename_{stamp}_spare_{len(stuck)}{cur.suffix}")
+                stuck.append((cur, spare))
+                del pending[cur]
+                pending[spare] = dst
+                continue
+            for cur, dst in ready:
+                stuck.append((cur, dst))
+                del pending[cur]
+        if not stuck:
+            map_file.unlink(missing_ok=True)
+            console.append(f"❌ Rename failed and was undone, nothing changed: {e}")
+            console.append("   Close any program that has these files open (image viewer, editor, sync client) and try again.")
+        else:
+            console.append(f"❌ Rename failed ({e}) and some files could not be put back. Rename them by hand, in this order:")
+            console.extend([f"  • {now.relative_to(path)} → {was.relative_to(path)}" for now, was in stuck])
+            console.append(f"   The intended old → new names are in {map_file.name}.")
+        yield console.text()
+        return
 
     manifest = _load_manifest(backup) if backup.is_dir() else {}
     if manifest:
-        renamed = {}
+        def renamed(st: str) -> str:
+            owner_stem = stem_by_key.get(st.casefold())
+            return new_stem[owner_stem] if owner_stem is not None else st
+        renamed_manifest = {}
         for key, rec in manifest.items():
             k = Path(key)
-            nk = new_stem.get(k.stem, k.stem) + k.suffix
+            nk = renamed(k.stem) + k.suffix
             if isinstance(rec, dict) and "source" in rec:
                 src = Path(rec["source"])
-                rec = dict(rec, source=new_stem.get(src.stem, src.stem) + src.suffix)
-            renamed[nk] = rec
-        _save_manifest(backup, renamed)
+                rec = dict(rec, source=renamed(src.stem) + src.suffix)
+            renamed_manifest[nk] = rec
+        _save_manifest(backup, renamed_manifest)
     console.append(f"🔢 Renamed {len(stems)} image(s) to {'0' * (width - 1)}1–{len(stems):0{width}d} ({len(moves)} files, including captions, originals and sidecars).")
     console.append(f"   Old → new names saved in {map_file.name}. Latent caches are rebuilt on the next training run.")
     yield console.text()
 
 
 def start_rename(dataset_dir):
-    return start_tool("Renaming", rename_dataset_sequential, dataset_dir)
+    return start_tool("Renaming", rename_dataset_sequential, dataset_dir, folder=dataset_dir)
 
 
 def start_bucketing(dataset_dir, side_min, side_max, convert_other=True, set_aside_duplicates=True):
-    return start_tool("Bucketing", run_smart_crop_ui, dataset_dir, side_min, side_max, convert_other, set_aside_duplicates)
+    return start_tool("Bucketing", run_smart_crop_ui, dataset_dir, side_min, side_max, convert_other, set_aside_duplicates,
+                      folder=dataset_dir)
 
 
 def start_tagging(dataset_dir, gen_thresh, char_thresh, overwrite, use_embedded=True):
-    return start_tool("Auto-captioning", run_auto_tagging, dataset_dir, gen_thresh, char_thresh, overwrite, use_embedded)
+    return start_tool("Auto-captioning", run_auto_tagging, dataset_dir, gen_thresh, char_thresh, overwrite, use_embedded,
+                      folder=dataset_dir)
 
 
 def start_inspect(dataset_dir, trigger_word):
-    msg = tool_runner.start("Dataset inspection", inspect_dataset, dataset_dir, trigger_word)
+    msg = tool_runner.start("Dataset inspection", inspect_dataset, dataset_dir, trigger_word, folder=dataset_dir)
     if msg:
         console.append(msg)
     return console.text()
@@ -2393,22 +2600,31 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
     images = sorted(f for f in path.iterdir() if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTS)
     media = unconverted_media(path)
     stems = {f.stem for f in images} | {f.stem for f in media}  # a clip.txt next to clip.mp4 isn't an orphan
+    keys = {s.casefold() for s in stems}
     txts = sorted(f for f in path.iterdir() if f.is_file() and f.suffix.lower() == ".txt")
     missing = [f.name for f in images if not f.with_suffix(".txt").is_file()]
-    orphans = [f.name for f in txts if f.stem not in stems]
-    stem_clash = sorted({f.stem for f in images if sum(1 for g in images if g.stem == f.stem) > 1})
+    orphans = [f.name for f in txts if f.stem.casefold() not in keys]
+    # Caption named Cat.txt for cat.png: Windows pairs them, Linux doesn't, and renaming tools may lose it.
+    case_only = [f.name for f in txts if f.stem not in stems and f.stem.casefold() in keys]
+    by_key: dict = {}
+    for f in images:
+        by_key.setdefault(f.stem.casefold(), []).append(f.name)
+    stem_clash = sorted(" + ".join(names) for names in by_key.values() if len(names) > 1)
 
     trig = trigger_word.strip().lower()
     tag_counts: dict = {}
-    empty, dup_tags, with_trigger, n_caps, tags_total = [], [], 0, 0, 0
+    empty, dup_tags, escaped, with_trigger, n_caps, tags_total = [], [], [], 0, 0, 0
     for img in images:
         txt = img.with_suffix(".txt")
         if not txt.is_file():
             continue
         try:
-            tags = split_tags(txt.read_text(encoding="utf-8", errors="ignore"))
+            caption_text = txt.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
+        tags = split_tags(caption_text)
+        if "\\(" in caption_text or "\\)" in caption_text:
+            escaped.append(txt.name)
         n_caps += 1
         tags_total += len(tags)
         if not tags:
@@ -2455,7 +2671,7 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
     if with_embedded:
         out.append(f"🏷️ {with_embedded} of {len(images)} image(s) carry embedded tags (Grabber/exiftool): Auto-Caption uses those instead of the WD tagger.")
     try:
-        dups = find_duplicates(path)
+        dups = find_duplicates(path, write_cache=False)
     except Exception:
         dups = []
     flag(dups, f"⚠️ {len(dups)} group(s) of duplicate images ({sum(len(g['drop']) for g in dups)} extra copies) — ✂️ Start Bucketing sets the extra copies aside: "
@@ -2463,12 +2679,15 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
     flag(media, f"⚠️ {len(media)} video/GIF/other-format file(s) not converted yet — ✂️ Start Bucketing turns them into PNG images: {_examples([f.name for f in media])}")
     flag(missing, f"❌ {len(missing)} image(s) without a caption: {_examples(missing)}")
     flag(unreadable, f"❌ {len(unreadable)} image(s) can't be opened: {_examples(unreadable)}")
-    flag(stem_clash, f"❌ Same name with different extensions (captions are shared, bucketing refuses): {_examples(stem_clash)}")
+    flag(stem_clash, f"❌ Same name with a different extension or letter case (they share one caption; bucketing refuses): {_examples(stem_clash)}")
+    flag(case_only, f"⚠️ {len(case_only)} caption(s) named with different letter case than their image (only Windows pairs them; 🔢 Rename to Numbers fixes the names): {_examples(case_only)}")
     flag(oversized, f"❌ {len(oversized)} image(s) are 2048px or larger (training refuses them): {_examples(oversized)}")
     flag(empty, f"⚠️ {len(empty)} empty caption(s): {_examples(empty)}")
     flag(orphans, f"⚠️ {len(orphans)} caption file(s) with no image: {_examples(orphans)}")
     flag(rotated, f"⚠️ {len(rotated)} image(s) have an EXIF rotation sd-scripts ignores — bucket them first: {_examples(rotated)}")
     flag(dup_tags, f"⚠️ {len(dup_tags)} caption(s) repeat a tag: {_examples(dup_tags)}")
+    flag(escaped, f"⚠️ {len(escaped)} caption(s) contain escaped parentheses \\( \\) — captions are read literally, so write them plain, "
+                  f"e.g. 'hatsune miku (cosplay)' (only prompts need the backslash): {_examples(escaped)}")
     flag(small, f"ℹ️ {len(small)} image(s) have a short side under 512px (trained at their own lower resolution): {_examples(small)}")
     if trig and n_caps:
         if with_trigger == n_caps:
@@ -2652,13 +2871,47 @@ def extend_training(trigger_word, new_total):
     if not torch.cuda.is_available():
         console.extend(CUDA_ERROR.split("\n"))
         return console.text()
+    busy, tool_warning = tool_blocks_training(run_dataset_dir(point["run_dir"]))
+    if busy:
+        console.append(busy)
+        return console.text()
 
     run_dir, name, old = point["run_dir"], point["name"], point["step"]
+    meta = run_dir / "run.json"
+    original_toml = point["training_toml"].read_bytes()
+    original_meta = meta.read_bytes() if meta.exists() else None
+    kept = None
+    backup = point["training_toml"].with_name(f"{name}_training.before_extend_{old}.toml")
+    made_backup = False
+
+    def undo() -> List[str]:
+        """Put the run back exactly as it was finished (config, final LoRA, run.json)."""
+        problems = []
+        try:
+            point["training_toml"].write_bytes(original_toml)
+            if made_backup:
+                backup.unlink(missing_ok=True)
+        except OSError as e:
+            problems.append(f"config: {e}")
+        if kept is not None and kept.exists() and not point["final"].exists():
+            try:
+                os.replace(kept, point["final"])
+            except OSError as e:
+                problems.append(f"{kept.name} → {point['final'].name}: {e}")
+        try:
+            if original_meta is None:
+                meta.unlink(missing_ok=True)
+            else:
+                meta.write_bytes(original_meta)
+        except OSError as e:
+            problems.append(f"run.json: {e}")
+        return problems
+
     try:
         # keep the config this run finished with, then raise the step target
-        backup = point["training_toml"].with_name(f"{name}_training.before_extend_{old}.toml")
         if not backup.exists():
             shutil.copy2(point["training_toml"], backup)
+            made_backup = True
         cfg["max_train_steps"] = new_total
         with open(point["training_toml"], "w", encoding="utf-8") as f:
             toml.dump(cfg, f)
@@ -2667,16 +2920,17 @@ def extend_training(trigger_word, new_total):
         if kept.exists():
             kept = run_dir / f"{name}-step{old:08d}-final.safetensors"
         os.replace(point["final"], kept)
-        meta = run_dir / "run.json"
         try:
-            info = json.loads(meta.read_text(encoding="utf-8")) if meta.exists() else {}
+            info = json.loads(original_meta.decode("utf-8")) if original_meta else {}
         except Exception:
             info = {}
         info.setdefault("extensions", []).append({"from": old, "to": new_total, "at": time.strftime("%Y-%m-%d %H:%M:%S")})
         info["max_train_steps"] = new_total
         meta.write_text(json.dumps(info, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
-        console.append(f"❌ Could not prepare the run for more training: {e}")
+        problems = undo()
+        console.append(f"❌ Could not prepare the run for more training: {e}"
+                       + (f" — and could not undo: {'; '.join(problems)}" if problems else " — nothing was changed."))
         return console.text()
 
     halt_file = Path(cfg.get("halt_request_file") or (run_dir / ".halt_request"))
@@ -2686,15 +2940,22 @@ def extend_training(trigger_word, new_total):
     console.clear()
     console.append(f"➕ Training {project_name} — run {run_dir.name} further: step {old} → {new_total}")
     console.append(f"   Previous final LoRA kept as {kept.name}")
+    if tool_warning:
+        console.append(tool_warning)
     if str(cfg.get("lr_scheduler", "")) == "cosine":
         console.append(f"   Cosine LR: the schedule is rebuilt for {new_total} steps, so the LR jumps back up to where that schedule is at step {old}, then decays to 0 again.")
     console.append(f"📁 Run folder: {run_dir}")
     try:
-        if not training_manager.start(cmd, TRAIN_DIR.resolve(), build_train_env(), run_dir, log_path, halt_file,
-                                      gallery_since=0.0, output_name=name):
-            console.append("⚠️ Training is already running!")
+        launched = training_manager.start(cmd, TRAIN_DIR.resolve(), build_train_env(), run_dir, log_path, halt_file,
+                                          gallery_since=0.0, output_name=name)
+        error = None if launched else "Training is already running!"
     except Exception as e:
-        console.append(f"❌ Error: {str(e)}")
+        error = str(e)
+    if error:
+        problems = undo()
+        console.append(f"❌ Error: {error}")
+        console.append(f"   The run was put back as it was (final LoRA {point['final'].name}, {old} steps)." if not problems
+                       else f"   ⚠️ Could not fully restore the run: {'; '.join(problems)}")
     return console.text()
 
 def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, save_resume_state, blocks_to_swap=0, network_alpha=0):
@@ -2704,13 +2965,52 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         console.append("⚠️ Training is already running!")
         return console.text()
 
+    input_errors = []
+    def whole(label, value, minimum):
+        try:
+            v = int(value)
+            if v != float(value):
+                raise ValueError
+        except (TypeError, ValueError):
+            input_errors.append(f"❌ {label} must be a whole number (it is {value!r}).")
+            return None
+        if v < minimum:
+            input_errors.append(f"❌ {label} must be at least {minimum} (it is {v}).")
+        return v
+    whole("Network Rank", rank, 1)
+    whole("Training Steps", t_steps, 1)
+    whole("Save Every n Steps", save_steps, 0)
+    whole("Preview Every n Steps", sample_steps, 0)
+    whole("Batch Size", batch_size, 1)
+    whole("Gradient Accumulation", grad_acc, 1)
+    whole("Preview Width", w, 64)
+    whole("Preview Height", h, 64)
+    whole("Preview Steps", s_steps_gen, 1)
+    whole("Preview Seed", s_seed, -(2 ** 63))
+    try:
+        if float(lr) <= 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        input_errors.append(f"❌ Learning Rate must be a number above 0 (it is {lr!r}).")
+    try:
+        float(s_cfg)
+    except (TypeError, ValueError):
+        input_errors.append(f"❌ Preview CFG must be a number (it is {s_cfg!r}).")
+    if input_errors:
+        console.extend(input_errors)
+        return console.text()
+    busy, tool_warning = tool_blocks_training(dataset_path)
+    if busy:
+        console.append(busy)
+        return console.text()
+
     model_errors = []
     if not dit_p or not os.path.isfile(dit_p): model_errors.append(f"❌ DiT file not found: {dit_p}")
     if not qwen_p or not os.path.isfile(qwen_p): model_errors.append(f"❌ Qwen3 file not found: {qwen_p}")
     if not vae_p or not os.path.isfile(vae_p): model_errors.append(f"❌ VAE file not found: {vae_p}")
     
     dataset_errors = []
-    preflight_warnings = []
+    preflight_warnings = [tool_warning] if tool_warning else []
     if not dataset_path or not os.path.exists(dataset_path): 
         dataset_errors.append(f"❌ Dataset path not found: {dataset_path}")
     else:
@@ -2846,6 +3146,10 @@ def resume_training(trigger_word):
     if not torch.cuda.is_available():
         console.extend(CUDA_ERROR.split("\n"))
         return console.text()
+    busy, tool_warning = tool_blocks_training(run_dataset_dir(point["run_dir"]))
+    if busy:
+        console.append(busy)
+        return console.text()
 
     run_dir = point["run_dir"]
     halt_file = Path(cfg.get("halt_request_file") or (run_dir / ".halt_request"))
@@ -2856,6 +3160,8 @@ def resume_training(trigger_word):
     console.clear()
     console.append(f"↩ Resuming {project_name} — run {run_dir.name} from step {point['step']}/{point['max_steps']}")
     console.append(f"   State: {point['state_dir'].name}")
+    if tool_warning:
+        console.append(tool_warning)
     console.append(f"📁 Run folder: {run_dir}")
     try:
         if not training_manager.start(cmd, TRAIN_DIR.resolve(), build_train_env(), run_dir, log_path, halt_file, gallery_since=0.0,
@@ -3119,4 +3425,6 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     grid_btn.click(fn=make_checkpoint_grid, inputs=[trigger_word], outputs=[grid_image, output_log])
 
 if __name__ == "__main__":
-     ui.launch(inbrowser=True, theme=gr.themes.Soft(), css=CSS)
+     # allowed_paths: previews and the checkpoint grid live under training/output; without this Gradio refuses
+     # to serve them when app.py is started from another working folder.
+     ui.launch(inbrowser=True, theme=gr.themes.Soft(), css=CSS, allowed_paths=[str(OUTPUT_BASE.resolve())])

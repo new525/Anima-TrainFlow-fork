@@ -3,6 +3,68 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.9] - 2026-11-05
+
+Fixes from a full code review. Every item below was reproduced first, then fixed and covered by a test.
+
+### Fixed
+- **↩ Resume Run and ➕ Train More with Gradient Accumulation 2 or more could finish without training.**
+  - **Cause:** the bundled sd-scripts worked out which epoch to resume in by dividing micro-batches by optimizer steps. With accumulation ≥ 2 that overshot by the accumulation factor.
+  - **When it hit:** with the datasets the app builds (one epoch per run), a run resumed past roughly 1 ÷ accumulation of its length skipped the whole training loop. Train More with accumulation ≥ 2 always did.
+  - **What you saw:** the trainer immediately saved a "final" LoRA at the step it resumed from, and the app reported ✅ Finished.
+  - **Fix:** one line in `train_network.py` (`epoch_to_start = initial_step // len(train_dataloader)`). The test runs the trainer's own resume code for accumulation 1, 2 and 4 and checks the run reaches its last step.
+- **Names that differ only in letter case could destroy an original on Windows.** Windows treats `Cat.png` and `cat.png` as the same file; bucketing's clash check didn't.
+  - `Cat.png` + `cat.gif`: the GIF frame's crop overwrote your `Cat.png`, and no copy survived anywhere.
+  - `Cat.png` + `cat.jpg`: one of the two silently dropped out of the dataset.
+  - Bucketing now compares names ignoring letter case and refuses such pairs before changing anything. That includes pairs already sitting in `original_images/` from an earlier version.
+  - It also refuses a new file of any extension named like an existing original, e.g. a new `dog.webp` next to an earlier `dog.jpg`. Before, such a file was skipped and trained on without being bucketed.
+- **🔢 Rename to Numbers left captions behind when their letter case differed** (`IMG_0001.JPG` with `img_0001.txt` became `001.JPG` with no caption). Captions, sidecars and originals now pair with their image regardless of case. Images whose names differ only in case are refused, since on Windows they share one caption.
+- **Rename to Numbers could leave a dataset half-renamed.** A file locked by another program (image viewer, antivirus, OneDrive) stopped it part-way, with hidden `.tf_rename_*` files left behind.
+  - It now tracks every file and puts everything back. It never overwrites a file while undoing.
+  - If a file stays locked, it lists the exact renames to do by hand, in an order that's safe to follow.
+- **Training and the dataset tools could work on the same folder at once.**
+  - 🚀 Start Training, ↩ Resume Run and ➕ Train More now wait for Bucketing, Rename or Captioning on that dataset to finish.
+  - ✂️ Start Bucketing and 🔢 Rename refuse the dataset of a running trainer.
+  - Tools on *another* folder still run. GPU tools only warn that they share VRAM. Rename no longer shows that warning, since it doesn't use the GPU.
+  - 🔎 Inspect Dataset never blocks anything.
+- **💾 Halt & Save resume points were never deleted.** sd-scripts only cleans up resume points at multiples of *Save Every n Steps*.
+  - A halt's resume point is now removed once a newer one exists, or when the run finishes.
+  - With periodic resume points off, a second halt replaces the first.
+- **Duplicates:** when only a copy being set aside had a caption, your caption went to `duplicates/` and the kept image had none. Now the kept copy gets a copy of it (from the largest captioned copy). This shows in the log and in `duplicates.log`. A caption named in a different letter case is now set aside with its image too.
+- **WD tagger captions had backslashes before parentheses** (`hatsune miku \(cosplay\)`). Now they're written plain (`hatsune miku (cosplay)`), like embedded tags.
+  - sd-scripts passes captions to the text encoder as they are.
+  - Forge Neo removes a prompt's backslashes before encoding (checked in its Anima text engine), as A1111 and ComfyUI do.
+  - So an escaped caption trained on backslashes that never appear at generation time. 🔎 Inspect Dataset flags captions that still contain them.
+- **Network Rank 0 or empty** crashed Start Training (division by zero in the alpha log line) and left an empty run folder.
+  - All numeric fields are now checked before anything is written: rank, steps, save/preview intervals, batch size, accumulation, preview size/steps/seed/CFG and learning rate.
+  - Each problem gets a message naming the field.
+- **Min Side / Max Side** were used as typed: Min 500 produced buckets up to 820 px, above Max and off the 64-px grid, and Min > Max cropped everything square. Now Min is rounded up and Max down to multiples of 64, with a note, and Min > Max is refused.
+- **A video/GIF whose source couldn't be moved** (file locked) left its PNG original behind, despite the "unchanged" message, and every later bucketing run then aborted with a name clash. The PNG is removed again, so the next run simply converts it.
+- **➕ Train More when the trainer can't be launched** had already renamed the final LoRA and raised the step target. The run is now put back exactly as it was.
+- **`settings.json`:**
+  - It's written to a temporary file and swapped in, so closing the app mid-write can't truncate it. Concurrent saves are serialised.
+  - An unreadable file is kept as `settings.unreadable_<time>.json` with a warning. Before, it was silently replaced by defaults, losing your model paths.
+- **Previews and the checkpoint grid failed to load when `app.py` was started from another folder.** Gradio only served files under the working folder or temp. The launch now allows `training/output`. `start_trainer.bat` was never affected.
+- **Preview prompts:** the trigger is matched as a tag, so trigger `cat` is now added to `catgirl, smile`. Before, the text-prefix check matched it and skipped the trigger.
+- 🔎 **Inspect Dataset:**
+  - Reports images whose names differ only in letter case, and captions named in a different letter case than their image (only Windows pairs those) instead of calling them orphans.
+  - No longer writes the duplicate-check cache into the folder it inspects.
+
+### Changed
+- `requirements.txt` lists `pandas` and `psutil`, which the app imports directly. Both were already installed as dependencies of Gradio and accelerate, so re-running `Install_Requirements.bat` isn't required.
+- The duplicate `weighting_scheme` entry in the hidden settings is gone. The value that took effect, `logit_normal`, is unchanged, and Anima's loss weighting treats it the same as `none`.
+
+### Added
+- **Test suite in `tests/`.** Until now it only existed outside the repository.
+  - 14 scripts covering about 260 checks: bucketing, duplicates, media conversion, embedded tags, rename, the trainer patch, the training flow, an end-to-end run through the Gradio API with a stand-in trainer, and an optional headless-browser UI check.
+  - No GPU or models are needed. See [tests/README.md](tests/README.md).
+
+### Verified
+- `tests/run_all.py` passes in a fresh Python 3.10 environment built from `tests/requirements.txt`. The browser check passes in headless Chromium.
+- **Letter case:** the clash and rename fixes were also checked on a case-insensitive filesystem that behaves like NTFS.
+- **Rename undo:** checked at every failure point, with up to three files staying locked.
+- **Not yet confirmed:** the gradient-accumulation resume fix on a real GPU run. The test executes the trainer's real resume code with the app's dataset sizes, but not the full trainer.
+
 ## [1.8] - 2026-11-05
 
 ### Added

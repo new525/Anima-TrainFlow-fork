@@ -1,0 +1,12 @@
+{
+  "name": "trainflow-ui-check",
+  "private": true,
+  "description": "Headless-browser check of the TrainFlow UI (optional; run through tests/e2e/test_browser.py)",
+  "type": "module",
+  "dependencies": {
+    "puppeteer-core": "^25.14.0"
+  },
+  "optionalDependencies": {
+    "@sparticuz/chromium": "^153.0.0"
+  }
+}

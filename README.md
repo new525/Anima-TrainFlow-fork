@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.8** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.9** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.8) |
+| | Upstream (v1.1.0) | This fork (1.9) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
@@ -85,7 +85,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 * Re-run `Install_Requirements.bat` when the changelog says dependencies changed.
   * **1.2.1** (GitHub release 1.3) updated Gradio.
   * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
-  * **1.5** through **1.8** add no dependencies.
+  * **1.5** through **1.9** add no dependencies. (1.9 lists `pandas` and `psutil` explicitly, but they were already installed.)
 
 ---
 
@@ -105,10 +105,13 @@ Then:
    * Files that nothing can decode are left where they are and listed in the log. This includes audio, documents and caches.
    * Your originals, including the videos, GIFs and AVIFs, are moved to `original_images/` and never modified.
    * Running it again with different sizes regenerates the crops from those originals.
+   * **Min Side** and **Max Side** are rounded to multiples of 64 (Min up, Max down), the bucket step training uses.
+   * It refuses, changing nothing, files that would end up with the same name: `cat.jpg` + `cat.png`, `cat.mp4` + `cat.gif`, or names that differ only in letter case like `Cat.png` + `cat.jpg`, which Windows treats as one file.
    * A caption already written for a video (`clip.txt` next to `clip.mp4`) pairs with the image made from it (`clip.png`).
    * **Duplicates are checked** across the whole dataset, including images bucketed in earlier runs.
      * **What counts:** identical files, plus re-saved, resized, recompressed, watermarked or mirrored copies — the typical result of downloading one post from two sites, or a sample alongside the full size.
      * **What happens:** the copy with the most pixels is kept; on a tie, the one with a caption. *Set duplicates aside* (on by default) moves the other copies to `duplicates/`, together with their captions, originals and sidecars. Nothing is deleted; move a file back to restore it.
+     * **Captions:** if the kept copy has no caption but a copy being set aside does, the kept copy gets a copy of it.
      * **Untick it** to only list the groups.
      * **`duplicates.log`:** every check that finds duplicates appends the full list to this file in the dataset folder, whether or not they were moved.
        * Each group shows the kept file and every copy, with its size and why it matched.
@@ -120,13 +123,15 @@ Then:
    * **Embedded tags come first.** Tags that a downloader such as Grabber saved inside the image are used as they are, and the WD tagger only handles images without any.
      * **Where it looks:** XMP Subject/Keywords, IPTC Keywords, Windows keywords, or an `.xmp` sidecar. It reads the original in `original_images/` too, so it works after bucketing. It also reads tags saved in GIFs and videos.
      * **Format:** tags are rewritten to Anima's caption format — lowercase, spaces instead of underscores, `@` before artists, and the model card's order: meta, 1girl/1boy…, character, series, artist, general.
+     * **Parentheses stay plain**, e.g. `hatsune miku (cosplay)`, in embedded and WD-tagger captions alike. Training reads captions literally, while Forge and ComfyUI strip a prompt's `\(` back to `(` before the text encoder sees it. So the backslash belongs in your prompts, not in captions.
      * **Turn it off** with *Use tags embedded in the images first*.
    * **Recommended Grabber setup.** In Grabber's Exiftool metadata settings, set the key to `Subject` and the value to `%all:includenamespace,unsafe,separator=;%`.
      * The namespaces tell the app which tags are artists, characters and series, so it can add the `@` and order them.
      * `Subject` is stored as XMP, which keeps non-English tags. `Keywords` is stored as IPTC in JPG and PNG, which turns them into `????` when the file is saved.
      * Grabber's docs write keys as `XMP.Subject`; exiftool rejects that form, so use `Subject` or `XMP:Subject`.
 3. **🔎 Inspect Dataset** checks the result before you spend an hour training:
-   * missing, empty or orphaned captions
+   * missing, empty or orphaned captions, and captions named in a different letter case than their image
+   * escaped parentheses `\(` `\)` in captions
    * duplicate images
    * videos, GIFs or other formats that haven't been converted yet
    * oversized, small, unreadable or rotated images
@@ -137,8 +142,12 @@ Then:
    * Everything tied to an image is renamed together: caption, original and source in `original_images/`, `.xmp` sidecars, and bucketing's records. Bucketing and captioning keep working afterwards.
    * The old → new names are saved to `rename_map_<time>.json`.
    * It changes nothing if another file already uses one of the new names — for example a leftover `002.txt` that would otherwise become an image's caption.
+   * Files pair with their image regardless of letter case (`IMG_0001.JPG` and `img_0001.txt`).
+   * If a file is locked by another program part-way, everything already renamed is put back.
 
-These tools run in the background; their progress shows in the log.
+These tools and training don't work on the same folder at once. 🚀 Start Training waits until a tool working on its dataset has finished, and Bucketing and Rename refuse a dataset that's being trained. Tools on another folder run normally.
+
+The tools run in the background; their progress shows in the log.
 
 ### Train
 Set a **Trigger Word**, which also names the run's folder, then press **🚀 Start Training**. The status line above the buttons always shows what's running.
@@ -158,7 +167,7 @@ More options:
   * **With Prodigy:** Prodigy estimates its own step size, so it should largely compensate for a different alpha. Leaving it at 0 is the safe choice.
   * The log shows the alpha and scale each run uses.
 * **Block Swap (Low VRAM):** keeps that many of the 28 DiT blocks in system RAM. This lowers VRAM use at the cost of slower steps. Use it if training runs out of memory.
-* **Save resume points with each checkpoint** (on by default): saves a resume point with every checkpoint and keeps the newest two. A crash then costs at most one save interval, and ➕ Train More becomes possible.
+* **Save resume points with each checkpoint** (on by default): saves a resume point with every checkpoint and keeps the newest two. A crash then costs at most one save interval, and ➕ Train More becomes possible. A 💾 Halt & Save resume point is removed once a newer one exists, or when the run finishes.
 * You can refresh the page, close it, or even close the console window and restart the app. Training keeps going, and the restarted app reconnects to it.
 
 ### Choose the best checkpoint
@@ -181,16 +190,16 @@ training/output/<keyword>/<YYYYmmdd_HHMMSS>/   one folder per run
 
 ## Status
 
-* **Tested:** the fork's changes have been tested end to end on Python 3.10, the bundled version, with the real app and a stand-in trainer that mimics the real one's files and output.
+* **Tested:** the fork's changes are covered by the test suite in [`tests/`](tests/README.md). It runs the real app on Python 3.10, the bundled version, end to end through its API, with a stand-in trainer that mimics the real one's files and output. No GPU is needed.
 * **Browser-tested:** the interface has been exercised in headless Chromium. That covers switching tabs mid-run, the loss chart updating, previews, and settings surviving a page refresh.
 * **Not yet confirmed:**
-  * On a real GPU: halt/resume through the bundled trainer, and block swap's VRAM savings.
+  * On a real GPU: halt/resume through the bundled trainer (including the 1.9 fix for resuming with gradient accumulation), and block swap's VRAM savings.
   * On Windows: training surviving a closed console window.
 
 See *Known limitations* in [CHANGELOG.md](CHANGELOG.md), and please open an issue if something misbehaves.
 
 ## Technical details
-* **Core:** a modified `sd-scripts` for the Anima architecture. This fork adds a halt-request hook and fixes the step count when resuming with gradient accumulation.
+* **Core:** a modified `sd-scripts` for the Anima architecture. This fork adds a halt-request hook, fixes resuming with gradient accumulation (the step count, and the epoch it resumes in), and removes Halt & Save resume points once they're superseded.
 * **UI:** Gradio 6.17.3 (the newest release compatible with sd-scripts' pinned `huggingface-hub==0.34.3`). The trainer runs as a separate process launched with `accelerate launch`, and the UI follows its log file.
 * **Defaults:** BF16, latent and text-encoder caching, and the Prodigy optimizer with a constant learning rate; AdamW uses a cosine schedule.
 * **Settings** are auto-saved to `training/settings.json`.

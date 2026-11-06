@@ -9,6 +9,8 @@ import sys
 import random
 import time
 import json
+import re
+import shutil
 from multiprocessing import Value
 import numpy as np
 
@@ -51,6 +53,32 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+def remove_superseded_halt_states(args, current_step):
+    """[TrainFlow] Halt & Save writes a resumable state at whatever step it happens on. sd-scripts' own pruning only
+    ever removes states at multiples of save_every_n_steps (and only when save_state is on), so those halt states
+    would stay forever. Once a newer state exists (or the run has finished), an older halt state is redundant."""
+    name = train_util.default_if_none(args.output_name, train_util.DEFAULT_STEP_NAME)
+    pattern = re.compile(re.escape(name) + r"-step(\d{8})-state$")
+    every = args.save_every_n_steps
+    try:
+        entries = os.listdir(args.output_dir)
+    except OSError:
+        return
+    for entry in entries:
+        m = pattern.match(entry)
+        if not m:
+            continue
+        step = int(m.group(1))
+        if step >= current_step:
+            continue
+        if args.save_state and every and step % every == 0:
+            continue  # a periodic resume point: sd-scripts keeps the newest of these itself
+        path = os.path.join(args.output_dir, entry)
+        if os.path.isdir(path):
+            logger.info(f"removing superseded halt state: {path}")
+            shutil.rmtree(path, ignore_errors=True)
 
 
 class NetworkTrainer:
@@ -1268,7 +1296,11 @@ class NetworkTrainer:
                 initial_step *= args.gradient_accumulation_steps
 
                 # set epoch to start to make initial_step less than len(train_dataloader)
-                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+                # [TrainFlow] initial_step now counts micro-batches, and so does len(train_dataloader). Upstream divided
+                # by optimizer steps per epoch instead, which with gradient accumulation >= 2 starts too many epochs in:
+                # past roughly 1/accumulation of the run the epoch loop was empty and the "resumed" run saved its final
+                # LoRA at the step it resumed from without training at all.
+                epoch_to_start = initial_step // len(train_dataloader)
             else:
                 # if not, only epoch no is skipped for informative purpose
                 epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1511,6 +1543,7 @@ class NetworkTrainer:
 
                             if args.save_state:
                                 train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+                                remove_superseded_halt_states(args, global_step)  # [TrainFlow]
 
                             remove_step_no = train_util.get_remove_step_no(args, global_step)
                             if remove_step_no is not None:
@@ -1530,6 +1563,7 @@ class NetworkTrainer:
                                 save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch)
                             if not (saved_now and args.save_state):
                                 train_util.save_and_remove_state_stepwise(args, accelerator, global_step)
+                            remove_superseded_halt_states(args, global_step)
                             try:
                                 os.remove(args.halt_request_file)
                             except OSError:
@@ -1753,6 +1787,8 @@ class NetworkTrainer:
 
         if is_main_process and not halted and (args.save_state or args.save_state_on_train_end):
             train_util.save_state_on_train_end(args, accelerator)
+        if is_main_process and not halted:
+            remove_superseded_halt_states(args, global_step + 1)  # [TrainFlow] finished: no halt state is needed any more
 
         if is_main_process and not halted:
             ckpt_name = train_util.get_last_ckpt_name(args, "." + args.save_model_as)
