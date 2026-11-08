@@ -371,6 +371,11 @@ class TextEncoderOutputsCachingStrategy:
     def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
         raise NotImplementedError
 
+    def is_disk_cached_caption_current(self, npz_path: str, caption: str) -> bool:
+        """[TrainFlow] Whether the cached outputs were encoded from exactly this caption text. Strategies that don't
+        store the text can't tell, and keep the old behaviour (the cache is reused)."""
+        return True
+
     def cache_batch_outputs(
         self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, batch: List
     ):
@@ -417,6 +422,22 @@ class LatentsCachingStrategy:
 
     def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
         raise NotImplementedError
+
+    @staticmethod
+    def image_fingerprint(image_path: str) -> np.ndarray:
+        """[TrainFlow] Size and modification time of the image file the latents are encoded from."""
+        st = os.stat(image_path)
+        return np.array([st.st_size, st.st_mtime_ns], dtype=np.int64)
+
+    def is_disk_cached_latents_current(self, npz_path: str, image_path: str) -> bool:
+        """[TrainFlow] Whether the cached latents were encoded from this exact file. The cache file is named after the
+        image's name and size only, so an image edited or replaced under the same name and size kept its old latents.
+        Caches written before this check have no fingerprint and are encoded again once."""
+        try:
+            npz = np.load(npz_path)
+            return "image_fingerprint" in npz and np.array_equal(npz["image_fingerprint"], self.image_fingerprint(image_path))
+        except Exception:
+            return False
 
     def is_disk_cached_latents_expected(
         self, bucket_reso: Tuple[int, int], npz_path: str, flip_aug: bool, alpha_mask: bool
@@ -534,7 +555,8 @@ class LatentsCachingStrategy:
 
             if self.cache_to_disk:
                 self.save_latents_to_disk(
-                    info.latents_npz, latents, original_size, crop_ltrb, flipped_latent, alpha_mask, key_reso_suffix
+                    info.latents_npz, latents, original_size, crop_ltrb, flipped_latent, alpha_mask, key_reso_suffix,
+                    image_path=info.absolute_path,  # [TrainFlow] fingerprint, see is_disk_cached_latents_current
                 )
             else:
                 info.latents_original_size = original_size
@@ -618,6 +640,7 @@ class LatentsCachingStrategy:
         flipped_latents_tensor=None,
         alpha_mask=None,
         key_reso_suffix="",
+        image_path=None,
     ):
         """
         Args:
@@ -633,12 +656,18 @@ class LatentsCachingStrategy:
             None
         """
         kwargs = {}
+        fingerprint = self.image_fingerprint(image_path) if image_path is not None else None
 
         if os.path.exists(npz_path):
             # load existing npz and update it
             npz = np.load(npz_path)
-            for key in npz.files:
-                kwargs[key] = npz[key]
+            # [TrainFlow] latents of an older version of the image (other resolutions) must not be kept alongside
+            same_image = fingerprint is None or ("image_fingerprint" in npz and np.array_equal(npz["image_fingerprint"], fingerprint))
+            if same_image:
+                for key in npz.files:
+                    kwargs[key] = npz[key]
+        if fingerprint is not None:
+            kwargs["image_fingerprint"] = fingerprint
 
         # TODO float() is needed if vae is in bfloat16. Remove it if vae is float16.
         kwargs["latents" + key_reso_suffix] = latents_tensor.float().cpu().numpy()

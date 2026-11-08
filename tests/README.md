@@ -23,6 +23,7 @@ python -m venv .venv
 | `test_heic.py`, `test_media_*.py`, `test_other_formats.py` | Video/GIF/AVIF/JXL/HEIC/PSD/TIFF… conversion, frame extraction, messages |
 | `test_rename.py` | Rename to Numbers: undo when a file is locked part-way, letter-case pairing, training interlock |
 | `test_trainer_patch.py` | The sd-scripts patch: resume/Train More with gradient accumulation, halt-state cleanup (runs the real trainer code, extracted) |
+| `test_trainer_cache.py` | sd-scripts' real dataset and caching code: the trigger word reaches the cached captions; edited captions, edited images and renamed datasets are encoded again. Needs the trainer's packages: on Windows it runs itself with `python_embeded\python.exe`, elsewhere it reports SKIP |
 | `test_training_flow.py` | Input validation, training ⇄ tool interlock, Train More rollback, settings.json safety, preview prompts, WD caption format, inspector checks |
 | `e2e/test_e2e.py` | The app served by Gradio and driven through its API: the trainer outliving the app, reattach, pause/halt/resume, grid, loss, Train More, background tools |
 | `e2e/test_browser.py` | Optional: the UI in a headless browser (tab switching mid-run, loss chart, settings restored after reload) |

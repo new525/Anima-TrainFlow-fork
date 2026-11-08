@@ -2613,7 +2613,7 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
 
     trig = trigger_word.strip().lower()
     tag_counts: dict = {}
-    empty, dup_tags, escaped, with_trigger, n_caps, tags_total = [], [], [], 0, 0, 0
+    empty, dup_tags, escaped, multiline, with_trigger, n_caps, tags_total = [], [], [], [], 0, 0, 0
     for img in images:
         txt = img.with_suffix(".txt")
         if not txt.is_file():
@@ -2625,6 +2625,8 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
         tags = split_tags(caption_text)
         if "\\(" in caption_text or "\\)" in caption_text:
             escaped.append(txt.name)
+        if len([line for line in caption_text.splitlines() if line.strip()]) > 1:
+            multiline.append(txt.name)
         n_caps += 1
         tags_total += len(tags)
         if not tags:
@@ -2686,6 +2688,7 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
     flag(orphans, f"⚠️ {len(orphans)} caption file(s) with no image: {_examples(orphans)}")
     flag(rotated, f"⚠️ {len(rotated)} image(s) have an EXIF rotation sd-scripts ignores — bucket them first: {_examples(rotated)}")
     flag(dup_tags, f"⚠️ {len(dup_tags)} caption(s) repeat a tag: {_examples(dup_tags)}")
+    flag(multiline, f"⚠️ {len(multiline)} caption(s) have more than one line — training reads only the first line: {_examples(multiline)}")
     flag(escaped, f"⚠️ {len(escaped)} caption(s) contain escaped parentheses \\( \\) — captions are read literally, so write them plain, "
                   f"e.g. 'hatsune miku (cosplay)' (only prompts need the backslash): {_examples(escaped)}")
     flag(small, f"ℹ️ {len(small)} image(s) have a short side under 512px (trained at their own lower resolution): {_examples(small)}")

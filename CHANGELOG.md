@@ -3,6 +3,38 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.10] - 2026-11-08
+
+Training-cache fixes. These bugs came from upstream; they were found while checking how natural-language captions would reach the model. Each one was reproduced by running sd-scripts' real dataset and caching code on a dataset config written by TrainFlow, then fixed and covered by a test.
+
+### Fixed
+- **The trigger word was never trained unless the captions already contained it.**
+  - **Cause:** TrainFlow always caches text-encoder outputs, and sd-scripts encoded the raw caption file for that cache. The `caption_prefix` that adds the trigger word is only applied on the uncached path, which training never took.
+  - **What it meant:** captions from embedded tags or the WD tagger never contain the trigger, so in practice every run trained without it. The LoRA still learned the subject, but the trigger word did nothing in particular.
+  - **Fix:** the cache now encodes the caption exactly as training would see it, prefix included. Caption dropout still works, since cached outputs apply it at train time.
+- **Edited captions kept their old encoding.** The caption cache (`<dataset>/cache_text_encoder/`) was only checked for the right keys, never for the text. The cache now stores the caption it was made from and encodes again when the text differs, including after changing the trigger word.
+- **Edited images kept their old latents.** The latent cache (`<dataset>/latent_cache/`) is named after the image's name and size only. An image edited in place at the same size, e.g. a watermark painted out of a bucketed PNG, kept training on the old pixels. The cache now stores the image file's size and modification time and encodes again when either changes.
+- **Rename to Numbers could train an image with another image's caption.** When adding an image shifted the numbering, both caches followed the old names.
+  - **Reproduced:** a new landscape picture that became `001` got fresh latents (its size changed the cache name) but kept the old `001`'s cached caption.
+  - **Also:** with matching sizes, the new picture was skipped and an old one was trained twice.
+  - **Now:** both checks above catch it. The rename message "caches are rebuilt on the next training run" is now true.
+
+### Changed
+- **One-time re-encode:** the first run after updating encodes every caption and image again, because caches from older versions don't record what they were made from. Expect a slower start once.
+- 🔎 **Inspect Dataset** flags captions with more than one line. Training reads only the first line, and that's unchanged.
+
+### Added
+- `tests/test_trainer_cache.py` runs sd-scripts' real dataset and caching code with stand-in encoders. It covers:
+  - the trigger in the cached text, matching what uncached training encodes
+  - reuse when nothing changed
+  - re-encoding after an edited caption, a changed trigger, an old-format cache, an edited image, and a rename that shifts names
+  - Run against the previous sd-scripts files (minus the checks that need the new code), the trigger, edited-caption, changed-trigger, edited-image and rename checks all fail.
+- It needs the trainer's packages, so on Windows it runs itself with `python_embeded\python.exe`. Elsewhere it reports SKIP.
+
+### Verified
+- The full suite passes. `test_trainer_cache.py` was run with torch 2.14 (CPU) and the bundled sd-scripts requirements.
+- **Not yet confirmed:** a real GPU run. The real text encoder and VAE were swapped for stand-ins; the caching code around them is the real thing.
+
 ## [1.9] - 2026-11-05
 
 Fixes from a full code review. Every item below was reproduced first, then fixed and covered by a test.

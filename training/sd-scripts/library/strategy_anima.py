@@ -172,6 +172,15 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         cache_dir.mkdir(parents=True, exist_ok=True)
         return str(cache_dir / (path.stem + self.ANIMA_TEXT_ENCODER_OUTPUTS_NPZ_SUFFIX))
 
+    def is_disk_cached_caption_current(self, npz_path: str, caption: str) -> bool:
+        """[TrainFlow] The cache file is named after the image only, so an edited caption used to keep its old
+        embedding. Caches written before this check have no caption_text and are encoded again once."""
+        try:
+            npz = np.load(npz_path)
+            return "caption_text" in npz and str(npz["caption_text"]) == caption
+        except Exception:
+            return False
+
     def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
         if not self.cache_to_disk:
             return False
@@ -246,6 +255,7 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
                     t5_input_ids=t5_input_ids_i,
                     t5_attn_mask=t5_attn_mask_i,
                     caption_dropout_rate=caption_dropout_rate,
+                    caption_text=np.array(captions[i]),  # [TrainFlow] see is_disk_cached_caption_current
                 )
             else:
                 info.text_encoder_outputs = (prompt_embeds_i, attn_mask_i, t5_input_ids_i, t5_attn_mask_i, caption_dropout_rate)

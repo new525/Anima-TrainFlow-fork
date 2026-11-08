@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.9** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.10** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.9) |
+| | Upstream (v1.1.0) | This fork (1.10) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
@@ -30,7 +30,8 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 | **Dataset formats** | PNG, JPG, WebP, BMP (the tagger skipped BMP) | Also videos and GIFs (their middle frame), AVIF, JPEG XL, HEIC, and anything else Pillow or OpenCV can read |
 | **Dataset checks** | Pre-flight (its oversized-image check never fired) | Working pre-flight plus 🔎 Inspect Dataset |
 | **Bucketing / tagging during a refresh** | Interrupted with the tab | Run in the background |
-| **Trigger word prefix** | `trigger,  tags` (double space); added even if captions already contain it | `trigger, tags`; skipped when every caption has it |
+| **Trigger word prefix** | `trigger,  tags` (double space); added even if captions already contain it; never actually trained, because the cached captions left it out | `trigger, tags`, and trained; skipped when every caption has it |
+| **Caption and image caches** | Reused after a caption or image is edited, or after renaming shifts names onto other pictures | Encoded again whenever the caption text or the image file changed |
 
 The complete list, including smaller fixes, is in [CHANGELOG.md](CHANGELOG.md).
 
@@ -85,7 +86,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
 * Re-run `Install_Requirements.bat` when the changelog says dependencies changed.
   * **1.2.1** (GitHub release 1.3) updated Gradio.
   * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
-  * **1.5** through **1.9** add no dependencies. (1.9 lists `pandas` and `psutil` explicitly, but they were already installed.)
+  * **1.5** through **1.10** add no dependencies. (1.9 lists `pandas` and `psutil` explicitly, but they were already installed.)
 
 ---
 
@@ -136,6 +137,7 @@ Then:
    * videos, GIFs or other formats that haven't been converted yet
    * oversized, small, unreadable or rotated images
    * repeated tags, and the trigger word already in some captions
+   * captions with more than one line (training reads only the first)
    * the most frequent tags, and tags present in every caption
 
 4. **🔢 Rename to Numbers** (optional) renames the images to `001`, `002`, … in filename order. Short names avoid Windows' path-length limit once cache suffixes are added.
@@ -151,6 +153,8 @@ The tools run in the background; their progress shows in the log.
 
 ### Train
 Set a **Trigger Word**, which also names the run's folder, then press **🚀 Start Training**. The status line above the buttons always shows what's running.
+
+The trigger word is put at the front of every caption that doesn't already have it. Captions and images are encoded once and cached next to the dataset (`cache_text_encoder/`, `latent_cache/`). Each run checks those caches against the current caption text and image files, and encodes again whatever changed, so editing, re-captioning or renaming needs no manual cleanup.
 
 | Button | What it does |
 |---|---|
@@ -199,7 +203,7 @@ training/output/<keyword>/<YYYYmmdd_HHMMSS>/   one folder per run
 See *Known limitations* in [CHANGELOG.md](CHANGELOG.md), and please open an issue if something misbehaves.
 
 ## Technical details
-* **Core:** a modified `sd-scripts` for the Anima architecture. This fork adds a halt-request hook, fixes resuming with gradient accumulation (the step count, and the epoch it resumes in), and removes Halt & Save resume points once they're superseded.
+* **Core:** a modified `sd-scripts` for the Anima architecture. This fork adds a halt-request hook, fixes resuming with gradient accumulation (the step count, and the epoch it resumes in), removes Halt & Save resume points once they're superseded, puts the caption prefix (trigger word) into cached text-encoder outputs, and re-encodes cached captions and latents when the caption or image changed.
 * **UI:** Gradio 6.17.3 (the newest release compatible with sd-scripts' pinned `huggingface-hub==0.34.3`). The trainer runs as a separate process launched with `accelerate launch`, and the UI follows its log file.
 * **Defaults:** BF16, latent and text-encoder caching, and the Prodigy optimizer with a constant learning rate; AdamW uses a cosine schedule.
 * **Settings** are auto-saved to `training/settings.json`.

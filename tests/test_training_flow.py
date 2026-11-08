@@ -194,12 +194,15 @@ d = tmpdir()
 Image.new("RGB", (600, 900)).save(d / "IMG_1.png"); (d / "img_1.txt").write_text("1girl", encoding="utf-8")
 Image.new("RGB", (600, 900)).save(d / "Dog.png"); Image.new("RGB", (600, 900)).save(d / "dog.jpg")
 (d / "Dog.txt").write_text("hatsune miku \\(cosplay\\), smile", encoding="utf-8")
+Image.new("RGB", (600, 900)).save(d / "two.png"); (d / "two.txt").write_text("1girl, smile\nA girl smiling.\n", encoding="utf-8")
 out = drain(g, g["inspect_dataset"](str(d), "kw"))
 check("inspector: caption named in another letter case is pointed out, not called an orphan",
       "named with different letter case than their image" in out and "img_1.txt" in out and "with no image" not in out,
       [line for line in out.splitlines() if "letter case" in line or "no image" in line])
 check("inspector: Dog.png + dog.jpg reported as a clash", "Dog.png + dog.jpg" in out or "dog.jpg + Dog.png" in out)
 check("inspector: escaped parentheses flagged", "contain escaped parentheses" in out and "Dog.txt" in out)
+check("inspector: multi-line captions flagged (only the first line is trained)", "have more than one line" in out and "two.txt" in out
+      and "1 caption(s) have more than one line" in out)
 
 # --- launch / config details
 src = (REPO / "app.py").read_text(encoding="utf-8")

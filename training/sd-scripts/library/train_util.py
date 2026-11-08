@@ -825,6 +825,17 @@ class BaseDataset(torch.utils.data.Dataset):
     def add_replacement(self, str_from, str_to):
         self.replacements[str_from] = str_to
 
+    def caption_for_cache(self, subset: BaseSubset, caption):
+        """[TrainFlow] The caption as training sees it, minus caption dropout (which cached outputs apply at train
+        time): prefix/suffix, first line (or wildcard pick), separators, replacements. Cached text-encoder outputs used
+        to encode the raw caption file instead, so caption_prefix/caption_suffix (the trigger word) never reached them."""
+        rate, every = subset.caption_dropout_rate, subset.caption_dropout_every_n_epochs
+        subset.caption_dropout_rate, subset.caption_dropout_every_n_epochs = 0, 0
+        try:
+            return self.process_caption(subset, caption)
+        finally:
+            subset.caption_dropout_rate, subset.caption_dropout_every_n_epochs = rate, every
+
     def process_caption(self, subset: BaseSubset, caption):
         # caption に prefix/suffix を付ける
         if subset.caption_prefix:
@@ -1197,6 +1208,14 @@ class BaseDataset(torch.utils.data.Dataset):
                     cache_available = caching_strategy.is_disk_cached_latents_expected(
                         info.bucket_reso, info.latents_npz, subset.flip_aug, subset.alpha_mask
                     )
+                    if cache_available and not caching_strategy.skip_disk_cache_validity_check:
+                        # [TrainFlow] re-encode an image that was edited or replaced since it was cached
+                        cache_available = caching_strategy.is_disk_cached_latents_current(info.latents_npz, info.absolute_path)
+                        if not cache_available:
+                            try:
+                                os.remove(info.latents_npz)  # its other resolutions are of the old image too
+                            except OSError:
+                                pass
                     if cache_available:  # do not add to batch
                         continue
 
@@ -1324,6 +1343,8 @@ class BaseDataset(torch.utils.data.Dataset):
 
         logger.info("checking cache validity...")
         for i, info in enumerate(tqdm(image_infos)):
+            # [TrainFlow] the text training would see (with prefix/suffix), not the raw caption file
+            info.cache_caption = self.caption_for_cache(self.image_to_subset[info.image_key], info.caption)
             # check disk cache exists and size of text encoder outputs
             if caching_strategy.cache_to_disk:
                 te_out_npz = caching_strategy.get_outputs_npz_path(info.absolute_path)
@@ -1335,6 +1356,9 @@ class BaseDataset(torch.utils.data.Dataset):
                     continue
 
                 cache_available = caching_strategy.is_disk_cached_outputs_expected(te_out_npz)
+                if cache_available and not caching_strategy.skip_disk_cache_validity_check:
+                    # [TrainFlow] re-encode when the caption changed since it was cached
+                    cache_available = caching_strategy.is_disk_cached_caption_current(te_out_npz, info.cache_caption)
                 if cache_available:  # do not add to batch
                     continue
 
@@ -1356,7 +1380,15 @@ class BaseDataset(torch.utils.data.Dataset):
         logger.info("caching Text Encoder outputs...")
         for batch in tqdm(batches, smoothing=1, total=len(batches)):
             # cache_batch_latents(vae, cache_to_disk, batch, subset.flip_aug, subset.alpha_mask, subset.random_crop)
-            caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
+            # [TrainFlow] strategies encode info.caption: hand them the processed text, then restore the raw caption
+            raw_captions = [info.caption for info in batch]
+            for info in batch:
+                info.caption = info.cache_caption
+            try:
+                caching_strategy.cache_batch_outputs(tokenize_strategy, models, text_encoding_strategy, batch)
+            finally:
+                for info, raw in zip(batch, raw_captions):
+                    info.caption = raw
 
     # if weight_dtype is specified, Text Encoder itself and output will be converted to the dtype
     # this method is only for SDXL, but it should be implemented here because it needs to be a method of dataset
