@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.10** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.11** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.10) |
+| | Upstream (v1.1.0) | This fork (1.11) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
@@ -27,6 +27,7 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 | **Re-running bucketing with new sizes** | Can overwrite your original images with crops | Non-destructive; originals are never touched |
 | **Phone photos** | Bucket chosen from unrotated size: cropped the wrong way | Rotated upright first |
 | **Captions** | WD tagger only | Tags already embedded by Grabber/exiftool first, written in Anima's caption format; WD tagger for the rest |
+| **Natural-language captions** | — | A separate ToriiGate 0.5 captioner writes `<name>.toriigate.txt` next to each image (training still reads the tag captions) |
 | **Dataset formats** | PNG, JPG, WebP, BMP (the tagger skipped BMP) | Also videos and GIFs (their middle frame), AVIF, JPEG XL, HEIC, and anything else Pillow or OpenCV can read |
 | **Dataset checks** | Pre-flight (its oversized-image check never fired) | Working pre-flight plus 🔎 Inspect Dataset |
 | **Bucketing / tagging during a refresh** | Interrupted with the tab | Run in the background |
@@ -151,6 +152,14 @@ These tools and training don't work on the same folder at once. 🚀 Start Train
 
 The tools run in the background; their progress shows in the log.
 
+### Natural-language captions (optional)
+`start_captioner.bat` opens a separate captioner that writes a natural-language caption for every image with [ToriiGate 0.5](https://huggingface.co/Minthy/ToriiGate-0.5).
+* It runs the model in llama.cpp. Both are downloaded on first use: about 5.2 GB for the model.
+* The image's Grabber tags or tag caption are passed to the model as hints, so characters get their right names.
+* Each caption is saved as `<name>.toriigate.txt`; your tag captions aren't touched. The dataset tools above treat it as part of its image.
+* **Training doesn't use these captions yet:** it reads only `<name>.txt`.
+* There's a command line too. Details are in [tools/toriigate-captioner/README.md](tools/toriigate-captioner/README.md).
+
 ### Train
 Set a **Trigger Word**, which also names the run's folder, then press **🚀 Start Training**. The status line above the buttons always shows what's running.
 
@@ -199,6 +208,7 @@ training/output/<keyword>/<YYYYmmdd_HHMMSS>/   one folder per run
 * **Not yet confirmed:**
   * On a real GPU: halt/resume through the bundled trainer (including the 1.9 fix for resuming with gradient accumulation), and block swap's VRAM savings.
   * On Windows: training surviving a closed console window.
+  * The ToriiGate captioner with the real model on a GPU. Its llama.cpp handling was tested with a tiny model of the same architecture on the CPU.
 
 See *Known limitations* in [CHANGELOG.md](CHANGELOG.md), and please open an issue if something misbehaves.
 
@@ -209,4 +219,4 @@ See *Known limitations* in [CHANGELOG.md](CHANGELOG.md), and please open an issu
 * **Settings** are auto-saved to `training/settings.json`.
 
 ## Credits & license
-Anima TrainFlow was created by **ThetaCursed** ([upstream repository](https://github.com/ThetaCursed/Anima-TrainFlow)). This fork's changes are released under the same [MIT License](LICENSE). Anima model weights are © CircleStone Labs under their own license. The bundled `sd-scripts` is by kohya-ss.
+Anima TrainFlow was created by **ThetaCursed** ([upstream repository](https://github.com/ThetaCursed/Anima-TrainFlow)). This fork's changes are released under the same [MIT License](LICENSE). Anima model weights are © CircleStone Labs under their own license. The bundled `sd-scripts` is by kohya-ss. The captioner's `prompts.py` is ToriiGate 0.5's own, by Minthy (MIT); see [its third-party notes](tools/toriigate-captioner/THIRD_PARTY.md).

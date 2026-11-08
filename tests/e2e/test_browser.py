@@ -27,6 +27,7 @@ tree, ds = work / "apptree", work / "ds"
 for d in (tree / "models", tree / "training" / "sd-scripts", ds):
     d.mkdir(parents=True)
 shutil.copy(APP, tree / "app.py")
+shutil.copy(APP.parent / "embedded_tags.py", tree / "embedded_tags.py")
 for f in ("dit", "qwen", "vae"):
     (tree / "models" / f"{f}.safetensors").touch()
 for i in range(3):

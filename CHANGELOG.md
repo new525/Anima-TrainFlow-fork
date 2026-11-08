@@ -3,6 +3,65 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.11] - 2026-11-08
+
+Natural-language captions with ToriiGate 0.5, as a separate tool. Training doesn't use them yet; that's the next step.
+
+### Added
+- **ToriiGate 0.5 captioner** (`tools/toriigate-captioner/`, started with `start_captioner.bat`). It writes a natural-language caption for every image in a folder, as `<name>.toriigate.txt` next to the image. Tag captions (`.txt`) are never changed. There's a web UI and a command line (`toriigate_cli.bat`).
+  - **Model:** [Minthy/ToriiGate-0.5](https://huggingface.co/Minthy/ToriiGate-0.5), from the GGUF build [SleepVeryHard/ToriiGate-0.5_GGUF](https://huggingface.co/SleepVeryHard/ToriiGate-0.5_GGUF), run in llama.cpp's `llama-server`.
+  - **First use downloads:** llama.cpp `b12211` (Windows, CUDA 12.4) and the model (`Q8_0`, 5.16 GB, plus the vision projector), both into the tool's folder. Downloads resume after an interruption.
+  - **Other ways to run the model:** your own `llama-server`, or a server that's already running. Any `.gguf` in the repo can be picked from 🔄 List files.
+  - **Prompts:** the model's own `prompts.py`, bundled unmodified, with all 10 caption formats.
+  - **Requests** follow the model's reference script: at most 1 megapixel, JPEG quality 95, temperature 0.5, up to 2048 tokens.
+  - **Hints**, which the model card recommends for correct names, come from one of two places:
+    - The image's Grabber tags. With namespaces, characters are told apart; artist tags are left out unless asked for.
+    - Otherwise the first line of its `.txt`.
+    - Names you type replace any that were found. `score_*` tags are never passed.
+  - **Character names:** use the known names, let the model recognise characters, or never name them.
+  - **🔍 Try one image** shows the caption and the exact prompt without saving.
+  - **Keep the model loaded** reuses the server between runs.
+  - **Runs** skip images that already have a caption, so an interrupted run carries on. They keep going when the page is reloaded and stop after the current image.
+  - A log, `toriigate_captions.log`, records each image's format, time, tokens and hint source.
+- TrainFlow's dataset tools treat `<name>.toriigate.txt` as part of its image:
+  - 🔢 Rename to Numbers renames it.
+  - The duplicate check sets it aside, and copies it to the kept copy if that has none.
+  - 🔎 Inspect Dataset counts these files and leaves them out of the tag checks. One whose image is missing is flagged.
+
+### Changed
+- The embedded-tag reader moved from `app.py` to `embedded_tags.py` unchanged, so the captioner can use it too. One function was added: `namespaced_tags`, which sorts Grabber tags by namespace.
+- A `.gitignore` keeps `__pycache__/` out of the repository.
+
+### Tests
+- `tests/test_toriigate_captioner.py` uses `tests/e2e/fake_llama_server.py`, a stand-in for llama-server. It covers:
+  - the official `prompts.py` (checksum)
+  - every hint and name mode
+  - image preparation
+  - the server lifecycle, including a server that dies while loading
+  - captioning, skip, overwrite, limit and stop
+  - errors: an HTTP error, a server lost mid-run, a token-limit cut-off
+  - resumable downloads and the llama.cpp zip (including a zip with paths outside its folder)
+  - the CLI
+  - TrainFlow's handling of `.toriigate.txt`
+- `tests/e2e/test_captioner_ui.py` drives the web UI through its API, covering:
+  - captioning a folder and trying one image
+  - a page reload during a run, and stop
+  - keeping the model loaded, and unload
+  - settings surviving a restart
+- `tests/test_toriigate_real_llama.py` is optional: it runs against a real llama-server and model.
+
+### Verified
+- **Against a real llama.cpp `b12211` `llama-server`** (CPU build), with a tiny randomly initialised model of ToriiGate's architecture (Qwen3.5 vision-language), converted with llama.cpp's own converter:
+  - The server starts with the flags the captioner passes.
+  - The image reaches the model: 1,048 prompt tokens for a 1154×866 image, about one token per 32×32 pixels plus the text.
+  - With reasoning off, the answer comes back as plain content.
+  - The CLI and the folder run write the captions.
+- **Not yet confirmed:**
+  - caption quality with the real model
+  - VRAM use on an 11 GB card
+  - the BF16 vision projector's speed on RTX 20-series cards, which have no native BF16
+  - that the exact file names in the GGUF repo match its README. Hugging Face wasn't reachable from the build environment; 🔄 List files shows the real names.
+
 ## [1.10] - 2026-11-08
 
 Training-cache fixes. These bugs came from upstream; they were found while checking how natural-language captions would reach the model. Each one was reproduced by running sd-scripts' real dataset and caching code on a dataset config written by TrainFlow, then fixed and covered by a test.

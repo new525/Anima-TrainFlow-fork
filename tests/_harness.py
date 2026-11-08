@@ -43,6 +43,7 @@ def load_app(fake_cropper=True, seen_shapes=None, src_transform=None):
     stub_torch()
     work = Path(tempfile.mkdtemp(prefix="tf_app_"))
     shutil.copy(APP, work / "app.py")
+    shutil.copy(REPO / "embedded_tags.py", work / "embedded_tags.py")   # imported by app.py
     src = APP.read_text(encoding="utf-8").replace('if __name__ == "__main__":', "if False:")
     if src_transform:
         src = src_transform(src)

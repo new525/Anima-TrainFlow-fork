@@ -31,6 +31,7 @@ shutil.rmtree(WORK, ignore_errors=True)
 for d in (M, TREE / "training" / "sd-scripts", DS):
     d.mkdir(parents=True)
 shutil.copy(APP_SRC, TREE / "app.py")
+shutil.copy(APP_SRC.parent / "embedded_tags.py", TREE / "embedded_tags.py")
 for f in ("dit", "qwen", "vae"):
     (M / f"{f}.safetensors").touch()
 for i in range(3):

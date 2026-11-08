@@ -40,6 +40,7 @@ from _harness import check, finish  # noqa: E402
 # TrainFlow's own dataset.toml writer (app.py executed with the real torch)
 work = Path(tempfile.mkdtemp(prefix="tf_cache_app_"))
 shutil.copy(REPO / "app.py", work / "app.py")
+shutil.copy(REPO / "embedded_tags.py", work / "embedded_tags.py")
 app = {"__name__": "app", "__file__": str(work / "app.py")}
 exec(compile((REPO / "app.py").read_text(encoding="utf-8").replace('if __name__ == "__main__":', "if False:"), str(REPO / "app.py"), "exec"), app)
 
