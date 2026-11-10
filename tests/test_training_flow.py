@@ -143,6 +143,51 @@ check("…and says so", "put back as it was" in out, out.splitlines()[-1])
 out = g["extend_training"]("tm", 700)
 check("…so Train More is still offered for it (not 'use Resume Run')", "isn't finished" not in out, out.splitlines()[-1])
 
+# --- Resume Run: only the keyword's newest started run counts; a newer run with no resume point isn't skipped over
+def fake_run(kw, name, state_step=None, final=False, configs=True):
+    rd = g["OUTPUT_BASE"] / kw / name
+    rd.mkdir(parents=True)
+    if configs:
+        (rd / "configs").mkdir()
+        toml.dump(dict(cfg, output_name=kw, max_train_steps=2400), open(rd / "configs" / f"{kw}_training.toml", "w", encoding="utf-8"))
+        toml.dump({"datasets": [{"subsets": [{"image_dir": ds.as_posix()}]}]}, open(rd / "configs" / f"{kw}_dataset.toml", "w", encoding="utf-8"))
+    if state_step is not None:
+        sd = rd / f"{kw}-step{state_step:08d}-state"
+        sd.mkdir()
+        (sd / "train_state.json").write_text(json.dumps({"current_step": state_step})); (sd / "random_states_0.pkl").touch()
+    if final:
+        (rd / f"{kw}.safetensors").write_bytes(b"final")
+    return rd
+
+
+def resume_point(kw):
+    point = g["find_resume_point"](g["OUTPUT_BASE"] / kw)
+    return point and (point["run_dir"].name, point["step"])
+
+
+fake_run("rs1", "20260101_000000", state_step=600)
+check("resume point: the halted run, at its saved step", resume_point("rs1") == ("20260101_000000", 600), resume_point("rs1"))
+fake_run("rs1", "20260102_000000", configs=False)      # a start that failed before its configs were written
+check("…a newer folder that never started doesn't hide it", resume_point("rs1") == ("20260101_000000", 600), resume_point("rs1"))
+fake_run("rs1", "20260103_000000", state_step=200)
+check("…a newer halted run is the one resumed", resume_point("rs1") == ("20260103_000000", 200), resume_point("rs1"))
+fake_run("rs2", "20260101_000000", state_step=600)
+fake_run("rs2", "20260102_000000")                     # newer run, stopped before its first resume point
+check("a newer run with no resume point: the older halted run is not resumed in its place", resume_point("rs2") is None, resume_point("rs2"))
+launches.clear()
+tm.start = lambda *a, **k: (launches.append(a), True)[1]
+console.clear()
+out = g["resume_training"]("rs2")
+check("…↩ Resume Run says there's nothing to resume and launches nothing", "Nothing to resume for 'rs2'" in out and not launches, out.splitlines()[-1])
+console.clear()
+out = g["resume_training"]("rs1")
+check("↩ Resume Run launches the newest halted run from its state", len(launches) == 1 and "run 20260103_000000 from step 200/2400" in out
+      and "--resume" in launches[0][0], out.splitlines()[:2])
+fake_run("rs3", "20260101_000000", state_step=600)
+fake_run("rs3", "20260102_000000", state_step=2400, final=True)
+check("a newer finished run: nothing to resume", resume_point("rs3") is None, resume_point("rs3"))
+tm.start = real_start
+
 # --- settings.json: atomic save; an unreadable file is kept and reported, not silently replaced by defaults
 sf = g["SETTINGS_FILE"]
 good = dict(g["DEFAULT_SETTINGS"], dit_path="D:/models/anima.safetensors", trigger_word="mychar")

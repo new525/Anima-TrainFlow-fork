@@ -738,8 +738,9 @@ def read_state_step(state_dir: Path) -> int | None:
 
 
 def find_resume_point(project_dir: Path) -> dict | None:
-    """Newest unfinished run of this keyword that has a complete saved state, with its newest state.
-    Stops at the newest finished run: older runs behind it are treated as abandoned, not resumed silently."""
+    """The keyword's newest run, with its newest complete saved state, if that run is unfinished and has one.
+    Only the newest run that was actually started (it has configs) is considered: when it finished, or was stopped
+    before its first resume point, older runs behind it are treated as abandoned, not resumed silently."""
     if not project_dir.is_dir():
         return None
     for run_dir in sorted((d for d in project_dir.iterdir() if d.is_dir()), key=lambda d: d.name, reverse=True):
@@ -761,9 +762,10 @@ def find_resume_point(project_dir: Path) -> dict | None:
             step = read_state_step(state_dir)
             if step is not None and step < max_steps and (best is None or step > best[0]):
                 best = (step, state_dir)
-        if best:
-            return {"run_dir": run_dir, "state_dir": best[1], "step": best[0], "max_steps": max_steps,
-                    "training_toml": training_tomls[0], "dataset_toml": dataset_tomls[0]}
+        if not best:
+            return None
+        return {"run_dir": run_dir, "state_dir": best[1], "step": best[0], "max_steps": max_steps,
+                "training_toml": training_tomls[0], "dataset_toml": dataset_tomls[0]}
     return None
 
 

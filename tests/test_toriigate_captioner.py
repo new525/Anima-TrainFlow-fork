@@ -226,6 +226,46 @@ except tc.SetupError as e:
     check("unreachable external server reported", "can't reach" in str(e))
 
 
+# --- web UI: a button pressed during a run must not stop the server that run is using ------------------------------------
+os.environ["TG_CAPTIONER_SETTINGS"] = str(Path(tempfile.mkdtemp(prefix="tf_tgset_")) / "settings.json")   # not the real one
+import captioner_ui as cui  # noqa: E402
+
+os.environ.update(FAKE_LLAMA_LOAD="0", FAKE_LLAMA_DELAY="0.4")
+d = grabber()
+
+
+def ui_values(**kw):
+    v = dict(cui.DEFAULTS, folder=str(d), keep_running=True)
+    v.update(kw)
+    return [v[k] for k in cui.UI_KEYS]
+
+
+session = cui.job.get_session(cui.split_values(ui_values())[2])   # the UI's session, its model already loaded
+srv = session.server = tc.LlamaServer([sys.executable, str(FAKE)], Path("m.gguf"), Path("mm.gguf"),
+                                      log_path=Path(tempfile.mkdtemp()) / "srv.log")
+try:
+    session.base_url = srv.start(timeout=30)
+    cui.start_captioning(*ui_values())
+    time.sleep(1.0)
+    check("UI: a folder run is in progress", cui.job.busy(), cui.job.status)
+    for label, press in [("🔍 Try one image", cui.try_one), ("▶ Caption folder", cui.start_captioning),
+                         ("⬇ Download now", cui.download_now)]:
+        press(*ui_values(ctx=4096, gpu_layers="0"))
+        check(f"UI: {label} with changed server settings during a run is refused; the run keeps its server",
+              srv.alive() and cui.job.session is session and cui.job.lines[-1] == cui.BUSY, cui.job.lines[-2:])
+    cui.job.thread.join(120)
+    done = len(list(d.glob("*" + tc.NL_CAPTION_SUFFIX)))
+    check("…and the run captions every image", done == len(tc.list_images(d)) and "Captioning finished" in cui.job.status
+          and not any("lost the server" in line for line in cui.job.lines), (done, cui.job.status, cui.job.lines[-3:]))
+    cui.try_one(*ui_values(mode="external", url=f"http://127.0.0.1:{tc.free_port()}"))
+    cui.job.thread.join(60)
+    check("UI: once idle, changed server settings do unload the old model", not srv.alive() and cui.job.session is not session,
+          cui.job.status)
+finally:
+    srv.stop()
+    del os.environ["FAKE_LLAMA_DELAY"]
+
+
 # --- downloads ----------------------------------------------------------------------------------------------------------
 serve_dir = Path(tempfile.mkdtemp(prefix="tf_dl_"))
 payload = os.urandom(3 * 2**20 + 123)

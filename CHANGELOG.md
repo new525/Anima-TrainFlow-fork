@@ -3,6 +3,32 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.12] - 2026-11-10
+
+Two fixes from a code review of 1.11. Each was reproduced first and is covered by the test suite.
+
+### Fixed
+- **ToriiGate captioner: pressing a button during a run could stop the model the run was using.**
+  - **Cause:** ▶ Caption folder, 🔍 Try one image and ⬇ Download now set up their server session before checking whether a job was already running. With a changed setting under *Model and server* (model, projector, GPU layers, context size, mode, path or URL), setting up meant closing the current session, and with it the running job's `llama-server`.
+  - **What you saw:** "⏏ Model unloaded", then "⚠️ Still working", and the folder run ending with "lost the server" after the image it was on.
+  - **When it hit:** only when the captioner runs `llama-server` itself (the automatic download, or "my llama-server"). A server that was already running was never stopped.
+  - **Fix:** the three buttons check for a running job first and change nothing while one is working. Once idle, changed settings still unload the old model, as before.
+- **↩ Resume Run could resume an older run than the newest one.**
+  - **Cause:** when the keyword's newest run had no resume point yet, the search carried on to the runs before it.
+  - **What you saw:** after halting run A and then starting a new run B that was stopped before its first resume point, Resume Run continued A, with A's settings. The console did name the run, but nothing said B had been passed over.
+  - **Fix:** only the newest run that was actually started counts. If it finished or has no resume point, Resume Run says there is nothing to resume, as the README describes. A run folder left by a start that failed before its configs were written is still ignored.
+
+### Tests
+- `test_toriigate_captioner.py`: each of the three buttons pressed with changed server settings during a folder run; the run keeps its server and captions every image. Once idle, changed settings unload the old model.
+- `test_training_flow.py`: which run Resume Run picks: a halted run, a newer halted run, a newer run with no resume point, a newer finished run, a newer folder that never started.
+
+### Verified
+- Both new groups of checks fail on 1.11 and pass with the fixes.
+- `tests/run_all.py` on Linux with Python 3.11, in an environment built from `tests/requirements.txt`: 17 of 18 scripts pass.
+  - `e2e/test_e2e.py` fails two timing checks there ("training refused while bucketing works on its dataset", "second tool refused while one runs"). They fail the same way on unchanged 1.11: the bucketing job the test starts is finished before the test's next call. Its other checks pass.
+  - Skipped, as designed without their requirements: `test_trainer_cache.py` (needs the trainer's packages), `test_toriigate_real_llama.py` (needs a real llama-server and model), `e2e/test_browser.py` (needs Node.js).
+- **Not yet confirmed:** either fix on Windows, and the captioner fix with a real `llama-server`. The test uses the stand-in server with real process handling.
+
 ## [1.11] - 2026-11-08
 
 Natural-language captions with ToriiGate 0.5, as a separate tool. Training doesn't use them yet; that's the next step.
