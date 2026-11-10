@@ -42,6 +42,9 @@ def save_settings(values: dict) -> None:
         pass
 
 
+BUSY = "⚠️ Still working — wait or press ⏹ Stop."
+
+
 class Job:
     """One background job at a time; keeps the llama-server session between jobs when asked to."""
 
@@ -105,7 +108,7 @@ class Job:
 
     def start(self, label: str, fn) -> str:
         if self.busy():
-            return "⚠️ Still working — wait or press ⏹ Stop."
+            return BUSY
         self.stop_event = threading.Event()
 
         def run():
@@ -139,6 +142,15 @@ job = Job()
 atexit.register(lambda: job.session.close(force=True) if job.session else None)
 
 
+def refuse_if_busy() -> bool:
+    """True (and a log line) while a job runs. Ask this before job.get_session(): with changed server settings that
+    call closes the current session, which would stop the server the running job is using."""
+    if job.busy():
+        job.log(BUSY)
+        return True
+    return False
+
+
 def split_values(values) -> tuple:
     v = dict(zip(UI_KEYS, values))
     opts = tc.Options(**{k: v[k] for k in OPTION_KEYS})
@@ -154,6 +166,8 @@ def start_captioning(*values):
     folder = Path(str(v["folder"]).strip().strip('"'))
     if not folder.is_dir():
         job.log(f"❌ Not a folder: {folder}")
+        return
+    if refuse_if_busy():
         return
     session = job.get_session(cfg)
     msg = job.start("Captioning", lambda: session.caption_folder(folder, opts, job.stop_event))
@@ -180,6 +194,8 @@ def try_one(*values):
     if image is None:
         job.log("❌ No images in this folder.")
         return
+    if refuse_if_busy():
+        return
     session = job.get_session(cfg)
     if not cfg.keep_running:
         job.log("ℹ️ Tip: tick 'Keep the model loaded' to try several settings without reloading it each time.")
@@ -199,6 +215,8 @@ def try_one(*values):
 def download_now(*values):
     v, opts, cfg = split_values(values)
     save_settings(v)
+    if refuse_if_busy():
+        return
     session = job.get_session(cfg)
 
     def run():
