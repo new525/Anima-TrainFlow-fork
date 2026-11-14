@@ -2435,7 +2435,8 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
 
     trig = trigger_word.strip().lower()
     tag_counts: dict = {}
-    empty, dup_tags, escaped, multiline, with_trigger, n_caps, tags_total = [], [], [], [], 0, 0, 0
+    empty, dup_tags, escaped, multiline, n_caps, tags_total = [], [], [], [], 0, 0
+    trig_in, trig_out = [], []   # captions with / without the trigger word as a tag
     for img in images:
         txt = img.with_suffix(".txt")
         if not txt.is_file():
@@ -2456,8 +2457,8 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
         low = [t.lower() for t in tags]
         if len(set(low)) != len(low):
             dup_tags.append(txt.name)
-        if trig and trig in low:
-            with_trigger += 1
+        if trig:
+            (trig_in if trig in low else trig_out).append(txt.name)
         for t in set(low):
             tag_counts[t] = tag_counts.get(t, 0) + 1
 
@@ -2518,12 +2519,17 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
                   f"e.g. 'hatsune miku (cosplay)' (only prompts need the backslash): {_examples(escaped)}")
     flag(small, f"ℹ️ {len(small)} image(s) have a short side under 512px (trained at their own lower resolution): {_examples(small)}")
     if trig and n_caps:
-        if with_trigger == n_caps:
+        if len(trig_in) == n_caps:
             out.append(f"ℹ️ Every caption already contains '{trigger_word.strip()}': training won't add it again.")
-        elif with_trigger:
+        elif trig_in:
             problems += 1
-            out.append(f"⚠️ {with_trigger}/{n_caps} captions already contain '{trigger_word.strip()}' and will get it twice "
+            out.append(f"⚠️ {len(trig_in)}/{n_caps} captions already contain '{trigger_word.strip()}' and will get it twice "
                        f"(training adds it to every caption). Remove it from those, or add it to all of them.")
+            # Name the smaller group: those are the captions to edit, whichever way it's fixed.
+            if len(trig_out) <= len(trig_in):
+                out.append(f"   {len(trig_out)} without it: {_examples(trig_out, 30)}")
+            else:
+                out.append(f"   {len(trig_in)} with it: {_examples(trig_in, 30)}")
     if tag_counts:
         top = sorted(tag_counts.items(), key=lambda kv: (-kv[1], kv[0]))
         everywhere = [t for t, c in top if c == n_caps and t != trig]

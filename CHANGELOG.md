@@ -3,6 +3,20 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.13] - 2026-11-14
+
+### Fixed
+- **🔎 Inspect Dataset didn't say which captions were the odd ones out for the trigger word.**
+  - **What you saw:** "115/129 captions already contain '…' and will get it twice", with no file names. Training's own warning pointed to Inspect Dataset for the list.
+  - **Fix:** a second line names the smaller group, since those are the captions to edit either way: the ones *without* the trigger word when most captions have it, the ones *with* it when few do. Up to 30 names are shown; the rest are counted.
+
+### Tests
+- `test_training_flow.py`: the listed names for a trigger word in most captions, in few, in a group longer than 30, and in every caption (nothing listed). The first three fail on 1.12.
+
+### Verified
+- `tests/run_all.py` on Linux with Python 3.11: same result as 1.12. 17 of 18 scripts pass, and `e2e/test_e2e.py` fails the same two timing checks as before this change.
+- **Not yet confirmed:** on Windows.
+
 ## [1.12] - 2026-11-10
 
 Two fixes from a code review of 1.11. Each was reproduced first and is covered by the test suite.
