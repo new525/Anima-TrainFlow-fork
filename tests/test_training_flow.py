@@ -249,6 +249,30 @@ check("inspector: escaped parentheses flagged", "contain escaped parentheses" in
 check("inspector: multi-line captions flagged (only the first line is trained)", "have more than one line" in out and "two.txt" in out
       and "1 caption(s) have more than one line" in out)
 
+# --- inspector: trigger word in only some captions: the smaller group is named, so they can be found and edited
+def trigger_lines(with_kw, without_kw):
+    d = tmpdir()
+    for i in range(with_kw + without_kw):
+        Image.new("RGB", (600, 900), (i, 0, 0)).save(d / f"{i:03d}.png")
+        (d / f"{i:03d}.txt").write_text(("kw, " if i < with_kw else "") + f"1girl, tag{i}", encoding="utf-8")
+    lines = drain(g, g["inspect_dataset"](str(d), "kw")).splitlines()
+    at = next((n for n, line in enumerate(lines) if "already contain" in line), None)
+    return lines[at:at + 2] if at is not None else []
+
+
+got = trigger_lines(5, 2)
+check("inspector: trigger in most captions: the ones without it are listed",
+      len(got) == 2 and "5/7 captions already contain 'kw'" in got[0] and got[1].strip() == "2 without it: 005.txt, 006.txt", got)
+got = trigger_lines(2, 5)
+check("inspector: trigger in few captions: the ones with it are listed",
+      len(got) == 2 and "2/7 captions already contain 'kw'" in got[0] and got[1].strip() == "2 with it: 000.txt, 001.txt", got)
+got = trigger_lines(40, 35)
+check("inspector: a long list is cut at 30 names with the rest counted",
+      len(got) == 2 and got[1].strip().startswith("35 without it: 040.txt, 041.txt") and got[1].endswith("069.txt … (+5)"), got[1:])
+got = trigger_lines(3, 0)
+check("inspector: trigger in every caption: nothing to list",
+      "Every caption already contains 'kw'" in got[0] and not any("with it:" in line or "without it:" in line for line in got), got)
+
 # --- launch / config details
 src = (REPO / "app.py").read_text(encoding="utf-8")
 check("ui.launch allows serving files from training/output (previews, grid)", re.search(r"ui\.launch\(.*allowed_paths=\[str\(OUTPUT_BASE", src) is not None)
