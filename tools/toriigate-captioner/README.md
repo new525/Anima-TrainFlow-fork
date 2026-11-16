@@ -26,6 +26,8 @@ It comes with a web UI and a command line. Both use the same code.
 toriigate_cli.bat "C:\Images\MyDataset"
 toriigate_cli.bat "C:\Images\MyDataset" --format long --characters "my_trigger"
 toriigate_cli.bat "C:\Images\MyDataset" --dry-run --limit 3      (prints the prompts, loads nothing)
+toriigate_cli.bat --show-prompt --format short > my_prompt.txt   (the model's prompt, to edit; see "Your own prompt")
+toriigate_cli.bat "C:\Images\MyDataset" --prompt-file my_prompt.txt
 toriigate_cli.bat --help
 ```
 
@@ -88,6 +90,32 @@ The formats marked *needs names* only work with names, so with **none**, or with
 
 Both styles are ones the model's prompt code produces itself.
 
+### Your own prompt
+
+Under **Prompt** you can edit the prompt sent to the model, and its system prompt. Empty boxes use the model's own.
+
+1. Pick the *Caption format* to start from and press **📋 Load the model's prompt for this format**. Both boxes fill in.
+2. Edit the text. For example, add a sentence to the format's instructions, or replace them altogether.
+3. Press 🔍 **Try one image**. *Prompt sent to the model* shows exactly what that image got.
+
+In the prompt, two placeholders stand for the parts that differ per image:
+
+| Placeholder | Filled in with, for each image |
+|---|---|
+| `{tags}` | Its tag hints, as the `# Booru tags for the image` section. It's empty when the image has none, or with tag hints turned off. |
+| `{characters}` | The `# Characters on picture:` section: the names to use, or the instruction to recognise characters or not to guess names, depending on *Character names*. |
+
+- **Moving or removing placeholders:** they can go anywhere. Leave one out and that part isn't sent; the log says so before a run.
+- **Unchanged:** a loaded prompt with no edits fills in to exactly what the model's `prompts.py` makes. A test checks this for every format and setting.
+- **Caption format:** your prompt replaces the format's instructions. After that, changing the *Caption format* only changes how names are handled: the formats marked *needs names* still ask the model to recognise characters when none are known.
+- **The log:** each image's line in `toriigate_captions.log` notes `(custom prompt)` and/or `(custom system prompt)`.
+
+**On the command line:**
+- `--show-prompt --format <format>` prints the model's prompt as a template, plus its system prompt.
+- `--prompt-file` and `--system-prompt-file` use your edited copies.
+
+**A caution:** the model card says the prompts in `prompts.py` are what the model is built for, that "deviating from them is highly discouraged", and that abilities other than captioning were trained away. Small additions to the instructions are the likeliest to be followed. Check any edit on a few images before a whole folder.
+
 ### Generation
 
 The defaults are the model's own:
@@ -130,6 +158,7 @@ Images that already have a `.toriigate.txt` are skipped unless *Overwrite* is on
 
 **Checked:**
 - The prompts are the model's own `prompts.py` (checksum test).
+- A loaded, unedited prompt template fills in to the same prompt, byte for byte, in 3,360 cases. Those cover every format, names mode and tag style, with and without tags and typed names, across every fixture image.
 - Requests have the shape of the model's reference script.
 - Against a real llama.cpp `b12211` llama-server, using a tiny model with ToriiGate's architecture (Qwen3.5 vision-language) on the CPU:
   - the server starts with the flags this tool passes

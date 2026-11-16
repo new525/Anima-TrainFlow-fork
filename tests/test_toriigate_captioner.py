@@ -88,6 +88,47 @@ check("falls back to the image's .txt caption (first line; @artist and score tag
       item11["tags"] == ["1girl", "blue sky"] and src11 == "a11.txt", (item11, src11))
 check("query text matches prompts.make_user_query for the same inputs", q.startswith("# Captioning format:\n" + tc.tg.prompts_b["short"]))
 
+# --- your own prompt -----------------------------------------------------------------------------------------------------
+n = differ = 0
+for fmt in tc.FORMATS:
+    for names in tc.NAMES_MODES:
+        for style in ("plain", "booru"):
+            for use_tags in (True, False):
+                for chars in ("", "mychar"):
+                    for im in tc.list_images(d):
+                        o = tc.Options(format=fmt, names=names, tag_style=style, use_tags=use_tags, characters=chars)
+                        it, _ = tc.grounding(im, index, o)
+                        official, _ = tc.build_query(it, o, im.name)
+                        o.prompt = tc.default_template(fmt)
+                        n += 1
+                        differ += tc.build_query(it, o, im.name)[0] != official
+check(f"the model's prompt loaded as a template fills in to exactly what prompts.py makes ({n} cases: every format, "
+      "names mode, tag style, with/without tags and typed names, every fixture image)", n > 3000 and differ == 0, differ)
+mine = tc.default_template("short").replace("Cover main objects and details.", "Cover main objects. Mention the lighting.")
+qm, _ = tc.build_query(item, tc.Options(prompt=mine), "a03.jpg")
+check("your prompt: your text, with this image's tag and character sections filled in where {tags} and {characters} were",
+      "Mention the lighting." in qm and "# Booru tags for the image\n[" in qm and "make sure to use them: [hatsune miku]" in qm
+      and "{tags}" not in qm and "{characters}" not in qm, qm)
+check("…the filled-in sections are the ones the model's own prompt has for that image",
+      qm.replace("Cover main objects. Mention the lighting.", "Cover main objects and details.") == q)
+qr, _ = tc.build_query(item, tc.Options(prompt="{characters}One sentence, please.\n{tags}"), "a03.jpg")
+check("…placeholders can go anywhere, in any order",
+      qr.index("# Characters on picture:") < qr.index("One sentence") < qr.index("# Booru tags"), qr)
+bare = "# Captioning format:\nOne sentence.\n"
+check("…left out, that part isn't sent", tc.build_query(item, tc.Options(prompt=bare), "a03.jpg")[0] == bare)
+w = tc.prompt_warnings(tc.Options(prompt=bare))
+check("…and that's said before a run", len(w) == 2 and "{tags}" in w[0] and "{characters}" in w[1], w)
+check("no such notes for the model's own prompt, or a template with both placeholders",
+      tc.prompt_warnings(tc.Options()) == [] and tc.prompt_warnings(tc.Options(prompt=mine)) == [])
+check("…nor about {tags} when tag hints are turned off", len(tc.prompt_warnings(tc.Options(prompt="{characters}", use_tags=False))) == 0)
+qj, _ = tc.build_query(item, tc.Options(prompt='Answer as {"caption": "…"} {unknown} {tags}{characters}'), "a03.jpg")
+check("other braces in your prompt are kept as they are (JSON examples, unknown names)",
+      qj.startswith('Answer as {"caption": "…"} {unknown} # Booru tags'), qj[:80])
+qn, note = tc.build_query(tc.grounding(d / "a01.jpg", index, tc.Options())[0],
+                          tc.Options(format="long_thoughts", names="none", prompt="Think first.\n{tags}{characters}"), "a01.jpg")
+check("with your prompt, the chosen format still decides names (a names-only format still asks to recognise them)",
+      "Try to recognize the characters" in qn and "needs named characters" in note, qn)
+
 # --- image preparation -------------------------------------------------------------------------------------------------
 REAL = sample_images()
 big = Image.open(REAL / "astronaut.png").convert("RGB").resize((2000, 1500))
@@ -204,6 +245,18 @@ try:
 finally:
     proc.kill()
 
+proc, url, rec = fake_server()
+try:
+    d = grabber()
+    s = tc.Session(tc.ServerConfig(mode="external", url=url)).caption_folder(
+        d, tc.Options(prompt=mine, system_prompt="You are terse."), limit=3)
+    r = records(rec)
+    check("folder run: your prompt and system prompt are what the server gets", len(r) == 3
+          and all("Mention the lighting." in x["query"] and x["system"] == "You are terse." for x in r), r[:1])
+    check("…and the log says so", "short (custom prompt + custom system prompt)" in (d / tc.LOG_NAME).read_text(encoding="utf-8"))
+finally:
+    proc.kill()
+
 for mode, check_fn, label in [
     ("reasoning", lambda d, s: (d / "a01.toriigate.txt").read_text(encoding="utf-8").startswith("A caption"), "answer only in reasoning_content is used"),
     ("think", lambda d, s: "pondering" not in (d / "a01.toriigate.txt").read_text(encoding="utf-8"), "<think> blocks stripped"),
@@ -240,6 +293,11 @@ def ui_values(**kw):
     return [v[k] for k in cui.UI_KEYS]
 
 
+check("UI: 📋 Load gives the model's prompt for the chosen format, and its system prompt",
+      cui.load_prompt("long") == (tc.default_template("long"), tc.tg.system_prompt))
+check("UI: ↺ empties both, back to the model's own", cui.clear_prompt() == ("", ""))
+check("UI: the prompt boxes reach the captioning options",
+      (lambda o: o.prompt == "P {tags}" and o.system_prompt == "S")(cui.split_values(ui_values(prompt="P {tags}", system_prompt="S"))[1]))
 session = cui.job.get_session(cui.split_values(ui_values())[2])   # the UI's session, its model already loaded
 srv = session.server = tc.LlamaServer([sys.executable, str(FAKE)], Path("m.gguf"), Path("mm.gguf"),
                                       log_path=Path(tempfile.mkdtemp()) / "srv.log")
@@ -336,6 +394,21 @@ r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), str(d)
                    capture_output=True, text=True, encoding="utf-8")
 check("--dry-run prints the prompts without loading anything", r.returncode == 0 and r.stdout.count("=====") == 3
       and "make sure to use them: [mychar]" in r.stdout and not list(d.glob("*.toriigate.txt")), r.stdout[:200] + r.stderr[-300:])
+r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), "--show-prompt", "--format", "long"],
+                   capture_output=True, text=True, encoding="utf-8")
+check("--show-prompt prints the model's prompt for the format as a template, and the system prompt",
+      r.returncode == 0 and tc.default_template("long") in r.stdout and tc.tg.system_prompt in r.stdout, r.stdout[:200])
+pf, sf = Path(tempfile.mkdtemp()) / "prompt.txt", Path(tempfile.mkdtemp()) / "system.txt"
+pf.write_text("\ufeff" + mine.replace("\n", "\r\n"), encoding="utf-8")   # as Notepad saves it: BOM, CRLF
+sf.write_text("You are terse.", encoding="utf-8")
+r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), str(d), "--dry-run", "--limit", "1",
+                    "--prompt-file", str(pf), "--system-prompt-file", str(sf)], capture_output=True, text=True, encoding="utf-8")
+check("--prompt-file / --system-prompt-file (a Notepad file: BOM and CRLF are fine)", r.returncode == 0
+      and "Mention the lighting." in r.stdout and "You are terse." in r.stdout and "\ufeff" not in r.stdout
+      and "\r" not in r.stdout and "[" in r.stdout.split("# Booru tags for the image")[1], r.stdout[:400] + r.stderr[-300:])
+r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), str(d), "--dry-run", "--prompt-file", "nope.txt"],
+                   capture_output=True, text=True, encoding="utf-8")
+check("…a missing file is reported", r.returncode == 2 and "can't read nope.txt" in r.stdout, r.stdout + r.stderr[-200:])
 proc, url, rec = fake_server()
 try:
     r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), str(d), "--server-url", url, "--limit", "2", "--format", "json"],
