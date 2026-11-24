@@ -11,10 +11,12 @@ usage: python tools/install_triton.py [--check-only] [--spec "<specifier>"]
 """
 import argparse
 import importlib.metadata
+import json
 import os
 import re
 import subprocess
 import sys
+import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -32,6 +34,25 @@ def triton_spec_of_torch(requirements):
             if spec:
                 return spec.replace(" ", "")
     return None
+
+
+def triton_spec_from_pypi(torch_version: str, timeout: float = 20.0):
+    """The Triton requirement of this PyTorch release as published on PyPI. PyTorch's CUDA builds for Windows (the
+    +cu128 wheels) carry no Triton line of their own, but the same release on PyPI names the version it was built
+    for. Returns None when PyPI can't be reached or names none."""
+    public = torch_version.split("+")[0]
+    try:
+        with urllib.request.urlopen(f"https://pypi.org/pypi/torch/{public}/json", timeout=timeout) as r:
+            return triton_spec_of_torch(json.load(r)["info"].get("requires_dist"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def windows_spec(spec: str) -> str:
+    """PyTorch's Triton requirement as one for triton-windows, whose releases are post-releases of the same
+    numbers (3.6.0.post26): '==3.6.0' has to become '==3.6.0.*' to match them. Other forms already do."""
+    m = re.fullmatch(r"==\s*(\d+(?:\.\d+)*)", spec.strip())
+    return f"=={m.group(1)}.*" if m else spec.strip()
 
 
 def this_python() -> str:
@@ -127,14 +148,20 @@ def main():
                 return 1
             torch_version, requirements = torch.__version__, []
             print("(PyTorch loads, but its package record wasn't found, so it can't say which Triton it was built for.)")
-        spec = a.spec or triton_spec_of_torch(requirements)
-        print(f"PyTorch {torch_version}" + (f" was built for Triton {spec}" if spec and not a.spec else ""))
+        spec, source = a.spec, ""
+        if not spec:
+            spec, source = triton_spec_of_torch(requirements), "its own package record"
+            if not spec and os.name == "nt":
+                spec, source = triton_spec_from_pypi(torch_version), f"PyPI's record of PyTorch {torch_version.split('+')[0]}"
+            spec = windows_spec(spec) if spec else spec
+        print(f"PyTorch {torch_version}" + (f" was built for Triton {spec} (from {source})" if spec and not a.spec else ""))
         if os.name != "nt":
             print("Not Windows: PyTorch's own installation brings Triton where it supports it. Nothing to install.")
         elif not spec:
-            print("This PyTorch doesn't name a Triton version, so none is installed (a mismatched one breaks at run time).\n"
+            print("Neither this PyTorch's package record nor PyPI (not reachable?) names a Triton version for it, so none is\n"
+                  "installed: a mismatched one breaks at run time.\n"
                   "Pick the triton-windows version for your PyTorch from https://github.com/triton-lang/triton-windows\n"
-                  'and run:  python_embeded\\python.exe tools\\install_triton.py --spec "<the specifier, e.g. <3.8>"')
+                  'and run:  python_embeded\\python.exe tools\\install_triton.py --spec "==3.6.0.*"   (with your version)')
             return 1
         elif not install(spec):
             print(f"\ntriton-windows{spec} could not be installed (see pip's message above; there may be no release for this\n"

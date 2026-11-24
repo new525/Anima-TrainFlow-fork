@@ -19,6 +19,41 @@ check("the Triton version comes from PyTorch's own requirement line, whatever pl
 check("no Triton line, a bare one, or another package with a similar name: no version is made up",
       spec(["sympy"]) is None and spec(['triton; platform_system == "Linux"']) is None and spec(["triton-windows<3.8"]) is None and spec(None) is None)
 
+check("PyTorch's exact pin becomes one that matches triton-windows' post-releases; other forms are kept",
+      it.windows_spec("==3.6.0") == "==3.6.0.*" and it.windows_spec("~=3.8.0") == "~=3.8.0" and it.windows_spec("<3.8") == "<3.8"
+      and it.windows_spec("==3.6.0.*") == "==3.6.0.*")
+
+
+class FakeResponse(io.StringIO):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+asked = []
+real_urlopen = it.urllib.request.urlopen
+it.urllib.request.urlopen = lambda url, timeout=None: (asked.append(url), FakeResponse(
+    '{"info": {"requires_dist": ["filelock", "triton==3.6.0; platform_system == \\"Linux\\""]}}'))[1]
+try:
+    found = it.triton_spec_from_pypi("2.11.0+cu128")
+finally:
+    it.urllib.request.urlopen = real_urlopen
+check("a Windows CUDA build that names no Triton version: the same release's record on PyPI is asked (2.11.0+cu128 → 2.11.0)",
+      found == "==3.6.0" and asked == ["https://pypi.org/pypi/torch/2.11.0/json"], (found, asked))
+
+
+def offline(url, timeout=None):
+    raise OSError("no network")
+
+
+it.urllib.request.urlopen = offline
+try:
+    check("PyPI unreachable: no version is made up", it.triton_spec_from_pypi("2.11.0+cu128") is None)
+finally:
+    it.urllib.request.urlopen = real_urlopen
+
 real_import = builtins.__import__
 
 

@@ -28,6 +28,10 @@ The ToriiGate captioner explains `hints: none`, and `Install_Triton_for_MOSS.bat
   - **What you saw:** the message even after running `Install_Requirements.bat`.
   - **Fix:** each case has its own message. It names the Python that was used and its packages folder, and shows the real error when PyTorch won't load. A missing package record no longer stops it when PyTorch itself loads.
   - Which of the cases a given machine is in isn't known from here; the new output is what tells.
+- **`Install_Triton_for_MOSS.bat` installed nothing on PyTorch's CUDA builds for Windows.**
+  - **Cause:** it took the Triton version from the installed PyTorch's package record. The `+cu128` Windows wheels carry no Triton line, so it stopped with "This PyTorch doesn't name a Triton version". Seen with PyTorch 2.11.0+cu128.
+  - **Fix:** when the local record names none, the same release's record on PyPI is asked (2.11.0 names Triton 3.6.0). An exact pin is turned into one that matches triton-windows' post-releases: `==3.6.0` becomes `==3.6.0.*`.
+  - Checked from here: PyPI's answer for 2.11.0, and that pip resolves `triton-windows==3.6.0.*` to a Windows wheel for Python 3.10. Whether the kernels then compile on the embedded Python is what the script's last step reports.
 - **The console filled up with `StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated`.**
   - **Cause:** Gradio 6.17.3 looks that status-code name up on every button press, and the Starlette installed beside it has renamed it. The warning says nothing about the request.
   - **Fix:** the trainer app and the captioner filter that one warning. Other warnings still show.
@@ -37,7 +41,7 @@ The ToriiGate captioner explains `hints: none`, and `Install_Triton_for_MOSS.bat
 - `test_toriigate_captioner.py` (17 new checks): compressed XMP in a PNG; the explanation for an image with no metadata, with an original, and with metadata in other fields; the hint report's counts and groups; the advice for a folder with no metadata, and its absence for a tagged one; the warning and the closing count in a folder run; `--check-hints` and `--dry-run`.
 - `e2e/test_captioner_ui.py`: the 🔎 Check hints button through the UI's API, with no server set up.
 - `e2e/test_e2e.py` and `e2e/test_captioner_ui.py`: the server's console output doesn't contain the status-code warning. Before the fix it appeared 42 times in one captioner test run.
-- **New, `test_install_triton.py`** (8 checks): the Triton version taken from PyTorch's requirement line, and the message for each way PyTorch can be unusable.
+- **New, `test_install_triton.py`** (11 checks): the Triton version taken from PyTorch's requirement line, and the message for each way PyTorch can be unusable.
 
 ### Verified
 - `tests/run_all.py` on Linux with Python 3.10: all scripts pass (three skip there by design).
