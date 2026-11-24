@@ -12,7 +12,11 @@ import torch.nn as nn
 from PIL import Image
 from accelerate import Accelerator, PartialState
 
-from library import flux_utils, hunyuan_image_models, hunyuan_image_vae, strategy_base, train_util
+from library import flux_utils, hunyuan_image_models, hunyuan_image_vae, strategy_base, sampling
+from library.custom_offloading_utils import BlockSwapConfig
+import library.args as args_util
+import library.model_io as model_io
+from library.dataset import DatasetGroup, MinimalDataset
 from library.device_utils import clean_memory_on_device, init_ipex
 
 init_ipex()
@@ -27,7 +31,6 @@ from library import (
     sd3_train_utils,
     strategy_base,
     strategy_hunyuan_image,
-    train_util,
 )
 from library.utils import setup_logging
 
@@ -52,23 +55,12 @@ def sample_images(
     sample_prompts_te_outputs,
     prompt_replacement=None,
 ):
-    if steps == 0:
-        if not args.sample_at_first:
-            return
-    else:
-        if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
-            return
-        if args.sample_every_n_epochs is not None:
-            # sample_every_n_steps は無視する
-            if epoch is None or epoch % args.sample_every_n_epochs != 0:
-                return
-        else:
-            if steps % args.sample_every_n_steps != 0 or epoch is not None:  # steps is not divisible or end of epoch
-                return
+    if not sampling.should_sample_images(args, epoch, steps):
+        return
 
     logger.info("")
     logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
-    if not os.path.isfile(args.sample_prompts) and sample_prompts_te_outputs is None:
+    if not sampling.has_sample_prompts(args) and sample_prompts_te_outputs is None:
         logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
         return
 
@@ -82,7 +74,7 @@ def sample_images(
         text_encoders = [(accelerator.unwrap_model(te) if te is not None else None) for te in text_encoders]
     # print([(te.parameters().__next__().device if te is not None else None) for te in text_encoders])
 
-    prompts = train_util.load_prompts(args.sample_prompts)
+    prompts = sampling.get_sample_prompts(args)
 
     save_dir = args.output_dir + "/sample"
     os.makedirs(save_dir, exist_ok=True)
@@ -291,7 +283,9 @@ def sample_image_inference(
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-    image.save(os.path.join(save_dir, img_filename))
+    img_path = os.path.join(save_dir, img_filename)
+    image.save(img_path)
+    sampling.notify_sample_saved(img_path)
 
     # send images to wandb if enabled
     if "wandb" in [tracker.name for tracker in accelerator.trackers]:
@@ -316,8 +310,8 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
     def assert_extra_args(
         self,
         args,
-        train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
-        val_dataset_group: Optional[train_util.DatasetGroup],
+        train_dataset_group: Union[DatasetGroup, MinimalDataset],
+        val_dataset_group: Optional[DatasetGroup],
     ):
         super().assert_extra_args(args, train_dataset_group, val_dataset_group)
         # sdxl_train_util.verify_sdxl_training_args(args)
@@ -405,8 +399,14 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
 
         if self.is_swapping_blocks:
             # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
-            logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
-            model.enable_block_swap(args.blocks_to_swap, accelerator.device, supports_backward=True)
+            # The base weights are frozen in LoRA training. Freeze them here, before enabling block swap, for the H2D-only offloader.
+            model.requires_grad_(False)
+            swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+            logger.info(
+                f"enable block swap: blocks_to_swap={args.blocks_to_swap}, H2D-only: {swap_config.h2d_only}, "
+                f"use pinned memory: {swap_config.use_pinned_memory}"
+            )
+            model.enable_block_swap(args.blocks_to_swap, swap_config)
 
         return model, text_encoders
 
@@ -444,7 +444,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
             return None
 
     def cache_text_encoder_outputs_if_needed(
-        self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
+        self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: DatasetGroup, weight_dtype
     ):
         vlm_device = "cpu" if args.text_encoder_cpu else accelerator.device
         if args.cache_text_encoder_outputs:
@@ -473,7 +473,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
                     strategy_base.TextEncodingStrategy.get_strategy()
                 )
 
-                prompts = train_util.load_prompts(args.sample_prompts)
+                prompts = sampling.load_prompts(args.sample_prompts)
                 sample_prompts_te_outputs = {}  # key: prompt, value: text encoder outputs
                 with accelerator.autocast(), torch.no_grad():
                     for prompt_dict in prompts:
@@ -580,7 +580,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
         return loss
 
     def get_sai_model_spec(self, args):
-        return train_util.get_sai_model_spec_dataclass(None, args, False, True, False, hunyuan_image="2.1").to_metadata_dict()
+        return model_io.get_sai_model_spec_dataclass(None, args, False, True, False, hunyuan_image="2.1").to_metadata_dict()
 
     def update_metadata(self, metadata, args):
         metadata["ss_logit_mean"] = args.logit_mean
@@ -633,7 +633,7 @@ class HunyuanImageNetworkTrainer(train_network.NetworkTrainer):
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
-    train_util.add_dit_training_arguments(parser)
+    args_util.add_dit_training_arguments(parser)
 
     parser.add_argument(
         "--text_encoder",
@@ -648,10 +648,12 @@ def setup_parser() -> argparse.ArgumentParser:
 
     parser.add_argument(
         "--timestep_sampling",
-        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift"],
+        choices=["sigma", "uniform", "sigmoid", "shift", "flux_shift", "truncated_logit_normal"],
         default="sigma",
-        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid and FLUX.1 shifting."
-        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、FLUX.1のシフト。",
+        help="Method to sample timesteps: sigma-based, uniform random, sigmoid of random normal, shift of sigmoid, FLUX.1 shifting"
+        " and truncated logit-normal on the training grid (--logit_mean / --logit_std / --timestep_cutoff / --timestep_uniform_ratio)."
+        " / タイムステップをサンプリングする方法：sigma、random uniform、random normalのsigmoid、sigmoidのシフト、FLUX.1のシフト、"
+        "学習グリッド上の切り詰めた logit-normal（--logit_mean / --logit_std / --timestep_cutoff / --timestep_uniform_ratio）。",
     )
     parser.add_argument(
         "--sigmoid_scale",
@@ -707,8 +709,8 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    train_util.verify_command_line_training_args(args)
-    args = train_util.read_config_from_file(args, parser)
+    args_util.verify_command_line_training_args(args)
+    args = args_util.read_config_from_file(args, parser)
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"  # backward compatibility

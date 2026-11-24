@@ -1,10 +1,12 @@
-import glob
+﻿import glob
 import os
 from typing import Any, List, Optional, Tuple, Union
 
 import torch
 from transformers import AutoTokenizer, AutoModel, Gemma2Model, GemmaTokenizerFast
-from library import train_util
+from library import accelerator_setup
+import library.device_utils as device_utils
+from library.dataset import ImageInfo
 from library.strategy_base import (
     LatentsCachingStrategy,
     TokenizeStrategy,
@@ -20,7 +22,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-GEMMA_ID = "google/gemma-2-2b"
+# google/gemma-2-2b is gated on the Hub. The tokenizer files in the official Lumina-Image-2.0 repository are identical
+# to those of google/gemma-2-2b (same sha256 for tokenizer.json / tokenizer.model / tokenizer_config.json /
+# special_tokens_map.json), so the tokenizer is loaded from there.
+GEMMA_TOKENIZER_ID = "Alpha-VLLM/Lumina-Image-2.0"
+GEMMA_TOKENIZER_SUBFOLDER = "tokenizer"
 
 
 class LuminaTokenizeStrategy(TokenizeStrategy):
@@ -28,7 +34,7 @@ class LuminaTokenizeStrategy(TokenizeStrategy):
         self, system_prompt:str, max_length: Optional[int], tokenizer_cache_dir: Optional[str] = None
     ) -> None:
         self.tokenizer: GemmaTokenizerFast = AutoTokenizer.from_pretrained(
-            GEMMA_ID, cache_dir=tokenizer_cache_dir
+            GEMMA_TOKENIZER_ID, subfolder=GEMMA_TOKENIZER_SUBFOLDER, cache_dir=tokenizer_cache_dir
         )
         self.tokenizer.padding_side = "right"
 
@@ -215,14 +221,16 @@ class LuminaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy)
         tokenize_strategy: TokenizeStrategy,
         models: List[Any],
         text_encoding_strategy: TextEncodingStrategy,
-        batch: List[train_util.ImageInfo],
+        batch: List[ImageInfo],
+        captions: List[str],
     ) -> None:
         """
         Args:
             tokenize_strategy (LuminaTokenizeStrategy): Tokenize strategy
             models (List[Any]): Text encoders
             text_encoding_strategy (LuminaTextEncodingStrategy):
-            infos (List): List of ImageInfo
+            batch (List): List of ImageInfo
+            captions (List[str]): processed captions, same order as batch
 
         Returns:
             None
@@ -230,7 +238,6 @@ class LuminaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy)
         assert isinstance(text_encoding_strategy, LuminaTextEncodingStrategy)
         assert isinstance(tokenize_strategy, LuminaTokenizeStrategy)
 
-        captions = [info.caption for info in batch]
 
         if self.is_weighted:
             tokens, attention_masks, weights_list = (
@@ -371,5 +378,5 @@ class LuminaLatentsCachingStrategy(LatentsCachingStrategy):
             multi_resolution=True,
         )
 
-        if not train_util.HIGH_VRAM:
-            train_util.clean_memory_on_device(model.device)
+        if not accelerator_setup.HIGH_VRAM:
+            device_utils.clean_memory_on_device(model.device)

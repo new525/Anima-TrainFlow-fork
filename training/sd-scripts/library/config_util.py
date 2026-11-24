@@ -24,16 +24,18 @@ from voluptuous import (
 )
 from transformers import CLIPTokenizer
 
-from . import train_util
-from .train_util import (
+from . import accelerator_setup
+from . import args as args_util
+from .subset import (
+    DEFAULT_MULTILINE_CAPTION_SEPARATOR,
     DreamBoothSubset,
     FineTuningSubset,
     ControlNetSubset,
-    DreamBoothDataset,
-    FineTuningDataset,
-    ControlNetDataset,
-    DatasetGroup,
 )
+from .dataset import DatasetGroup
+from .dreambooth_dataset import DreamBoothDataset
+from .finetuning_dataset import FineTuningDataset
+from .controlnet_dataset import ControlNetDataset
 from .utils import setup_logging
 
 setup_logging()
@@ -56,11 +58,13 @@ class BaseSubsetParams:
     image_dir: Optional[str] = None
     num_repeats: int = 1
     shuffle_caption: bool = False
-    caption_separator: str = (",",)
+    caption_separator: str = ","
     keep_tokens: int = 0
-    keep_tokens_separator: str = (None,)
+    keep_tokens_separator: str = ""
     secondary_separator: Optional[str] = None
     enable_wildcard: bool = False
+    enable_multiline_caption: bool = False
+    multiline_caption_separator: str = DEFAULT_MULTILINE_CAPTION_SEPARATOR
     color_aug: bool = False
     flip_aug: bool = False
     face_crop_aug_range: Optional[Tuple[float, float]] = None
@@ -194,6 +198,8 @@ class ConfigSanitizer:
         "secondary_separator": str,
         "caption_separator": str,
         "enable_wildcard": bool,
+        "enable_multiline_caption": bool,
+        "multiline_caption_separator": str,
         "token_warmup_min": int,
         "token_warmup_step": Any(float, int),
         "caption_prefix": str,
@@ -561,6 +567,9 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
                     caption_tag_dropout_rate: {subset.caption_tag_dropout_rate}
                     caption_prefix: {subset.caption_prefix}
                     caption_suffix: {subset.caption_suffix}
+                    enable_wildcard: {subset.enable_wildcard}
+                    enable_multiline_caption: {subset.enable_multiline_caption}
+                    multiline_caption_separator: {subset.multiline_caption_separator}
                     color_aug: {subset.color_aug}
                     flip_aug: {subset.flip_aug}
                     face_crop_aug_range: {subset.face_crop_aug_range}
@@ -717,12 +726,12 @@ if __name__ == "__main__":
     config_args, remain = parser.parse_known_args()
 
     parser = argparse.ArgumentParser()
-    train_util.add_dataset_arguments(
+    args_util.add_dataset_arguments(
         parser, config_args.support_dreambooth, config_args.support_finetuning, config_args.support_dropout
     )
-    train_util.add_training_arguments(parser, config_args.support_dreambooth)
+    args_util.add_training_arguments(parser, config_args.support_dreambooth)
     argparse_namespace = parser.parse_args(remain)
-    train_util.prepare_dataset_args(argparse_namespace, config_args.support_finetuning)
+    accelerator_setup.prepare_dataset_args(argparse_namespace, config_args.support_finetuning)
 
     logger.info("[argparse_namespace]")
     logger.info(f"{vars(argparse_namespace)}")

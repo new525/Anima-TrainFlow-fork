@@ -1,5 +1,6 @@
 """Optional UI check in a headless browser (see tests/browser): starts the app with a fake training run in progress,
-then runs ui_check.mjs against it. Skipped when Node.js or the browser packages aren't installed."""
+then runs ui_check.mjs against it (tabs mid-run, loss chart, settings after a reload, switching between Anima and
+MOSS-Image). Skipped when Node.js or the browser packages aren't installed."""
 import os
 import shutil
 import socket
@@ -47,7 +48,9 @@ try:
     import client
     m = tree / "models"
     client.call("start_training", ["kw", str(ds), str(m / "dit.safetensors"), str(m / "qwen.safetensors"), str(m / "vae.safetensors"),
-                                   32, "1.0", "Prodigy", 2000, 100, 5, "a\nb", "neg", 1024, 1024, 30, 4.0, 42, 42, 1, 1, True, 0, 0])
+                                   32, "1.0", "Prodigy", 2000, 100, 5, "a\nb", "neg", 1024, 1024, 30, 4.0, 42, 42, 1, 1, True, 0, 0,
+                                   # model and the MOSS-Image inputs (unused by this Anima run), in UI order
+                                   "Anima", "", "", "", "", "Natural language (.toriigate.txt)", True, True, 20, True, 0, "", 50, 3.0])
     time.sleep(8)   # some steps, previews and loss points
     r = subprocess.run(["node", str(BROWSER / "ui_check.mjs"), f"http://127.0.0.1:{port}/", str(work / "ui.png")],
                        capture_output=True, text=True, timeout=300)

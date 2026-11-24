@@ -1,11 +1,12 @@
 """The sd-scripts patch, without a GPU: the resume arithmetic and the state-folder cleanup are executed from the real
-source of train_network.py / train_util.py (extracted verbatim), driven with the dataset sizes TrainFlow generates."""
+source of train_network.py / library/checkpoint_io.py (extracted verbatim), driven with the dataset sizes TrainFlow
+generates. train_network.py is shared by the Anima and the MOSS-Image trainer, so this covers both."""
 import argparse, ast, math, os, re, shutil, sys, tempfile, textwrap, types
 from pathlib import Path
 from _harness import check, finish, REPO
 
 TN = (REPO / "training" / "sd-scripts" / "train_network.py").read_text(encoding="utf-8")
-TU = (REPO / "training" / "sd-scripts" / "library" / "train_util.py").read_text(encoding="utf-8")
+CK = (REPO / "training" / "sd-scripts" / "library" / "checkpoint_io.py").read_text(encoding="utf-8")
 
 def block(src, start, end_marker):
     i = src.index(start); j = src.index(end_marker, i) + len(end_marker)
@@ -19,6 +20,9 @@ def function_source(src, name):
 
 # --- resume / Train More with gradient accumulation -----------------------------------------------------------------
 CALC = block(TN, "        # calculate steps to skip when resuming", "        global_step = 0\n")
+check("both trainers run this train_network.py", all(
+    "train_network.NetworkTrainer" in (REPO / "training" / "sd-scripts" / f).read_text(encoding="utf-8-sig")
+    for f in ("anima_train_network.py", "moss_image_train_network.py")))
 SKIP = block(TN, "        if initial_step > 0:  # only if skip_until_initial_step", "            global_step = resumed_global_step\n")
 quiet = types.SimpleNamespace(info=lambda *a, **k: None, warning=lambda *a, **k: None)
 
@@ -63,8 +67,9 @@ if fixed:
 ns = {"argparse": argparse, "os": os, "shutil": shutil, "re": re, "logger": quiet, "huggingface_util": None,
       "STEP_STATE_NAME": "{}-step{:08d}-state", "DEFAULT_STEP_NAME": "at",
       "default_if_none": lambda v, d: d if v is None else v}
-exec(function_source(TU, "save_and_remove_state_stepwise"), ns)
-ns["train_util"] = types.SimpleNamespace(default_if_none=ns["default_if_none"], DEFAULT_STEP_NAME="at")
+exec(function_source(CK, "save_state_stepwise"), ns)
+exec(function_source(CK, "save_and_remove_state_stepwise"), ns)
+ns["checkpoint_io"] = types.SimpleNamespace(default_if_none=ns["default_if_none"], DEFAULT_STEP_NAME="at")
 exec(function_source(TN, "remove_superseded_halt_states"), ns)
 save_stepwise, cleanup = ns["save_and_remove_state_stepwise"], ns["remove_superseded_halt_states"]
 

@@ -1,7 +1,7 @@
 # Everything the tests need, in a plain Python 3.10+ environment (no GPU, no torch: the tests stub it).
 # python -m venv .venv && .venv/Scripts/pip install -r tests/requirements.txt   (Windows: .venv\Scripts\pip)
 gradio==6.17.3
-huggingface-hub==0.34.3
+huggingface-hub==1.32.0
 toml==0.10.2
 numpy
 opencv-python-headless==4.10.0.84

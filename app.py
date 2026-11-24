@@ -33,6 +33,8 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import cv2
 import shutil
+import struct
+import importlib.util
 from typing import Generator, List, Tuple
 
 CSS = """
@@ -147,6 +149,20 @@ SETTINGS_FILE = TRAIN_BASE / "settings.json"
 
 TRAIN_DIR = TRAIN_BASE / "sd-scripts" 
 TRAIN_SCRIPT = TRAIN_DIR / "anima_train_network.py"
+
+# MOSS-Image (OpenMOSS): a 5B DiT of 42 blocks, the Qwen3.5-9B text encoder (32 layers) and the FLUX.2 VAE.
+# Trained by sd-scripts' moss_image_train_network.py; nothing is shared with Anima (models, caches, LoRA format).
+MODEL_ANIMA, MODEL_MOSS = "Anima", "MOSS-Image"
+MODEL_FAMILIES = [MODEL_ANIMA, MODEL_MOSS]
+MOSS_TRAIN_SCRIPT = TRAIN_DIR / "moss_image_train_network.py"
+MOSS_SWAPPABLE_BLOCKS = 40  # 42 DiT blocks; sd-scripts allows swapping at most num_blocks - 2
+MOSS_TE_LAYERS = 32
+# What a MOSS-Image run reads as captions. The model was trained on long natural-language captions.
+CAPTIONS_NL = "Natural language (.toriigate.txt)"
+CAPTIONS_TAGS = "Tags (.txt)"
+CAPTIONS_BOTH = "Both (one picked at random each step)"
+MOSS_CAPTION_SOURCES = [CAPTIONS_NL, CAPTIONS_TAGS, CAPTIONS_BOTH]
+MOSS_CAPTION_SEPARATOR = "---===---"  # sd-scripts' multiline_caption_separator: lines that start with it split candidates
 
 for d in [TRAIN_BASE, OUTPUT_BASE]:
     d.mkdir(parents=True, exist_ok=True)
@@ -769,10 +785,14 @@ def find_resume_point(project_dir: Path) -> dict | None:
     return None
 
 
-def build_train_command(training_toml: Path, dataset_toml: Path, extra_args: Tuple[str, ...] = ()) -> List[str]:
+def train_script_for(model_family: str) -> Path:
+    return MOSS_TRAIN_SCRIPT if model_family == MODEL_MOSS else TRAIN_SCRIPT
+
+
+def build_train_command(training_toml: Path, dataset_toml: Path, extra_args: Tuple[str, ...] = (), script: Path | None = None) -> List[str]:
     return [
         str(PORTABLE_PYTHON.resolve()), "-m", "accelerate.commands.launch", "--num_processes=1", "--mixed_precision=bf16", "--dynamo_backend=no",
-        TRAIN_SCRIPT.resolve().as_posix(),
+        Path(script or TRAIN_SCRIPT).resolve().as_posix(),
         "--config_file", Path(training_toml).resolve().as_posix(),
         "--dataset_config", Path(dataset_toml).resolve().as_posix(),
         *extra_args,
@@ -833,6 +853,22 @@ DEFAULT_SETTINGS = {
     "use_embedded_tags": True,
     "set_duplicates_aside": True,
     "network_alpha": 0,  # 0 = same as rank. Keep new keys at the end: settings are zipped with the UI components in order
+    # --- MOSS-Image. The defaults suit an 11-12 GB card: pre-quantized ConvRot INT8 files plus block swap. ---
+    "model_family": MODEL_ANIMA,
+    "moss_dit_path": str(ROOT / "models" / "moss_image" / "dit" / "moss_image_base_int8_convrot.safetensors"),
+    "moss_te_path": str(ROOT / "models" / "moss_image" / "text_encoder" / "qwen3.5_9b_int8_convrot.safetensors"),
+    "moss_vae_path": str(ROOT / "models" / "moss_image" / "vae" / "flux2-vae.safetensors"),
+    "moss_tokenizer_dir": "",  # empty: sd-scripts downloads the tokenizer (about 20 MB) from Hugging Face on first use
+    "moss_caption_source": CAPTIONS_NL,
+    "moss_convrot_int8": True,
+    "moss_convrot_int8_te": True,
+    "moss_blocks_to_swap": 20,
+    "moss_h2d_only": True,
+    "moss_te_blocks_to_swap": 0,
+    # previews: the official pipeline's defaults (50 steps, CFG 3, empty negative prompt)
+    "moss_neg_prompt": "",
+    "moss_sample_steps_gen": 50,
+    "moss_sample_cfg": 3.0,
 }
 _settings_lock = threading.Lock()
 
@@ -903,6 +939,19 @@ HIDDEN_SETTINGS = {
     "sigmoid_scale": 1.3,
 }
 
+MOSS_HIDDEN_SETTINGS = {
+    "network_module": "networks.lora_generic",
+    # The timestep distribution of MOSS-Image's own pre-training (sd-scripts docs/moss_image_train_network.md, 7.2).
+    "timestep_sampling": "truncated_logit_normal",
+    "logit_mean": -1.09,
+    "logit_std": 0.95,
+    "discrete_flow_shift": 1.0,
+    "attn_mode": "torch",
+    # The same guide's note for Windows: few workers, kept alive between epochs.
+    "max_data_loader_n_workers": 2,
+    "persistent_data_loader_workers": True,
+}
+
 
 def analyze_dataset_resolution(dataset_path: str) -> Tuple[int, int]:
     path = Path(dataset_path)
@@ -931,21 +980,29 @@ def analyze_dataset_resolution(dataset_path: str) -> Tuple[int, int]:
     return base_res, max_bucket
 
 
-def create_sample_prompts(project_name, trigger_word, pos_prompt, neg_prompt, width, height, steps_gen, cfg, seed, out_dir):
+def create_sample_prompts(project_name, trigger_word, pos_prompt, neg_prompt, width, height, steps_gen, cfg, seed, out_dir,
+                          model_family=MODEL_ANIMA):
     prompt_path = out_dir / f"{project_name}_prompts.txt"
     trigger = trigger_word.strip()
     # One preview prompt per line (sd-scripts reads the file line by line; '#' lines are comments).
     user_prompts = [line.strip() for line in (pos_prompt or "").splitlines() if line.strip()] or [""]
 
-    actual_neg = neg_prompt.strip().replace("\n", " ")
+    actual_neg = (neg_prompt or "").strip().replace("\n", " ")
     lines = []
     for user_prompt in user_prompts:
-        # Tag match, not a text prefix: trigger "cat" must still be added to "catgirl, smile".
-        if trigger and trigger.lower() not in (t.lower() for t in split_tags(user_prompt)):
+        if model_family == MODEL_MOSS:
+            # Natural-language prompts: the trigger counts as present when it appears as a word anywhere.
+            has_trigger = caption_has_trigger(user_prompt, trigger, natural_language=True)
+        else:
+            # Tag match, not a text prefix: trigger "cat" must still be added to "catgirl, smile".
+            has_trigger = trigger.lower() in (t.lower() for t in split_tags(user_prompt))
+        if trigger and not has_trigger:
             actual_pos = f"{trigger}, {user_prompt}" if user_prompt else trigger
         else:
             actual_pos = user_prompt if user_prompt else trigger
-        lines.append(f"{actual_pos} --n {actual_neg} --w {int(width)} --h {int(height)} --l {float(cfg)} --s {int(steps_gen)} --d {int(seed)}")
+        # MOSS-Image's default negative prompt is the empty prompt: leave --n out rather than write an empty one.
+        neg_part = "" if (model_family == MODEL_MOSS and not actual_neg) else f" --n {actual_neg}"
+        lines.append(f"{actual_pos}{neg_part} --w {int(width)} --h {int(height)} --l {float(cfg)} --s {int(steps_gen)} --d {int(seed)}")
     with open(prompt_path, "w", encoding="utf-8") as f: f.write("\n".join(lines) + "\n")
     return str(prompt_path)
 
@@ -988,6 +1045,214 @@ def create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_
         toml.dump(dataset_config, f)
     return str(config_path)
 
+def caption_has_trigger(caption: str, trigger: str, natural_language: bool) -> bool:
+    """Tag captions: the trigger is one of the comma-separated tags. Natural language: it appears as a whole word."""
+    trig = (trigger or "").strip().lower()
+    if not trig:
+        return True
+    if natural_language:
+        return re.search(r"(?<!\w)" + re.escape(trig) + r"(?!\w)", caption.lower()) is not None
+    return trig in (t.lower() for t in split_tags(caption))
+
+
+def read_moss_captions(img: Path, source: str) -> List[Tuple[str, bool]]:
+    """The caption candidates of one image for a MOSS-Image run, as (text, is_natural_language), natural language first.
+    Tag captions keep sd-scripts' rule for .txt files: only the first line is the caption. A ToriiGate caption is used
+    whole, line breaks included. An empty or unreadable file counts as missing."""
+    found = []
+    if source in (CAPTIONS_NL, CAPTIONS_BOTH):
+        nl = img.parent / (img.stem + NL_CAPTION_SUFFIX)
+        try:
+            text = nl.read_text(encoding="utf-8", errors="ignore").strip() if nl.is_file() else ""
+        except OSError:
+            text = ""
+        if text:
+            found.append((text, True))
+    if source in (CAPTIONS_TAGS, CAPTIONS_BOTH):
+        txt = img.with_suffix(".txt")
+        try:
+            text = txt.read_text(encoding="utf-8", errors="ignore").split("\n")[0].strip() if txt.is_file() else ""
+        except OSError:
+            text = ""
+        if text:
+            found.append((text, False))
+    return found
+
+
+def build_moss_metadata(dataset_path, trigger_word: str, source: str) -> Tuple[dict, dict]:
+    """sd-scripts metadata for a MOSS-Image run: {image path: {"caption": text or [candidates], "image_size": [w, h]}}.
+
+    sd-scripts' folder datasets read one caption file per image. A metadata file lets a run take its captions from
+    <name>.toriigate.txt, from <name>.txt, or from both: with both, each image carries two candidates, sd-scripts caches
+    the text-encoder output of each and picks one at random at every step. The trigger word is added here, to each
+    candidate that doesn't contain it yet, so no caption gets it twice.
+
+    Returns (metadata, stats). stats["missing"] lists images with no usable caption for this source."""
+    if source not in MOSS_CAPTION_SOURCES:
+        raise ValueError(f"unknown caption source: {source!r}")
+    path = Path(dataset_path)
+    trigger = (trigger_word or "").strip()
+    images = sorted(f for f in path.glob("*") if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTS)
+    metadata: dict = {}
+    stats = {"images": len(images), "missing": [], "only_nl": [], "only_tags": [], "both": 0, "prefixed": 0, "candidates": 0}
+    for img in images:
+        found = read_moss_captions(img, source)
+        if not found:
+            stats["missing"].append(img.name)
+            continue
+        if source == CAPTIONS_BOTH:
+            if len(found) == 2:
+                stats["both"] += 1
+            else:
+                stats["only_nl" if found[0][1] else "only_tags"].append(img.name)
+        captions = []
+        for text, natural_language in found:
+            if any(line.startswith(MOSS_CAPTION_SEPARATOR) for line in text.split("\n")):
+                raise ValueError(f"the caption of {img.name} has a line starting with {MOSS_CAPTION_SEPARATOR}, which sd-scripts "
+                                 f"reads as the divider between caption candidates. Remove that line.")
+            if trigger and not caption_has_trigger(text, trigger, natural_language):
+                text = f"{trigger}, {text}"
+                stats["prefixed"] += 1
+            captions.append(text)
+        stats["candidates"] += len(captions)
+        with Image.open(img) as im:
+            width, height = im.size  # as stored, like sd-scripts reads it (no EXIF rotation)
+        metadata[img.resolve().as_posix()] = {"caption": captions if len(captions) > 1 else captions[0], "image_size": [width, height]}
+    return metadata, stats
+
+
+def write_moss_metadata(metadata: dict, metadata_path: Path) -> None:
+    tmp = Path(metadata_path).with_name(Path(metadata_path).name + ".tmp")
+    tmp.write_text(json.dumps(metadata, indent=1, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, metadata_path)
+
+
+def create_moss_dataset_toml(project_name, dataset_path, metadata_path, n_images, base_res, max_bucket, out_dir, max_steps, batch_size, grad_acc):
+    config_path = out_dir / f"{project_name}_dataset.toml"
+    effective_batch = int(batch_size) * int(grad_acc)
+    final_repeats = max(1, math.ceil((int(max_steps) * effective_batch) / max(1, int(n_images))))
+    dataset_config = {
+        "general": {
+            "enable_bucket": True,
+            "min_bucket_reso": 256,
+            "max_bucket_reso": max_bucket,
+            "bucket_reso_steps": 64,  # MOSS-Image needs multiples of 16
+            "bucket_no_upscale": True
+        },
+        "datasets": [{
+            "resolution": base_res,
+            "subsets": [{
+                "image_dir": Path(dataset_path).resolve().as_posix(),  # also how the app finds a run's dataset folder
+                "metadata_file": Path(metadata_path).resolve().as_posix(),
+                "num_repeats": final_repeats,
+                "caption_dropout_rate": 0.05,
+                # the whole caption is used, line breaks included; a list of captions is a set of candidates
+                "enable_multiline_caption": True,
+            }]
+        }]
+    }
+    with open(config_path, "w", encoding="utf-8") as f:
+        toml.dump(dataset_config, f)
+    return str(config_path)
+
+
+def safetensors_keys(file_path) -> List[str]:
+    """Tensor names of a .safetensors file, from its header alone (8 bytes of length, then JSON)."""
+    with open(file_path, "rb") as f:
+        (n,) = struct.unpack("<Q", f.read(8))
+        if not 0 < n < 512 * 1024 * 1024:
+            raise ValueError("not a safetensors file")
+        return [k for k in json.loads(f.read(n).decode("utf-8")) if k != "__metadata__"]
+
+
+def is_convrot_int8_file(file_path) -> bool:
+    """A ComfyUI pre-quantized ConvRot INT8 checkpoint (its quantized layers carry a .comfy_quant entry).
+    sd-scripts detects these itself, so --convrot_int8 isn't passed for them."""
+    try:
+        return any(k.endswith(".comfy_quant") for k in safetensors_keys(file_path))
+    except Exception:
+        return False
+
+
+SHARD_RE = re.compile(r"^(.*?)(\d+)-of-(\d+)\.safetensors$")
+
+
+def missing_shards(file_path) -> List[str]:
+    """For a split checkpoint (…-00001-of-00003.safetensors) sd-scripts is given the first file and loads the rest
+    from the same folder. Returns the names that aren't there; a file that isn't the first part is reported too."""
+    name = os.path.basename(str(file_path))
+    m = SHARD_RE.match(name)
+    if not m:
+        return []
+    prefix, count, width = name[:m.start(2)], int(m.group(3)), len(m.group(2))
+    if int(m.group(2)) != 1:
+        return [f"{name} is part {int(m.group(2))} of {count}: give the first part, {prefix}{1:0{width}d}-of-{m.group(3)}.safetensors"]
+    folder = os.path.dirname(str(file_path))
+    names = [f"{prefix}{i + 1:0{width}d}-of-{m.group(3)}.safetensors" for i in range(count)]
+    return [n for n in names if not os.path.isfile(os.path.join(folder, n))]
+
+
+def moss_model_errors(dit_p, te_p, vae_p, tokenizer_dir="") -> List[str]:
+    errors = []
+    for label, value in (("MOSS-Image DiT", dit_p), ("Qwen3.5-9B text encoder", te_p), ("FLUX.2 VAE", vae_p)):
+        if not value or not os.path.isfile(value):
+            errors.append(f"❌ {label} file not found: {value}")
+            continue
+        gone = missing_shards(value)
+        if gone:
+            errors.append(f"❌ {label}: " + (gone[0] if " is part " in gone[0] else f"split checkpoint is incomplete, missing {', '.join(gone)}"))
+    if te_p and "w4a8" in os.path.basename(str(te_p)).lower():
+        errors.append("❌ The W4A8 GPTQ text encoder (qwen3.5_9b_w4a8_gptq.safetensors) isn't supported by sd-scripts: "
+                      "use qwen3.5_9b_int8_convrot.safetensors or the official model-00001-of-00004.safetensors.")
+    if tokenizer_dir and not os.path.isdir(tokenizer_dir):
+        errors.append(f"❌ Tokenizer folder not found: {tokenizer_dir} (leave it empty to download the tokenizer automatically)")
+    return errors
+
+
+def run_model_family(run_dir: Path | None, cfg: dict | None = None) -> str:
+    """Which model a run trains: from its run.json, else from its training config (runs made before MOSS-Image
+    support have neither marker and are Anima)."""
+    try:
+        family = json.loads((Path(run_dir) / "run.json").read_text(encoding="utf-8")).get("model_family")
+        if family in MODEL_FAMILIES:
+            return family
+    except Exception:
+        pass
+    if cfg and (cfg.get("network_module") == MOSS_HIDDEN_SETTINGS["network_module"] or "text_encoder" in cfg):
+        return MODEL_MOSS
+    return MODEL_ANIMA
+
+
+def model_file_keys(model_family: str) -> Tuple[str, ...]:
+    """The training-config keys that hold a run's model files."""
+    return ("pretrained_model_name_or_path", "text_encoder", "vae") if model_family == MODEL_MOSS else ("pretrained_model_name_or_path", "qwen3", "vae")
+
+
+def refresh_moss_metadata(run_dir: Path, dataset_toml: Path) -> str | None:
+    """Before a MOSS-Image run is continued: rebuild its metadata file from the captions as they are now, the way an
+    Anima run reads its .txt files afresh at every launch. Returns an error message, or None."""
+    try:
+        subset = toml.load(str(dataset_toml))["datasets"][0]["subsets"][0]
+        metadata_path, dataset_dir = Path(subset["metadata_file"]), subset["image_dir"]
+        info = json.loads((Path(run_dir) / "run.json").read_text(encoding="utf-8"))
+        source = info.get("caption_source") or CAPTIONS_NL
+        if not os.path.isdir(dataset_dir):
+            return f"❌ Dataset folder not found: {dataset_dir}"
+        metadata, stats = build_moss_metadata(dataset_dir, info.get("keyword", ""), source)
+    except Exception as e:
+        return f"❌ Could not rebuild this run's captions: {e}"
+    if stats["missing"]:
+        return (f"❌ {len(stats['missing'])} image(s) have no caption for this run's caption source ({source}): "
+                f"{_examples(stats['missing'])}")
+    if not metadata:
+        return f"❌ No images found in {dataset_dir}"
+    try:
+        write_moss_metadata(metadata, metadata_path)
+    except OSError as e:
+        return f"❌ Could not write {metadata_path}: {e}"
+    return None
+
+
 def resolve_network_alpha(rank, alpha) -> float:
     """0 or empty = same as rank (LoRA output scale alpha/rank = 1.0, the app's behaviour before this setting)."""
     try:
@@ -997,7 +1262,10 @@ def resolve_network_alpha(rank, alpha) -> float:
     return float(int(rank)) if a <= 0 else a
 
 
-def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_request_file, save_resume_state, blocks_to_swap=0, network_alpha=0):
+def create_training_toml(project_name, config_save_dir, actual_output_dir, rank, lr, optimizer, max_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_request_file, save_resume_state, blocks_to_swap=0, network_alpha=0,
+                         model_family=MODEL_ANIMA, moss=None):
+    """`models`: Anima {"dit_path", "qwen_path", "vae_path"}; MOSS-Image {"dit_path", "te_path", "vae_path"}.
+    `moss`: MOSS-Image memory options {"convrot_int8", "convrot_int8_te", "h2d_only", "te_blocks_to_swap", "tokenizer_dir"}."""
     config_path = config_save_dir / f"{project_name}_training.toml"
 
     network_rank = int(rank)
@@ -1012,7 +1280,7 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
 
     training_config = {
         "pretrained_model_name_or_path": Path(models["dit_path"]).resolve().as_posix(),
-        "qwen3": Path(models["qwen_path"]).resolve().as_posix(),
+        "qwen3": Path(models["qwen_path"]).resolve().as_posix() if model_family != MODEL_MOSS else None,  # Anima's text encoder
         "vae": Path(models["vae_path"]).resolve().as_posix(),
         "network_module": HIDDEN_SETTINGS["network_module"],
         "network_dim": int(rank),
@@ -1050,6 +1318,36 @@ def create_training_toml(project_name, config_save_dir, actual_output_dir, rank,
         # Halt & save: the trainer polls for this file once per step (see train_network.py, [TrainFlow]).
         "halt_request_file": Path(halt_request_file).resolve().as_posix(),
     }
+    if model_family == MODEL_MOSS:
+        moss = moss or {}
+        # Anima-only keys out, MOSS-Image's in. The text encoder always runs in bf16 (or INT8) and the VAE in fp32.
+        for key in ("qwen3", "sigmoid_scale", "weighting_scheme", "vae_chunk_size", "vae_disable_cache"):
+            training_config.pop(key, None)
+        training_config.update({
+            "text_encoder": Path(models["te_path"]).resolve().as_posix(),
+            "network_module": MOSS_HIDDEN_SETTINGS["network_module"],
+            "timestep_sampling": MOSS_HIDDEN_SETTINGS["timestep_sampling"],
+            "logit_mean": MOSS_HIDDEN_SETTINGS["logit_mean"],
+            "logit_std": MOSS_HIDDEN_SETTINGS["logit_std"],
+            "discrete_flow_shift": MOSS_HIDDEN_SETTINGS["discrete_flow_shift"],
+            "attn_mode": MOSS_HIDDEN_SETTINGS["attn_mode"],
+            "max_data_loader_n_workers": MOSS_HIDDEN_SETTINGS["max_data_loader_n_workers"],
+            "persistent_data_loader_workers": MOSS_HIDDEN_SETTINGS["persistent_data_loader_workers"],
+            "vae_batch_size": 1,
+        })
+        # ConvRot INT8 halves the weights' VRAM. Pre-quantized files are detected by sd-scripts and need no option.
+        if moss.get("convrot_int8") and not is_convrot_int8_file(models["dit_path"]):
+            training_config["convrot_int8"] = True
+        if moss.get("convrot_int8_te") and not is_convrot_int8_file(models["te_path"]):
+            training_config["convrot_int8_text_encoder"] = True
+        if int(blocks_to_swap or 0) > 0 and moss.get("h2d_only"):
+            # LoRA training only: the frozen base stays on the CPU and is only ever copied to the GPU.
+            training_config["block_swap_h2d_only"] = True
+        if int(moss.get("te_blocks_to_swap") or 0) > 0:
+            # Text-encoder layers streamed from the CPU while captions are cached, instead of the whole model on the GPU.
+            training_config["text_encoder_blocks_to_swap"] = int(moss["te_blocks_to_swap"])
+        if (moss.get("tokenizer_dir") or "").strip():
+            training_config["tokenizer_cache_dir"] = Path(moss["tokenizer_dir"].strip()).resolve().as_posix()
     # 0 (or less) disables the interval; sd-scripts would otherwise divide by zero.
     if int(save_steps) > 0:
         training_config["save_every_n_steps"] = int(save_steps)
@@ -2510,7 +2808,8 @@ def inspect_dataset(dataset_dir: str, trigger_word: str) -> Generator[str, None,
     flag(empty, f"⚠️ {len(empty)} empty caption(s): {_examples(empty)}")
     flag(orphans, f"⚠️ {len(orphans)} caption file(s) with no image: {_examples(orphans)}")
     if nl_caps:  # information, not a problem
-        out.append(f"ℹ️ {len(nl_caps) - len(nl_orphans)}/{len(images)} image(s) have a natural-language caption ({NL_CAPTION_SUFFIX}, from the ToriiGate captioner)")
+        out.append(f"ℹ️ {len(nl_caps) - len(nl_orphans)}/{len(images)} image(s) have a natural-language caption ({NL_CAPTION_SUFFIX}, from the ToriiGate captioner). "
+                   f"MOSS-Image runs can train on these; Anima runs read the .txt tag captions.")
     flag(nl_orphans, f"⚠️ {len(nl_orphans)} natural-language caption(s) with no image: {_examples(nl_orphans)}")
     flag(rotated, f"⚠️ {len(rotated)} image(s) have an EXIF rotation sd-scripts ignores — bucket them first: {_examples(rotated)}")
     flag(dup_tags, f"⚠️ {len(dup_tags)} caption(s) repeat a tag: {_examples(dup_tags)}")
@@ -2698,7 +2997,8 @@ def extend_training(trigger_word, new_total):
         console.append(f"ℹ️ Set Training Steps above {point['step']} (what {point['run_dir'].name} already trained), then press ➕ Train More.")
         return console.text()
     cfg = point["cfg"]
-    missing = [f"❌ Model file not found: {cfg.get(k)}" for k in ("pretrained_model_name_or_path", "qwen3", "vae") if not cfg.get(k) or not os.path.isfile(cfg.get(k))]
+    family = run_model_family(point["run_dir"], cfg)
+    missing = [f"❌ Model file not found: {cfg.get(k)}" for k in model_file_keys(family) if not cfg.get(k) or not os.path.isfile(cfg.get(k))]
     if missing:
         console.extend(missing)
         return console.text()
@@ -2709,6 +3009,11 @@ def extend_training(trigger_word, new_total):
     if busy:
         console.append(busy)
         return console.text()
+    if family == MODEL_MOSS:
+        caption_error = refresh_moss_metadata(point["run_dir"], point["dataset_toml"])
+        if caption_error:
+            console.append(caption_error)
+            return console.text()
 
     run_dir, name, old = point["run_dir"], point["name"], point["step"]
     meta = run_dir / "run.json"
@@ -2770,9 +3075,10 @@ def extend_training(trigger_word, new_total):
     halt_file = Path(cfg.get("halt_request_file") or (run_dir / ".halt_request"))
     log_path = run_dir / "logs" / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log"
     cmd = build_train_command(point["training_toml"], point["dataset_toml"],
-                              ("--resume", point["state_dir"].resolve().as_posix(), "--skip_until_initial_step"))
+                              ("--resume", point["state_dir"].resolve().as_posix(), "--skip_until_initial_step"),
+                              script=train_script_for(family))
     console.clear()
-    console.append(f"➕ Training {project_name} — run {run_dir.name} further: step {old} → {new_total}")
+    console.append(f"➕ Training {project_name} ({family}) — run {run_dir.name} further: step {old} → {new_total}")
     console.append(f"   Previous final LoRA kept as {kept.name}")
     if tool_warning:
         console.append(tool_warning)
@@ -2792,12 +3098,22 @@ def extend_training(trigger_word, new_total):
                        else f"   ⚠️ Could not fully restore the run: {'; '.join(problems)}")
     return console.text()
 
-def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, save_resume_state, blocks_to_swap=0, network_alpha=0):
+def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, optimizer, t_steps, save_steps, sample_steps, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, train_seed, batch_size, grad_acc, save_resume_state, blocks_to_swap=0, network_alpha=0,
+                   model_family=MODEL_ANIMA, moss_dit_p="", moss_te_p="", moss_vae_p="", moss_tokenizer_dir="",
+                   moss_caption_source=CAPTIONS_NL, moss_convrot_int8=True, moss_convrot_int8_te=True, moss_blocks_to_swap=0,
+                   moss_h2d_only=True, moss_te_blocks_to_swap=0, moss_neg="", moss_s_steps_gen=50, moss_s_cfg=3.0):
     """Validate, write configs into a fresh run folder and hand the run to training_manager. Returns
     immediately; the trainer keeps running regardless of what happens to the browser tab."""
     if training_manager.is_running():
         console.append("⚠️ Training is already running!")
         return console.text()
+    if model_family not in MODEL_FAMILIES:
+        console.append(f"❌ Unknown model: {model_family!r}.")
+        return console.text()
+    is_moss = model_family == MODEL_MOSS
+    if is_moss:
+        # each model keeps its own preview settings and block-swap count; from here on the names mean this run's
+        neg, s_steps_gen, s_cfg, blocks_to_swap = moss_neg, moss_s_steps_gen, moss_s_cfg, moss_blocks_to_swap
 
     input_errors = []
     def whole(label, value, minimum):
@@ -2821,6 +3137,15 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     whole("Preview Height", h, 64)
     whole("Preview Steps", s_steps_gen, 1)
     whole("Preview Seed", s_seed, -(2 ** 63))
+    if is_moss:
+        swap = whole("Block Swap", blocks_to_swap or 0, 0)
+        if swap is not None and swap > MOSS_SWAPPABLE_BLOCKS:
+            input_errors.append(f"❌ Block Swap can be at most {MOSS_SWAPPABLE_BLOCKS} for MOSS-Image (it is {swap}).")
+        te_swap = whole("Text Encoder Block Swap", moss_te_blocks_to_swap or 0, 0)
+        if te_swap is not None and te_swap > MOSS_TE_LAYERS:
+            input_errors.append(f"❌ Text Encoder Block Swap can be at most {MOSS_TE_LAYERS} (it is {te_swap}).")
+        if moss_caption_source not in MOSS_CAPTION_SOURCES:
+            input_errors.append(f"❌ Unknown caption source: {moss_caption_source!r}.")
     try:
         if float(lr) <= 0:
             raise ValueError
@@ -2839,10 +3164,14 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         return console.text()
 
     model_errors = []
-    if not dit_p or not os.path.isfile(dit_p): model_errors.append(f"❌ DiT file not found: {dit_p}")
-    if not qwen_p or not os.path.isfile(qwen_p): model_errors.append(f"❌ Qwen3 file not found: {qwen_p}")
-    if not vae_p or not os.path.isfile(vae_p): model_errors.append(f"❌ VAE file not found: {vae_p}")
+    if is_moss:
+        model_errors = moss_model_errors(moss_dit_p, moss_te_p, moss_vae_p, (moss_tokenizer_dir or "").strip())
+    else:
+        if not dit_p or not os.path.isfile(dit_p): model_errors.append(f"❌ DiT file not found: {dit_p}")
+        if not qwen_p or not os.path.isfile(qwen_p): model_errors.append(f"❌ Qwen3 file not found: {qwen_p}")
+        if not vae_p or not os.path.isfile(vae_p): model_errors.append(f"❌ VAE file not found: {vae_p}")
     
+    moss_metadata, moss_stats = {}, {}
     dataset_errors = []
     preflight_warnings = [tool_warning] if tool_warning else []
     if not dataset_path or not os.path.exists(dataset_path): 
@@ -2860,9 +3189,22 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
                                   + (" Only videos/GIFs/other formats were found: run ✂️ Start Bucketing first." if media else ""))
         else:
             # Check for missing text files (captions)
-            missing_captions = [img.name for img in image_files if not img.with_suffix('.txt').exists()]
-            if missing_captions:
-                dataset_errors.append(f"❌ Error: Found {len(missing_captions)} images without .txt captions. Please use the 'Auto-Caption Dataset' tool first.")
+            if is_moss:
+                try:
+                    moss_metadata, moss_stats = build_moss_metadata(dataset_path, trigger_word, moss_caption_source)
+                except Exception as e:
+                    dataset_errors.append(f"❌ Could not read the captions: {e}")
+                    moss_stats = {"missing": []}
+                if moss_stats["missing"]:
+                    need = {CAPTIONS_NL: f"a {NL_CAPTION_SUFFIX} caption — write them with start_captioner.bat (the ToriiGate captioner), "
+                                         f"or choose another Caption Source",
+                            CAPTIONS_TAGS: "a .txt caption. Please use the 'Auto-Caption Dataset' tool first",
+                            CAPTIONS_BOTH: f"any caption (neither .txt nor {NL_CAPTION_SUFFIX})"}[moss_caption_source]
+                    dataset_errors.append(f"❌ Error: Found {len(moss_stats['missing'])} images without {need}: {_examples(moss_stats['missing'])}")
+            else:
+                missing_captions = [img.name for img in image_files if not img.with_suffix('.txt').exists()]
+                if missing_captions:
+                    dataset_errors.append(f"❌ Error: Found {len(missing_captions)} images without .txt captions. Please use the 'Auto-Caption Dataset' tool first.")
             
             # Check for oversized images (and EXIF-rotated ones, which sd-scripts would train on unrotated)
             oversized_images = []
@@ -2888,7 +3230,8 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         full_error = ""
         if model_errors:
             full_error += "\n".join(model_errors)
-            full_error += "\n\n⚠️ ERROR: Please check and set the correct model paths in the section:\n'🔧 Paths to Models <- Set Once'\n\n"
+            section = "🔧 Paths to MOSS-Image Models <- Set Once" if is_moss else "🔧 Paths to Models <- Set Once"
+            full_error += f"\n\n⚠️ ERROR: Please check and set the correct model paths in the section:\n'{section}'\n\n"
         if dataset_errors:
             full_error += "\n".join(dataset_errors)
             
@@ -2909,34 +3252,79 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
         d.mkdir(parents=True, exist_ok=True)
 
     console.clear()
-    console.append(f"🚀 Preparing: {project_name} — run {run_dir.name}")
+    console.append(f"🚀 Preparing: {project_name} ({model_family}) — run {run_dir.name}")
     for warning in preflight_warnings:
         console.append(warning)
     console.append(f"🔍 Analyzing dataset images...")
     base_res, max_bucket = analyze_dataset_resolution(dataset_path)
     console.append(f"📐 Auto-Resolution Set: Base {base_res}px, Max Bucket {max_bucket}px")
 
-    with_trigger, n_caps = trigger_caption_counts(dataset_path, trigger_word)
-    add_prefix = not (n_caps > 0 and with_trigger == n_caps)
-    if not add_prefix:
-        console.append(f"ℹ️ Every caption already contains '{trigger_word.strip()}', so it isn't added a second time.")
-    elif with_trigger:
-        console.append(f"⚠️ {with_trigger}/{n_caps} captions already contain '{trigger_word.strip()}' and will get it twice. 🔎 Inspect Dataset lists them.")
-    if int(blocks_to_swap or 0) > 0:
-        console.append(f"🧊 Block swap: {int(blocks_to_swap)} of 28 blocks kept in system RAM (less VRAM, slower steps).")
+    if is_moss:
+        add_prefix = False  # the trigger word is already in the captions of the metadata file, where it was missing
+        n_cands = moss_stats["candidates"]
+        console.append(f"📝 Captions: {moss_caption_source} — {len(moss_metadata)} images, {n_cands} caption(s)")
+        if moss_caption_source == CAPTIONS_BOTH:
+            console.append(f"   {moss_stats['both']} image(s) have both captions and alternate between them at random; each caption is encoded and cached.")
+            for label, names in (("natural-language", moss_stats["only_nl"]), ("tag", moss_stats["only_tags"])):
+                if names:
+                    console.append(f"   ⚠️ {len(names)} image(s) have only a {label} caption and always train on it: {_examples(names)}")
+        if trigger_word.strip():
+            if moss_stats["prefixed"] == 0:
+                console.append(f"ℹ️ Every caption already contains '{trigger_word.strip()}', so it isn't added a second time.")
+            elif moss_stats["prefixed"] < n_cands:
+                console.append(f"ℹ️ '{trigger_word.strip()}' was added to the {moss_stats['prefixed']} caption(s) that didn't contain it; "
+                               f"the other {n_cands - moss_stats['prefixed']} already did.")
+        dit_int8 = moss_convrot_int8 or is_convrot_int8_file(moss_dit_p)
+        te_int8 = moss_convrot_int8_te or is_convrot_int8_file(moss_te_p)
+        console.append(f"🧮 DiT: {'ConvRot INT8' if dit_int8 else 'bf16'}"
+                       + (" (pre-quantized file)" if is_convrot_int8_file(moss_dit_p) else " (quantized while loading)" if dit_int8 else "")
+                       + f" · Text encoder: {'ConvRot INT8' if te_int8 else 'bf16'}"
+                       + (" (pre-quantized file)" if is_convrot_int8_file(moss_te_p) else " (quantized while loading)" if te_int8 else ""))
+        if (dit_int8 or te_int8) and importlib.util.find_spec("triton") is None:
+            console.append("⚠️ Triton isn't installed in this Python: ConvRot INT8 still saves VRAM but runs through sd-scripts' slower "
+                           "fallback. Install_Triton_for_MOSS.bat installs it.")
+        if int(blocks_to_swap or 0) > 0:
+            console.append(f"🧊 Block swap: {int(blocks_to_swap)} of 42 blocks kept in system RAM (less VRAM, slower steps)"
+                           + (", H2D-only." if moss_h2d_only else "."))
+        if int(moss_te_blocks_to_swap or 0) > 0:
+            console.append(f"🧊 Text encoder block swap: {int(moss_te_blocks_to_swap)} of {MOSS_TE_LAYERS} layers streamed from system RAM while captions are cached.")
+    else:
+        with_trigger, n_caps = trigger_caption_counts(dataset_path, trigger_word)
+        add_prefix = not (n_caps > 0 and with_trigger == n_caps)
+        if not add_prefix:
+            console.append(f"ℹ️ Every caption already contains '{trigger_word.strip()}', so it isn't added a second time.")
+        elif with_trigger:
+            console.append(f"⚠️ {with_trigger}/{n_caps} captions already contain '{trigger_word.strip()}' and will get it twice. 🔎 Inspect Dataset lists them.")
+        if int(blocks_to_swap or 0) > 0:
+            console.append(f"🧊 Block swap: {int(blocks_to_swap)} of 28 blocks kept in system RAM (less VRAM, slower steps).")
     alpha_used = resolve_network_alpha(rank, network_alpha)
     console.append(f"🔧 Network rank {int(rank)}, alpha {alpha_used:g} → LoRA output scale {alpha_used / int(rank):g}"
                    + (" (alpha = rank)" if alpha_used == int(rank) else ""))
 
     halt_file = run_dir / ".halt_request"
     try:
-        models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
-        prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir)
-        dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc, add_prefix=add_prefix)
-        training_toml = create_training_toml(project_name, project_configs_dir, run_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_file, save_resume_state, blocks_to_swap, network_alpha)
+        prompt_path = create_sample_prompts(project_name, trigger_word, pos, neg, w, h, s_steps_gen, s_cfg, s_seed, project_configs_dir,
+                                            model_family=model_family)
+        run_info = {"keyword": trigger_word.strip(), "output_name": project_name, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "dataset_path": str(dataset_path), "max_train_steps": int(t_steps), "model_family": model_family}
+        if is_moss:
+            models = {"dit_path": moss_dit_p, "te_path": moss_te_p, "vae_path": moss_vae_p}
+            metadata_path = project_configs_dir / f"{project_name}_metadata.json"
+            write_moss_metadata(moss_metadata, metadata_path)
+            dataset_toml = create_moss_dataset_toml(project_name, dataset_path, metadata_path, len(moss_metadata), base_res, max_bucket,
+                                                    project_configs_dir, t_steps, batch_size, grad_acc)
+            moss_options = {"convrot_int8": bool(moss_convrot_int8), "convrot_int8_te": bool(moss_convrot_int8_te),
+                            "h2d_only": bool(moss_h2d_only), "te_blocks_to_swap": int(moss_te_blocks_to_swap or 0),
+                            "tokenizer_dir": (moss_tokenizer_dir or "").strip()}
+            training_toml = create_training_toml(project_name, project_configs_dir, run_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_file, save_resume_state, blocks_to_swap, network_alpha,
+                                                 model_family=MODEL_MOSS, moss=moss_options)
+            run_info["caption_source"] = moss_caption_source
+        else:
+            models = {"dit_path": dit_p, "qwen_path": qwen_p, "vae_path": vae_p}
+            dataset_toml = create_dataset_toml(project_name, dataset_path, trigger_word, base_res, max_bucket, project_configs_dir, t_steps, batch_size, grad_acc, add_prefix=add_prefix)
+            training_toml = create_training_toml(project_name, project_configs_dir, run_dir, rank, lr, optimizer, t_steps, save_steps, sample_steps, models, prompt_path, train_seed, batch_size, grad_acc, halt_file, save_resume_state, blocks_to_swap, network_alpha)
         with open(run_dir / "run.json", "w", encoding="utf-8") as f:
-            json.dump({"keyword": trigger_word.strip(), "output_name": project_name, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-                       "dataset_path": str(dataset_path), "max_train_steps": int(t_steps)}, f, indent=2, ensure_ascii=False)
+            json.dump(run_info, f, indent=2, ensure_ascii=False)
     except Exception as e:
         console.append(f"❌ Could not write training config: {e}")
         return console.text()
@@ -2947,7 +3335,8 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
     log_path = run_dir / "logs" / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log"
     console.append(f"📁 Run folder: {run_dir}")
     try:
-        if not training_manager.start(build_train_command(training_toml, dataset_toml), TRAIN_DIR.resolve(), build_train_env(),
+        if not training_manager.start(build_train_command(training_toml, dataset_toml, script=train_script_for(model_family)),
+                                      TRAIN_DIR.resolve(), build_train_env(),
                                       run_dir, log_path, halt_file, gallery_since=time.time(), output_name=project_name):
             console.append("⚠️ Training is already running!")
     except Exception as e:
@@ -2973,7 +3362,8 @@ def resume_training(trigger_word):
     except Exception as e:
         console.append(f"❌ Could not read {point['training_toml']}: {e}")
         return console.text()
-    missing = [f"❌ Model file not found: {cfg.get(k)}" for k in ("pretrained_model_name_or_path", "qwen3", "vae") if not cfg.get(k) or not os.path.isfile(cfg.get(k))]
+    family = run_model_family(point["run_dir"], cfg)
+    missing = [f"❌ Model file not found: {cfg.get(k)}" for k in model_file_keys(family) if not cfg.get(k) or not os.path.isfile(cfg.get(k))]
     if missing:
         console.extend(missing + ["   This run was configured with these paths; restore the files to resume it."])
         return console.text()
@@ -2984,15 +3374,21 @@ def resume_training(trigger_word):
     if busy:
         console.append(busy)
         return console.text()
+    if family == MODEL_MOSS:
+        caption_error = refresh_moss_metadata(point["run_dir"], point["dataset_toml"])
+        if caption_error:
+            console.append(caption_error)
+            return console.text()
 
     run_dir = point["run_dir"]
     halt_file = Path(cfg.get("halt_request_file") or (run_dir / ".halt_request"))
     log_path = run_dir / "logs" / f"train_{time.strftime('%Y%m%d_%H%M%S')}.log"
     cmd = build_train_command(point["training_toml"], point["dataset_toml"],
-                              ("--resume", point["state_dir"].resolve().as_posix(), "--skip_until_initial_step"))
+                              ("--resume", point["state_dir"].resolve().as_posix(), "--skip_until_initial_step"),
+                              script=train_script_for(family))
 
     console.clear()
-    console.append(f"↩ Resuming {project_name} — run {run_dir.name} from step {point['step']}/{point['max_steps']}")
+    console.append(f"↩ Resuming {project_name} ({family}) — run {run_dir.name} from step {point['step']}/{point['max_steps']}")
     console.append(f"   State: {point['state_dir'].name}")
     if tool_warning:
         console.append(tool_warning)
@@ -3089,6 +3485,23 @@ def handle_optimizer_change(opt, current_lr, saved_adam_lr):
     return (saved_adam_lr if current_lr == "1.0" else current_lr), saved_adam_lr
 
 
+def shown_if(condition):
+    """`visible` for a single control that belongs to one model: hidden ones stay in the page ("hidden") instead of
+    being left out (False). A control Gradio never put in the page doesn't reliably appear when it's switched on later;
+    seen with 6.17.3, where a model's path box and preview fields stayed missing until the page was reloaded."""
+    return True if condition else "hidden"
+
+
+def model_family_visibility(model_family):
+    """Show the chosen model's own controls (paths, memory options, preview settings) and hide the other's.
+    Order: Anima paths, MOSS paths, Anima block swap, MOSS options, Anima negative/steps/CFG, MOSS negative/steps/CFG.
+    The two path boxes and the MOSS options are groups (switched with True/False), the rest single controls."""
+    moss = model_family == MODEL_MOSS
+    anima_box, moss_box = gr.update(visible=not moss), gr.update(visible=moss)
+    anima, other = gr.update(visible=shown_if(not moss)), gr.update(visible=shown_if(moss))
+    return anima_box, moss_box, anima, moss_box, anima, anima, anima, other, other, other
+
+
 # ==========================================
 # UI BUILDER
 # ==========================================
@@ -3097,7 +3510,7 @@ cs = load_settings()
 # A trainer that kept running while the app was closed is picked up again here.
 training_manager.reattach(OUTPUT_BASE)
 
-with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
+with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B and MOSS-Image") as ui:
     gr.Markdown(
         "# Anima TrainFlow\n"
         '<div class="attribution"><span class="author-text">Created by ThetaCursed</span></div>',
@@ -3105,17 +3518,29 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     )
     
     saved_adam_lr = gr.State(value="0.00005")
+    moss_ui = cs.get("model_family", MODEL_ANIMA) == MODEL_MOSS  # which model's controls are shown at first
 
     with gr.Group():
         with gr.Row():
             with gr.Column(scale=1):
+                model_family_input = gr.Radio(MODEL_FAMILIES, label="Model to train a LoRA for", value=cs.get("model_family", MODEL_ANIMA))
                 with gr.Row():
                     trigger_word = gr.Textbox(label="Trigger Word / Project Name", value=cs.get("trigger_word", ""), placeholder="e.g., unique_style")
-                    dataset_path = gr.Textbox(label="Dataset Path (Images + .txt)", value=cs.get("dataset_path", ""), placeholder="C:/Images/MyDataset")
-                with gr.Accordion("🔧 Paths to Models <- Set Once", open=False):
-                    dit_input = gr.Textbox(label="DiT", value=cs.get("dit_path", ""))
-                    qwen_input = gr.Textbox(label="Qwen3", value=cs.get("qwen_path", ""))
-                    vae_input = gr.Textbox(label="VAE", value=cs.get("vae_path", ""))
+                    dataset_path = gr.Textbox(label="Dataset Path (Images + captions)", value=cs.get("dataset_path", ""), placeholder="C:/Images/MyDataset")
+                with gr.Group(visible=not moss_ui) as anima_paths_box:
+                    with gr.Accordion("🔧 Paths to Models <- Set Once", open=False):
+                        dit_input = gr.Textbox(label="DiT", value=cs.get("dit_path", ""))
+                        qwen_input = gr.Textbox(label="Qwen3", value=cs.get("qwen_path", ""))
+                        vae_input = gr.Textbox(label="VAE", value=cs.get("vae_path", ""))
+                with gr.Group(visible=moss_ui) as moss_paths_box:
+                    with gr.Accordion("🔧 Paths to MOSS-Image Models <- Set Once", open=False):
+                        moss_dit_input = gr.Textbox(label="MOSS-Image DiT (Base or SFT; a ComfyUI single file, or the first of the official split files)",
+                                                    value=cs.get("moss_dit_path", ""))
+                        moss_te_input = gr.Textbox(label="Qwen3.5-9B text encoder (qwen3.5_9b_int8_convrot.safetensors, or model-00001-of-00004.safetensors)",
+                                                   value=cs.get("moss_te_path", ""))
+                        moss_vae_input = gr.Textbox(label="FLUX.2 VAE (flux2-vae.safetensors)", value=cs.get("moss_vae_path", ""))
+                        moss_tokenizer_input = gr.Textbox(label="Tokenizer folder (optional; empty = downloaded from Hugging Face on first use, about 20 MB)",
+                                                          value=cs.get("moss_tokenizer_dir", ""))
                 status_md = gr.Markdown("**Status:** ⚪ Idle")
                 with gr.Row():
                     start_btn = gr.Button("🚀 Start Training", variant="primary")
@@ -3143,11 +3568,30 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                     blocks_swap_input = gr.Slider(
                         0, ANIMA_SWAPPABLE_BLOCKS, value=cs.get("blocks_to_swap", 0), step=1,
                         label="Block Swap (Low VRAM): DiT blocks kept in system RAM — less VRAM, slower steps (0 = off)",
+                        visible=shown_if(not moss_ui),
                     )
                     save_resume_state_input = gr.Checkbox(
                         label="Save resume points with each checkpoint (crash recovery, ➕ Train More; uses extra disk)",
                         value=cs.get("save_resume_state", True),
                     )
+                with gr.Group(visible=moss_ui) as moss_options_box:
+                    moss_caption_input = gr.Dropdown(
+                        label="Caption Source (MOSS-Image was trained on natural-language captions; start_captioner.bat writes them)",
+                        choices=MOSS_CAPTION_SOURCES, value=cs.get("moss_caption_source", CAPTIONS_NL),
+                    )
+                    with gr.Row():
+                        moss_int8_input = gr.Checkbox(label="ConvRot INT8 DiT (half the VRAM for the weights)", value=cs.get("moss_convrot_int8", True))
+                        moss_int8_te_input = gr.Checkbox(label="ConvRot INT8 text encoder (about 16 GB → 8 GB)", value=cs.get("moss_convrot_int8_te", True))
+                        moss_h2d_input = gr.Checkbox(label="H2D-only block swap (faster; slightly more VRAM)", value=cs.get("moss_h2d_only", True))
+                    with gr.Row():
+                        moss_blocks_swap_input = gr.Slider(
+                            0, MOSS_SWAPPABLE_BLOCKS, value=cs.get("moss_blocks_to_swap", 20), step=1,
+                            label="Block Swap: DiT blocks (of 42) kept in system RAM — less VRAM, slower steps (0 = off)",
+                        )
+                        moss_te_swap_input = gr.Slider(
+                            0, MOSS_TE_LAYERS, value=cs.get("moss_te_blocks_to_swap", 0), step=1,
+                            label="Text Encoder Block Swap: layers (of 32) streamed from RAM while captions are cached (0 = off)",
+                        )
 
     with gr.Row():
         with gr.Column(scale=1):
@@ -3199,12 +3643,17 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
                                             x_title="step", y_title="avg loss", height=GALLERY_HEIGHT - 40)
             with gr.Group():
                 pos_prompt = gr.Textbox(label="Preview Prompts (one per line; trigger word added automatically)", lines=2, value=cs.get("pos_prompt", ""))
-                neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""))
+                # Negative prompt, steps and CFG are kept per model: each has its own, and only the chosen model's show.
+                neg_prompt = gr.Textbox(label="Negative Prompt", lines=1, value=cs.get("neg_prompt", ""), visible=shown_if(not moss_ui))
+                moss_neg_prompt = gr.Textbox(label="Negative Prompt (MOSS-Image; empty is the official default)", lines=1,
+                                             value=cs.get("moss_neg_prompt", ""), visible=shown_if(moss_ui))
                 with gr.Row():
                     width_input = gr.Number(label="Width", value=cs.get("width", 1024), precision=0, min_width=80)
                     height_input = gr.Number(label="Height", value=cs.get("height", 1024), precision=0, min_width=80)
-                    sample_steps_gen_input = gr.Number(label="Steps", value=cs.get("sample_steps_gen", 30), precision=0, min_width=80)
-                    sample_cfg_input = gr.Number(label="CFG", value=cs.get("sample_cfg", 4.0), min_width=80)
+                    sample_steps_gen_input = gr.Number(label="Steps", value=cs.get("sample_steps_gen", 30), precision=0, min_width=80, visible=shown_if(not moss_ui))
+                    sample_cfg_input = gr.Number(label="CFG", value=cs.get("sample_cfg", 4.0), min_width=80, visible=shown_if(not moss_ui))
+                    moss_sample_steps_input = gr.Number(label="Steps (MOSS-Image)", value=cs.get("moss_sample_steps_gen", 50), precision=0, min_width=80, visible=shown_if(moss_ui))
+                    moss_sample_cfg_input = gr.Number(label="CFG (MOSS-Image)", value=cs.get("moss_sample_cfg", 3.0), min_width=80, visible=shown_if(moss_ui))
                     sample_seed_input = gr.Number(label="Seed", value=cs.get("sample_seed", 42), precision=0, min_width=80)
 
     training_inputs = [
@@ -3216,17 +3665,28 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     ]
 
     # Order must match DEFAULT_SETTINGS (auto_save_state zips them together).
+    # Passed to start_training after the Anima inputs, in this order (its model_family=… parameters).
+    moss_inputs = [
+        model_family_input, moss_dit_input, moss_te_input, moss_vae_input, moss_tokenizer_input, moss_caption_input,
+        moss_int8_input, moss_int8_te_input, moss_blocks_swap_input, moss_h2d_input, moss_te_swap_input,
+        moss_neg_prompt, moss_sample_steps_input, moss_sample_cfg_input,
+    ]
     all_settings_list = training_inputs + [
         side_min_input, side_max_input, tagger_gen_thresh, tagger_char_thresh, tagger_overwrite, save_resume_state_input,
         blocks_swap_input, convert_other_input, use_embedded_input, dup_aside_input, alpha_input,
-    ]
+    ] + moss_inputs
     assert len(all_settings_list) == len(DEFAULT_SETTINGS), "settings keys and UI components are out of sync"
 
     def load_state_on_refresh():
         current_settings = load_settings()
         return [current_settings.get(k, DEFAULT_SETTINGS[k]) for k in DEFAULT_SETTINGS.keys()]
 
-    ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list)    
+    family_boxes = [anima_paths_box, moss_paths_box, blocks_swap_input, moss_options_box, neg_prompt, sample_steps_gen_input,
+                    sample_cfg_input, moss_neg_prompt, moss_sample_steps_input, moss_sample_cfg_input]
+    # A refreshed tab gets the saved settings, then shows the controls of the model those settings name.
+    ui.load(fn=load_state_on_refresh, inputs=None, outputs=all_settings_list).then(
+        fn=model_family_visibility, inputs=[model_family_input], outputs=family_boxes, show_progress="hidden")
+    model_family_input.change(fn=model_family_visibility, inputs=[model_family_input], outputs=family_boxes, show_progress="hidden")
 
     # Log, previews, status and loss are pulled from the server every second rather than pushed by
     # the button handlers, so a refreshed (or newly opened) tab picks up whatever is running.
@@ -3249,7 +3709,8 @@ with gr.Blocks(title="Anima TrainFlow: Easy LoRA Trainer for Anima 2B") as ui:
     rename_btn.click(fn=start_rename, inputs=[dataset_path], outputs=[output_log])
     inspect_btn.click(fn=start_inspect, inputs=[dataset_path, trigger_word], outputs=[output_log])
     
-    start_btn.click(fn=start_training, inputs=training_inputs + [save_resume_state_input, blocks_swap_input, alpha_input], outputs=[output_log])
+    start_btn.click(fn=start_training, inputs=training_inputs + [save_resume_state_input, blocks_swap_input, alpha_input] + moss_inputs,
+                    outputs=[output_log])
     pause_btn.click(fn=toggle_pause, outputs=output_log)
     halt_btn.click(fn=halt_training, outputs=output_log)
     stop_btn.click(fn=stop_training, outputs=output_log)

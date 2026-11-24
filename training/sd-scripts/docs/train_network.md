@@ -16,7 +16,7 @@ This guide focuses on LoRA training and explains the basic configuration items.
 **Prerequisites:**
 
 * The `sd-scripts` repository has been cloned and the Python environment has been set up.
-* The training dataset has been prepared. (For dataset preparation, please refer to [this guide](link/to/dataset/doc))
+* The training dataset has been prepared. (For dataset preparation, please refer to [this guide](./config_README-en.md))
 
 <details>
 <summary>日本語</summary>
@@ -28,7 +28,7 @@ This guide focuses on LoRA training and explains the basic configuration items.
 **前提条件:**
 
 *   `sd-scripts` リポジトリのクローンと Python 環境のセットアップが完了していること。
-*   学習用データセットの準備が完了していること。（データセットの準備については[こちら](link/to/dataset/doc)を参照してください）
+*   学習用データセットの準備が完了していること。（データセットの準備については[こちら](./config_README-ja.md)を参照してください）
 </details>
 
 ## 2. Preparation / 準備
@@ -119,7 +119,7 @@ Next, we'll explain the main command-line arguments.
 #### Dataset Related / データセット関連
 
 * `--dataset_config="<path to configuration file>"`
-  * Specifies the path to a `.toml` file describing the dataset configuration. (For details on dataset configuration, see [here](link/to/dataset/config/doc))
+  * Specifies the path to a `.toml` file describing the dataset configuration. (For details on dataset configuration, see [here](./config_README-en.md))
   * It's also possible to specify dataset settings from the command line, but using a `.toml` file is recommended as it becomes lengthy.
 
 #### Output and Save Related / 出力・保存関連
@@ -138,9 +138,10 @@ Next, we'll explain the main command-line arguments.
 #### LoRA Parameters / LoRA パラメータ
 
 * `--network_module=networks.lora` **[Required]**
-  * Specifies the type of network to train. For LoRA, specify `networks.lora`.
+  * Specifies the type of network to train. For LoRA, specify `networks.lora`. For OFTv2 / BOFT, specify `networks.oft_v2` / `networks.boft` (see [train_network_oft_boft.md](./train_network_oft_boft.md)).
 * `--network_dim=16` **[Required]**
   * Specifies the rank (dimension) of LoRA. Higher values increase expressiveness but also increase file size and computational cost. Values between 4 and 128 are commonly used. There is no default (module dependent).
+  * For orthogonal adapters, `networks.oft` interprets this value as the number of blocks, while `networks.oft_v2` and `networks.boft` interpret it as the block size. The same value therefore has a different meaning depending on the network module.
 * `--network_alpha=1`
   * Specifies the alpha value for LoRA. This parameter is related to learning rate scaling. It is generally recommended to set it to about half the value of `network_dim`, but it can also be the same value as `network_dim`. The default is 1. Setting it to the same value as `network_dim` will result in behavior similar to older versions.
 * `--network_args`
@@ -207,7 +208,7 @@ Next, we'll explain the main command-line arguments.
 #### データセット関連
 
 *   `--dataset_config="<設定ファイルのパス>"` 
-    *   データセット設定を記述した `.toml` ファイルのパスを指定します。（データセット設定の詳細は[こちら](link/to/dataset/config/doc)）
+    *   データセット設定を記述した `.toml` ファイルのパスを指定します。（データセット設定の詳細は[こちら](./config_README-ja.md)）
     *   コマンドラインからデータセット設定を指定することも可能ですが、長くなるため `.toml` ファイルを使用することを推奨します。
 
 #### 出力・保存関連
@@ -226,9 +227,10 @@ Next, we'll explain the main command-line arguments.
 #### LoRA パラメータ
 
 *   `--network_module=networks.lora` **[必須]**
-    *   学習するネットワークの種別を指定します。LoRA の場合は `networks.lora` を指定します。
+    *   学習するネットワークの種別を指定します。LoRA の場合は `networks.lora` を指定します。OFTv2 / BOFT の場合は `networks.oft_v2` / `networks.boft` を指定します（[train_network_oft_boft.md](./train_network_oft_boft.md) を参照）。
 *   `--network_dim=16` **[必須]**
     *   LoRA のランク (rank / 次元数) を指定します。値が大きいほど表現力は増しますが、ファイルサイズと計算コストが増加します。一般的には 4〜128 程度の値が使われます。デフォルトは指定されていません（モジュール依存）。
+    *   直交変換系アダプタでは、`networks.oft` はブロック数、`networks.oft_v2` と `networks.boft` はブロックサイズとして解釈します。同じ値でも、ネットワークモジュールによって意味が異なります。
 *   `--network_alpha=1`
     *   LoRA のアルファ値 (alpha) を指定します。学習率のスケーリングに関係するパラメータで、一般的には `network_dim` の半分程度の値を指定することが推奨されますが、`network_dim` と同じ値を指定する場合もあります。デフォルトは 1 です。`network_dim` と同じ値に設定すると、旧バージョンと同様の挙動になります。
 

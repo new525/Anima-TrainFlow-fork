@@ -1,4 +1,4 @@
-# Anima Strategy Classes
+﻿# Anima Strategy Classes
 
 import os
 import random
@@ -8,7 +8,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from library import anima_utils, train_util
+from library import anima_utils
+import library.accelerator_setup as accelerator_setup
+import library.device_utils as device_utils
 from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy
 from library import qwen_image_autoencoder_kl
 
@@ -166,6 +168,7 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
     ) -> None:
         super().__init__(cache_to_disk, batch_size, skip_disk_cache_validity_check, is_partial)
 
+    # [TrainFlow] caches go into subfolders of the dataset folder instead of next to each image
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         path = Path(image_abs_path)
         cache_dir = path.parent / "cache_text_encoder"
@@ -222,9 +225,9 @@ class AnimaTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         models: List[Any],
         text_encoding_strategy: TextEncodingStrategy,
         infos: List,
+        captions: List[str],
     ):
         anima_text_encoding_strategy: AnimaTextEncodingStrategy = text_encoding_strategy
-        captions = [info.caption for info in infos]
 
         tokens_and_masks = tokenize_strategy.tokenize(captions)
         with torch.no_grad():
@@ -277,6 +280,7 @@ class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
     def cache_suffix(self) -> str:
         return self.ANIMA_LATENTS_NPZ_SUFFIX
 
+    # [TrainFlow] caches go into subfolders of the dataset folder instead of next to each image
     def get_latents_npz_path(self, absolute_path: str, image_size: Tuple[int, int]) -> str:
         path = Path(absolute_path)
         cache_dir = path.parent / "latent_cache"
@@ -316,5 +320,5 @@ class AnimaLatentsCachingStrategy(LatentsCachingStrategy):
             encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop, multi_resolution=True
         )
 
-        if not train_util.HIGH_VRAM:
-            train_util.clean_memory_on_device(vae_device)
+        if not accelerator_setup.HIGH_VRAM:
+            device_utils.clean_memory_on_device(vae_device)

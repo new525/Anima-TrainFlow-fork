@@ -1,12 +1,15 @@
-import os
+﻿import os
 import glob
 import random
 from typing import Any, List, Optional, Tuple, Union
 import torch
 import numpy as np
-from transformers import CLIPTokenizer, T5TokenizerFast, CLIPTextModel, CLIPTextModelWithProjection, T5EncoderModel
+from transformers import T5TokenizerFast, CLIPTextModel, CLIPTextModelWithProjection, T5EncoderModel
+from library.clip_tokenizer import CLIPTokenizer  # transformers.CLIPTokenizer with the legacy (ftfy) text normalization
 
-from library import sd3_utils, train_util
+from library import sd3_utils
+import library.accelerator_setup as accelerator_setup
+import library.device_utils as device_utils
 from library import sd3_models
 from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy
 
@@ -322,10 +325,14 @@ class Sd3TextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return [lg_out, t5_out, lg_pooled, l_attn_mask, g_attn_mask, t5_attn_mask]
 
     def cache_batch_outputs(
-        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
+        self,
+        tokenize_strategy: TokenizeStrategy,
+        models: List[Any],
+        text_encoding_strategy: TextEncodingStrategy,
+        infos: List,
+        captions: List[str],
     ):
         sd3_text_encoding_strategy: Sd3TextEncodingStrategy = text_encoding_strategy
-        captions = [info.caption for info in infos]
 
         tokens_and_masks = tokenize_strategy.tokenize(captions)
         with torch.no_grad():
@@ -416,5 +423,5 @@ class Sd3LatentsCachingStrategy(LatentsCachingStrategy):
             encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop, multi_resolution=True
         )
 
-        if not train_util.HIGH_VRAM:
-            train_util.clean_memory_on_device(vae.device)
+        if not accelerator_setup.HIGH_VRAM:
+            device_utils.clean_memory_on_device(vae.device)

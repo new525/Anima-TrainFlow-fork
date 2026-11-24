@@ -8,7 +8,7 @@ Writes a natural-language caption for every image in a folder with [ToriiGate 0.
 
 It comes with a web UI and a command line. Both use the same code.
 
-> **TrainFlow doesn't train on these captions yet.** Training reads only `<name>.txt`. TrainFlow's dataset tools already treat `.toriigate.txt` as part of the image:
+> **MOSS-Image runs can train on these captions; Anima runs read only `<name>.txt`.** In TrainFlow, choose **MOSS-Image** and set **Caption Source** to natural language, tags, or both. TrainFlow's dataset tools treat `.toriigate.txt` as part of the image:
 > - 🔢 Rename to Numbers renames it with its image.
 > - The duplicate check sets it aside with its image, and copies it to the copy that's kept.
 > - 🔎 Inspect Dataset counts these files and leaves them out of the tag checks.

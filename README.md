@@ -1,6 +1,6 @@
 # Anima TrainFlow — Fork
 
-A one-page GUI for training LoRAs on the **Anima 2B** anime model, tuned for NVIDIA GPUs with as little as **6 GB of VRAM**.
+A one-page GUI for training LoRAs on the **Anima 2B** anime model, tuned for NVIDIA GPUs with as little as **6 GB of VRAM**, and on **MOSS-Image** (OpenMOSS's 5B model), which needs more: see [Training MOSS-Image](#training-moss-image).
 
 This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow), which created the app. The fork keeps the same workflow and focuses on making long training runs hard to lose and checkpoints easy to choose. It is not affiliated with or endorsed by the upstream project.
 
@@ -15,6 +15,7 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 | | Upstream (v1.1.0) | This fork (1.14) |
 |---|---|---|
+| **Models** | Anima 2B | Anima 2B and MOSS-Image |
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
 | **Interrupting a run** | Stop only (progress lost) | ⏸ Pause, 💾 Halt & Save, ↩ Resume Run, crash recovery from resume points |
@@ -27,7 +28,7 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 | **Re-running bucketing with new sizes** | Can overwrite your original images with crops | Non-destructive; originals are never touched |
 | **Phone photos** | Bucket chosen from unrotated size: cropped the wrong way | Rotated upright first |
 | **Captions** | WD tagger only | Tags already embedded by Grabber/exiftool first, written in Anima's caption format; WD tagger for the rest |
-| **Natural-language captions** | — | A separate ToriiGate 0.5 captioner writes `<name>.toriigate.txt` next to each image (training still reads the tag captions) |
+| **Natural-language captions** | — | A separate ToriiGate 0.5 captioner writes `<name>.toriigate.txt` next to each image. MOSS-Image runs can train on them, on the tags, or on both; Anima runs read the tag captions |
 | **Dataset formats** | PNG, JPG, WebP, BMP (the tagger skipped BMP) | Also videos and GIFs (their middle frame), AVIF, JPEG XL, HEIC, and anything else Pillow or OpenCV can read |
 | **Dataset checks** | Pre-flight (its oversized-image check never fired) | Working pre-flight plus 🔎 Inspect Dataset |
 | **Bucketing / tagging during a refresh** | Interrupted with the tab | Run in the background |
@@ -47,7 +48,9 @@ The complete list, including smaller fixes, is in [CHANGELOG.md](CHANGELOG.md).
 
 **Requirements**
 * Windows 10/11.
-* An NVIDIA GPU (6 GB+ VRAM) with a driver recent enough for CUDA 12.8; the installer uses PyTorch's CUDA 12.8 build.
+* An NVIDIA GPU with a driver recent enough for CUDA 12.8; the installer uses PyTorch's CUDA 12.8 build.
+  * **Anima:** 6 GB of VRAM or more.
+  * **MOSS-Image:** about 7 to 8 GB of VRAM with the default low-memory settings and about 14 GB of free system RAM, going by sd-scripts' measurements; see [Training MOSS-Image](#training-moss-image).
 * Free disk space for PyTorch, the model files, and your runs. Resume points include optimizer state and are much larger than a LoRA.
 
 ### 1. Get the fork
@@ -63,8 +66,12 @@ Either way you get `python_embeded/`, an embedded Python 3.10 with pip. There's 
 ### 2. Install dependencies
 Run **`Install_Requirements.bat`**. It installs PyTorch (CUDA 12.8) and the training dependencies into `python_embeded/`.
 
+**Only for MOSS-Image:** then run **`Install_Triton_for_MOSS.bat`**. It's optional, and it makes the low-memory ConvRot INT8 option run at full speed. It finishes by trying one of the trainer's INT8 kernels on your GPU and says whether that worked; if it didn't, MOSS-Image still trains, more slowly.
+
 ### 3. Download the models
 Put each file in the folder shown; these are the paths the app uses by default. If you already have the files elsewhere, for example in ComfyUI, you can point the app at them instead (step 4).
+
+This table is for Anima, plus the two dataset tools both models use (the WD tagger and U2Net). For MOSS-Image, download the three files listed under [Training MOSS-Image](#training-moss-image) instead of the first three rows.
 
 | What | File | Put it in | Download |
 |---|---|---|---|
@@ -79,7 +86,7 @@ Put each file in the folder shown; these are the paths the app uses by default. 
 * For the tagger, download just the two files rather than cloning the repo. A clone also pulls two other formats of the same model, 3.78 GB in total.
 
 ### 4. Launch
-Run **`start_trainer.bat`**; the UI opens in your browser. If your model files aren't in the default folders, set their paths once under **🔧 Paths to Models**.
+Run **`start_trainer.bat`**; the UI opens in your browser. Pick the model under **Model to train a LoRA for** (Anima or MOSS-Image); the choice is remembered. If your model files aren't in the default folders, set their paths once under **🔧 Paths to Models** (each model has its own).
 
 ### Updating
 * **git:** run `git pull`.
@@ -88,6 +95,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. If your model files a
   * **1.2.1** (GitHub release 1.3) updated Gradio.
   * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
   * **1.5** through **1.13** add no dependencies. (1.9 lists `pandas` and `psutil` explicitly, but they were already installed.)
+  * **1.14** replaces the bundled sd-scripts with v0.13.1, which needs newer `transformers`, `diffusers`, `accelerate`, `safetensors` and `huggingface-hub`. **Re-run `Install_Requirements.bat`**; training won't start on the old packages.
 
 ---
 
@@ -158,11 +166,11 @@ The tools run in the background; their progress shows in the log.
 * The image's Grabber tags or tag caption are passed to the model as hints, so characters get their right names.
 * The prompt can be edited, starting from the model's own. Each image's tags and names are still filled in.
 * Each caption is saved as `<name>.toriigate.txt`; your tag captions aren't touched. The dataset tools above treat it as part of its image.
-* **Training doesn't use these captions yet:** it reads only `<name>.txt`.
+* **MOSS-Image runs can train on these captions** (Caption Source). Anima runs read only `<name>.txt`.
 * There's a command line too. Details are in [tools/toriigate-captioner/README.md](tools/toriigate-captioner/README.md).
 
 ### Train
-Set a **Trigger Word**, which also names the run's folder, then press **🚀 Start Training**. The status line above the buttons always shows what's running.
+Set a **Trigger Word**, which also names the run's folder, then press **🚀 Start Training**. The status line above the buttons always shows what's running. This section describes Anima runs; what differs for MOSS-Image is under [Training MOSS-Image](#training-moss-image).
 
 The trigger word is put at the front of every caption that doesn't already have it. Captions and images are encoded once and cached next to the dataset (`cache_text_encoder/`, `latent_cache/`). Each run checks those caches against the current caption text and image files, and encodes again whatever changed, so editing, re-captioning or renaming needs no manual cleanup.
 
@@ -183,6 +191,66 @@ More options:
 * **Block Swap (Low VRAM):** keeps that many of the 28 DiT blocks in system RAM. This lowers VRAM use at the cost of slower steps. Use it if training runs out of memory.
 * **Save resume points with each checkpoint** (on by default): saves a resume point with every checkpoint and keeps the newest two. A crash then costs at most one save interval, and ➕ Train More becomes possible. A 💾 Halt & Save resume point is removed once a newer one exists, or when the run finishes.
 * You can refresh the page, close it, or even close the console window and restart the app. Training keeps going, and the restarted app reconnects to it.
+
+### Training MOSS-Image
+**In short:**
+1. Run `Install_Triton_for_MOSS.bat` once (optional, see *Memory*).
+2. Download the three model files below.
+3. Caption the dataset: `start_captioner.bat` for natural-language captions, *Create .txt captions* for tags, or both.
+4. Choose **MOSS-Image**, check **Caption Source**, set a Trigger Word, press **🚀 Start Training**.
+
+[MOSS-Image](https://github.com/OpenMOSS/MOSS-Image) is a 5B diffusion transformer with a Qwen3.5-9B text encoder and the FLUX.2 VAE. Choose **MOSS-Image** under *Model to train a LoRA for*; the page then shows that model's own paths, memory options and preview settings. Everything else works as for Anima: the dataset tools, Pause, Halt & Save, Resume Run, Train More, the checkpoint grid and the loss chart. The two models share nothing, so a dataset folder can be trained on both; each keeps its own cache files.
+
+**Model files.** The pre-quantized ConvRot INT8 files from [Comfy-Org/MOSS-Image](https://huggingface.co/Comfy-Org/MOSS-Image) are the defaults: they are the smallest downloads and need the least memory.
+
+| What | File | Put it in | Where it is in the Comfy-Org repository |
+|---|---|---|---|
+| DiT (INT8, 5.41 GB) | `moss_image_base_int8_convrot.safetensors` | `models/moss_image/dit/` | `diffusion_models/` |
+| Text encoder (INT8, 7.34 GB) | `qwen3.5_9b_int8_convrot.safetensors` | `models/moss_image/text_encoder/` | `text_encoders/` |
+| VAE (336 MB) | `flux2-vae.safetensors` | `models/moss_image/vae/` | `vae/` |
+
+* Also accepted, as sd-scripts documents them: the bf16 single file `moss_image_base_bf16.safetensors` (10.16 GB), the SFT variants, and the official split files from [OpenMOSS-Team/MOSS-Image-Base](https://huggingface.co/OpenMOSS-Team/MOSS-Image-Base). For split files give the first part (`…-00001-of-00003.safetensors` for the DiT, `model-00001-of-00004.safetensors` for the text encoder); the rest are loaded from the same folder.
+* **Not accepted:** `qwen3.5_9b_w4a8_gptq.safetensors`. sd-scripts can't load it, and the app refuses it.
+* The tokenizer (about 20 MB) is downloaded from Hugging Face the first time a run starts. To train offline, put its files in a folder and set **Tokenizer folder**.
+* MOSS-Image is released under Apache 2.0; read the terms on the model pages.
+
+**Captions.** MOSS-Image was trained on long natural-language captions, so **Caption Source** offers three choices:
+
+| Caption Source | A run reads | An image without it |
+|---|---|---|
+| Natural language (the default) | `<name>.toriigate.txt`, whole, line breaks included | stops the run before it starts |
+| Tags | the first line of `<name>.txt`, as Anima does | stops the run before it starts |
+| Both | both files: two captions per image, one picked at random at every step | trains on the one it has; the log lists those images |
+
+* The trigger word is added to each caption that doesn't contain it yet, so no caption gets it twice. In sentences it's matched as a whole word, in any letter case; in tags, as a tag.
+* With *Both*, each caption is encoded and cached, so caching takes twice as long and twice the disk space.
+* Editing a caption, or switching the Caption Source, re-encodes just the captions that changed. ↩ Resume Run and ➕ Train More read the captions as they are when you press the button.
+* The captions a run used are in its folder: `configs/<keyword>_metadata.json`.
+
+**Memory.** sd-scripts' own measurements, at 1024×1024, batch size 1, rank 16, on Windows ([its guide](training/sd-scripts/docs/moss_image_train_network.md) has the full table):
+
+| DiT | Text encoder | Block Swap | VRAM while caching captions | VRAM while training | System RAM |
+|---|---|---|---|---|---|
+| bf16 | bf16 | 0 | 15.3 GB | 13.2 GB | 17.2 GB |
+| INT8 | INT8 | 0 | 9.1 GB | 9.1 GB | 9.9 GB |
+| INT8 | INT8 | 20 | 7.9 GB | 6.9 GB | 14.0 GB |
+| INT8 | INT8 | 36 | 7.9 GB | 5.2 GB | 15.6 GB |
+
+* **The defaults are the third row** (INT8 for both, Block Swap 20), which leaves room on an 11 or 12 GB card on paper. sd-scripts measured these on an RTX PRO 6000; on another card, watch the first run.
+* **ConvRot INT8 DiT / text encoder:** quantizes a bf16 file while loading. For the pre-quantized files the boxes change nothing, because sd-scripts detects those files itself.
+* **INT8 needs Triton to run at full speed.** Run **`Install_Triton_for_MOSS.bat`** once, after `Install_Requirements.bat`. It installs the `triton-windows` version your PyTorch names, then compiles and runs one of sd-scripts' INT8 kernels on your GPU and tells you whether that worked. Without Triton, INT8 still saves the VRAM but runs through a fallback that sd-scripts describes as slower than bf16. The app's log warns at the start of a run when Triton isn't installed.
+* **Block Swap** keeps that many of the 42 DiT blocks in system RAM (at most 40). **H2D-only** is sd-scripts' faster variant for LoRA training; it uses slightly more VRAM for the same count.
+* **Text Encoder Block Swap** streams that many of the text encoder's 32 layers from RAM while captions are cached, for cards the caching step doesn't fit on. sd-scripts gives about 5 GB at 28 and 3.5 GB at 32 for the bf16 text encoder, and 2.2 GB at 32 with INT8. It's slower, and only matters during caching.
+* On Windows the page file has to be large enough: sd-scripts notes a commit charge of up to about 38 GB for its bf16 runs.
+
+**Training settings.**
+* Rank, alpha, learning rate, optimizer, steps and batch size are the same controls as for Anima, with the values you last set. They aren't changed when you switch model.
+* The example in sd-scripts' MOSS-Image guide uses rank 16, AdamW8bit at 1e-4 with a constant schedule and alpha 1. In this app an alpha of 0 means "same as rank", which scales the LoRA 16 times stronger than alpha 1 at rank 16, so that learning rate doesn't carry over unchanged. Prodigy picks its own step size.
+* Fixed for MOSS-Image runs: the timestep distribution of the model's own pre-training (`truncated_logit_normal`, mean -1.09, std 0.95), bf16 mixed precision, gradient checkpointing, DiT-only training with the text encoder frozen (the model authors' recommendation), caption dropout 5%.
+
+**Previews.** MOSS-Image has its own Negative Prompt, Steps and CFG, starting at the official pipeline's defaults: empty, 50 and 3. Width, height, seed and the prompts are shared with Anima. Fifty steps per preview is slow with block swap; lower Steps or raise *Preview Every n Steps* if previews hold the run up.
+
+**Using the LoRA.** sd-scripts states that ComfyUI loads these LoRAs with its standard LoRA loader, no conversion needed, in a ComfyUI version that supports MOSS-Image.
 
 ### Choose the best checkpoint
 * **Preview Prompts:** write one prompt per line. Each is rendered at every preview step, with the trigger word added.
@@ -205,8 +273,13 @@ training/output/<keyword>/<YYYYmmdd_HHMMSS>/   one folder per run
 ## Status
 
 * **Tested:** the fork's changes are covered by the test suite in [`tests/`](tests/README.md). It runs the real app on Python 3.10, the bundled version, end to end through its API, with a stand-in trainer that mimics the real one's files and output. No GPU is needed.
+* **Tested against sd-scripts' real code, without a GPU:** the configs the app writes for both models are read by the real trainers' option parsers, the MOSS-Image trainer's own start-up checks run on the app's dataset, and the real caching code runs with stand-in encoders.
 * **Browser-tested:** the interface has been exercised in headless Chromium. That covers switching tabs mid-run, the loss chart updating, previews, and settings surviving a page refresh.
 * **Not yet confirmed:**
+  * **A real MOSS-Image training run.** Nothing in 1.14 has been run on a GPU: not loading the models, not the INT8 kernels, not the memory figures above, not a finished LoRA.
+  * **Anima on the updated sd-scripts (v0.13.1) on a real GPU.** 1.14 replaces the trainer under Anima too. Keep your 1.13 folder until a 1.14 Anima run has worked for you.
+  * `Install_Triton_for_MOSS.bat` on Windows, and Triton with the bundled embedded Python.
+  * RTX 20-series cards: speed of bf16 mixed precision and of the INT8 kernels. sd-scripts publishes no measurements for them.
   * On a real GPU: halt/resume through the bundled trainer (including the 1.9 fix for resuming with gradient accumulation), and block swap's VRAM savings.
   * On Windows: training surviving a closed console window.
   * The ToriiGate captioner with the real model on a GPU. Its llama.cpp handling was tested with a tiny model of the same architecture on the CPU.
@@ -214,10 +287,11 @@ training/output/<keyword>/<YYYYmmdd_HHMMSS>/   one folder per run
 See *Known limitations* in [CHANGELOG.md](CHANGELOG.md), and please open an issue if something misbehaves.
 
 ## Technical details
-* **Core:** a modified `sd-scripts` for the Anima architecture. This fork adds a halt-request hook, fixes resuming with gradient accumulation (the step count, and the epoch it resumes in), removes Halt & Save resume points once they're superseded, puts the caption prefix (trigger word) into cached text-encoder outputs, and re-encodes cached captions and latents when the caption or image changed.
-* **UI:** Gradio 6.17.3 (the newest release compatible with sd-scripts' pinned `huggingface-hub==0.34.3`). The trainer runs as a separate process launched with `accelerate launch`, and the UI follows its log file.
+* **Core:** kohya-ss `sd-scripts` v0.13.1 with this fork's patches, each marked `[TrainFlow]` in the source: a halt-request hook, resuming with gradient accumulation fixed (the step count, and the epoch it resumes in), Halt & Save resume points removed once they're superseded, cached Anima captions and cached latents of both models encoded again when the caption or image changed, and caches kept in `cache_text_encoder/` and `latent_cache/`. `anima_train_network.py` trains Anima and `moss_image_train_network.py` MOSS-Image; both run the same patched `train_network.py`.
+* **UI:** Gradio 6.17.3, kept at that version because of the tab-switching freeze fixed in 1.2.1. The trainer runs as a separate process launched with `accelerate launch`, and the UI follows its log file.
 * **Defaults:** BF16, latent and text-encoder caching, and the Prodigy optimizer with a constant learning rate; AdamW uses a cosine schedule.
+* **MOSS-Image datasets** are sd-scripts metadata datasets: the app writes the captions of a run into a JSON file, which is how one image can carry two captions.
 * **Settings** are auto-saved to `training/settings.json`.
 
 ## Credits & license
-Anima TrainFlow was created by **ThetaCursed** ([upstream repository](https://github.com/ThetaCursed/Anima-TrainFlow)). This fork's changes are released under the same [MIT License](LICENSE). Anima model weights are © CircleStone Labs under their own license. The bundled `sd-scripts` is by kohya-ss. The captioner's `prompts.py` is ToriiGate 0.5's own, by Minthy (MIT); see [its third-party notes](tools/toriigate-captioner/THIRD_PARTY.md).
+Anima TrainFlow was created by **ThetaCursed** ([upstream repository](https://github.com/ThetaCursed/Anima-TrainFlow)). This fork's changes are released under the same [MIT License](LICENSE). Anima model weights are © CircleStone Labs under their own license. MOSS-Image is by OpenMOSS (Apache 2.0). The bundled `sd-scripts` is by kohya-ss. The captioner's `prompts.py` is ToriiGate 0.5's own, by Minthy (MIT); see [its third-party notes](tools/toriigate-captioner/THIRD_PARTY.md).
