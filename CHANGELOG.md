@@ -3,6 +3,42 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14] - 2026-11-16
+
+### Added
+- **ToriiGate captioner: your own prompt.** A new **Prompt** section in the web UI lets you edit the prompt sent to the model, and its system prompt. Empty boxes use the model's own.
+  - **📋 Load the model's prompt for this format** fills both boxes with the model's prompts, ready to edit. **↺ Use the model's own** empties them.
+  - **Placeholders:** in the prompt, `{tags}` and `{characters}` are replaced for each image by its tag-hints section and its character-names section, written exactly as the model's `prompts.py` writes them. Leave one out and that part isn't sent; a note says so before a run. Other braces, such as a JSON example, are left as they are.
+  - **Unchanged:** a loaded prompt with no edits fills in to exactly what `prompts.py` makes.
+  - **The log:** `toriigate_captions.log` and 🔍 Try one image note `(custom prompt)` and `(custom system prompt)`. The prompts are saved with the other settings.
+  - **Command line:**
+    - `--show-prompt` prints the model's prompt for `--format` as a template, plus its system prompt.
+    - `--prompt-file` and `--system-prompt-file` use edited copies. Files saved by Notepad, with a BOM or CRLF line endings, work.
+  - **A caution, from the model card:** "deviating from [the prompts] is highly discouraged", and abilities other than captioning were trained away. Check edits on a few images first.
+
+### Tests
+- `test_toriigate_captioner.py`:
+  - **Unchanged template:** fills in byte for byte to the official prompt in 3,360 cases. Those cover every format, names mode and tag style, with and without tags and typed names, across every fixture image.
+  - **Edits:** an edit keeps that image's own sections.
+  - **Placeholders:** they can go in any order or be left out, with the notes before a run. Other braces stay untouched.
+  - **Names:** a names-only format still asks the model to recognise characters.
+  - **Folder run:** both prompts reach the server, and the log notes them.
+  - **UI functions:** load and clear.
+  - **Command line:** `--show-prompt`, prompt files with a BOM and CRLF, and a missing file.
+- `e2e/test_captioner_ui.py` drives the running UI through its API:
+  - load a prompt, edit it and try one image; the server receives the edited prompt with the image's tags and names
+  - the log line
+  - the settings file
+  - clear
+
+### Verified
+- `tests/run_all.py` on Linux with Python 3.11:
+  - 17 of 18 scripts pass, including `test_toriigate_captioner.py` (81 checks) and `e2e/test_captioner_ui.py` (24).
+  - `e2e/test_e2e.py` fails the same two timing checks it fails on 1.13, unchanged here (`app.py` isn't touched).
+- **Not yet confirmed:**
+  - how well the real model follows edited prompts; it hasn't been run on a GPU here
+  - on Windows
+
 ## [1.13] - 2026-11-14
 
 ### Fixed

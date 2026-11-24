@@ -10,6 +10,11 @@ from tags embedded by Grabber (character:/artist:/copyright: namespaces tell whi
 image's tag caption (.txt), and/or names you type in. Captions are written next to each image as
 <name>.toriigate.txt; the tag captions (.txt) are never touched.
 
+The prompt can be replaced with your own: a template in which {tags} and {characters} stand for the image's tag
+section and character section exactly as prompts.py writes them. The model's own prompt for a format, as a template,
+is default_template(format); filled in, it is byte for byte what prompts.py makes. The system prompt can be replaced
+too. The model card discourages changing the prompts, so check an edit on a few images first.
+
 Command line:  python toriigate_captioner.py <folder> [options]      (python toriigate_captioner.py --help)
 Web UI:        python captioner_ui.py
 """
@@ -63,7 +68,7 @@ try:
 except ImportError:
     pass
 
-VERSION = "1.0"
+VERSION = "1.1"
 # --- llama.cpp: a pinned release (its flags are what this file uses), Windows CUDA 12.4 build (runs on Turing+)
 LLAMA_CPP_TAG = "b12211"
 LLAMA_CPP_ASSETS = (f"llama-{LLAMA_CPP_TAG}-bin-win-cuda-12.4-x64.zip", "cudart-llama-bin-win-cuda-12.4-x64.zip")
@@ -101,6 +106,11 @@ NAMES_MODES = {
     "recognize": "use the names given or found; otherwise let the model recognise characters",
     "none": "never name characters",
 }
+# Custom prompts: placeholders for the per-image parts of prompts.make_user_query's output
+TAGS_SLOT, CHARS_SLOT = "{tags}", "{characters}"
+_SLOTS = re.compile(r"\{tags\}|\{characters\}")
+_FORMAT_HEAD = "# Captioning format:\n"
+_CHARS_HEAD = "# Characters on picture:"
 _THINK = re.compile(r"<think>.*?</think>\s*", re.S)
 _SCORE_TAG = re.compile(r"^score_\d+(?:_up)?$", re.I)
 
@@ -126,6 +136,8 @@ class Options:
     max_tokens: int = MAX_TOKENS
     seed: int = -1                # -1: random each time
     timeout: float = 600.0
+    prompt: str = ""              # your own prompt template ({tags}, {characters}); empty: the model's own
+    system_prompt: str = ""       # empty: the model's own
 
 
 @dataclass
@@ -228,9 +240,43 @@ def name_settings(item: dict, opts: Options) -> Tuple[bool, bool, str]:
     return False, False, ""
 
 
+def default_template(fmt: str) -> str:
+    """The model's own prompt for a format, with its per-image parts as {tags} and {characters}."""
+    return _FORMAT_HEAD + tg.prompts_b[fmt] + "\n" + TAGS_SLOT + CHARS_SLOT
+
+
+def prompt_sections(query: str, fmt: str) -> Tuple[str, str]:
+    """Split prompts.make_user_query's output into (tag section, character section), as written. The first is ''
+    when no tags were sent; the second is always there (it also says when names aren't to be guessed)."""
+    head = _FORMAT_HEAD + tg.prompts_b[fmt] + "\n"
+    if not query.startswith(head) or _CHARS_HEAD not in query:
+        raise CaptionError("prompts.py's output isn't laid out as expected; is prompts.py the official file?")
+    rest = query[len(head):]
+    i = rest.index(_CHARS_HEAD)
+    return rest[:i], rest[i:]
+
+
+def custom_prompt_label(opts: Options) -> str:
+    parts = [n for n, v in (("custom prompt", opts.prompt), ("custom system prompt", opts.system_prompt)) if v.strip()]
+    return f" ({' + '.join(parts)})" if parts else ""
+
+
+def prompt_warnings(opts: Options) -> List[str]:
+    """Things about a custom prompt worth saying once before a run."""
+    if not opts.prompt.strip():
+        return []
+    out = []
+    if TAGS_SLOT not in opts.prompt and opts.use_tags:
+        out.append(f"ℹ️ Your prompt has no {TAGS_SLOT}: the images' tags aren't sent.")
+    if CHARS_SLOT not in opts.prompt:
+        out.append(f"ℹ️ Your prompt has no {CHARS_SLOT}: character names (and 'don't guess names') aren't sent.")
+    return out
+
+
 def build_query(item: dict, opts: Options, key: str = "") -> Tuple[str, str]:
     """(user prompt, note). prompts.make_user_query shuffles the tags; seeding by the image's name keeps the prompt
-    for an image the same from run to run."""
+    for an image the same from run to run. With a custom prompt, its {tags} and {characters} are replaced by the
+    sections prompts.py wrote for this image."""
     if opts.format not in tg.prompts_b:
         raise CaptionError(f"unknown format '{opts.format}' (choose from: {', '.join(FORMATS)})")
     use_names, add_chars, note = name_settings(item, opts)
@@ -241,6 +287,9 @@ def build_query(item: dict, opts: Options, key: str = "") -> Tuple[str, str]:
                                    add_chars, False, False, underscores_replace=(opts.tag_style != "booru"))
     finally:
         random.setstate(state)
+    if opts.prompt.strip():
+        sections = dict(zip((TAGS_SLOT, CHARS_SLOT), prompt_sections(query, opts.format)))
+        query = _SLOTS.sub(lambda m: sections[m.group(0)], opts.prompt)
     return query, note
 
 
@@ -267,7 +316,8 @@ def request_caption(client: httpx.Client, base_url: str, image_b64: str, query: 
     payload = {
         "model": "toriigate",
         "messages": [
-            {"role": "system", "content": [{"type": "text", "text": tg.system_prompt}]},
+            {"role": "system", "content": [{"type": "text", "text": opts.system_prompt if opts.system_prompt.strip()
+                                                                    else tg.system_prompt}]},
             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
                                          {"type": "text", "text": query}]},
         ],
@@ -565,6 +615,8 @@ class Session:
                  + (f", {skipped} already have {NL_CAPTION_SUFFIX} (overwrite is off)" if skipped else ""))
         if not todo:
             return summary
+        for w in prompt_warnings(opts):
+            self.log(w)
         stop_event = stop_event or threading.Event()
         self.prepare(stop_event)
         index = EmbeddedTagIndex(folder) if EmbeddedTagIndex is not None else None
@@ -592,7 +644,7 @@ class Session:
             summary["captioned"] += 1
             tokens = res["usage"].get("completion_tokens")
             warn = " ⚠️ hit the token limit (caption may be cut off)" if res["finish_reason"] == "length" else ""
-            self._append_log(log_file, f"{image.name}  {opts.format}  {res['seconds']:.1f}s"
+            self._append_log(log_file, f"{image.name}  {opts.format}{custom_prompt_label(opts)}  {res['seconds']:.1f}s"
                              + (f"  {tokens} tokens" if tokens else "") + f"  hints: {res['source'] or 'none'}"
                              + (f"  ({res['note']})" if res["note"] else "") + warn)
             elapsed = time.time() - t_start
@@ -637,6 +689,13 @@ def parse_args(argv=None):
     g.add_argument("--max-tokens", type=int, default=MAX_TOKENS)
     g.add_argument("--seed", type=int, default=-1)
     g.add_argument("--dry-run", action="store_true", help="print the prompt for each image; load nothing")
+    p = ap.add_argument_group("your own prompt (the model card discourages changing it: try a few images first)")
+    p.add_argument("--show-prompt", action="store_true",
+                   help="print the model's own prompt for --format as a template, and its system prompt, then exit")
+    p.add_argument("--prompt-file", default="",
+                   help=f"use this prompt template instead: {TAGS_SLOT} and {CHARS_SLOT} are replaced by each "
+                        "image's tag and character sections (start from --show-prompt)")
+    p.add_argument("--system-prompt-file", default="", help="use this system prompt instead of the model's own")
     s = ap.add_argument_group("model and server")
     s.add_argument("--server-url", default="", help="use an already running llama-server (or compatible) at this URL")
     s.add_argument("--llama-server", default="", help="path to llama-server to run (default: download llama.cpp on Windows)")
@@ -657,9 +716,18 @@ def main(argv=None) -> int:
         except (AttributeError, ValueError):
             pass
     a = parse_args(argv)
+    if a.show_prompt:
+        print(f"===== prompt template ({a.format})\n{default_template(a.format)}\n===== system prompt\n{tg.system_prompt}")
+        return 0
+    try:
+        prompt, system = (Path(f).read_text(encoding="utf-8-sig") if f else ""
+                          for f in (a.prompt_file, a.system_prompt_file))
+    except OSError as e:
+        print(f"can't read {e.filename}: {e.strerror}")
+        return 2
     opts = Options(format=a.format, names=a.names, characters=a.characters, use_tags=not a.no_tags,
                    tag_style=a.tag_style, include_artists=a.include_artists, overwrite=a.overwrite,
-                   temperature=a.temperature, max_tokens=a.max_tokens, seed=a.seed)
+                   temperature=a.temperature, max_tokens=a.max_tokens, seed=a.seed, prompt=prompt, system_prompt=system)
     cfg = ServerConfig(mode="external" if a.server_url else ("local" if a.llama_server else "auto"),
                        llama_server=a.llama_server, url=a.server_url, repo=a.repo, model=a.model, mmproj=a.mmproj,
                        gpu_layers=a.gpu_layers, ctx=a.ctx)
@@ -693,6 +761,10 @@ def main(argv=None) -> int:
             print(f"not a folder: {folder}")
             return 2
         if a.dry_run:
+            for w in prompt_warnings(opts):
+                print(w)
+            if opts.system_prompt.strip():
+                print(f"===== system prompt\n{opts.system_prompt}")
             index = EmbeddedTagIndex(folder) if EmbeddedTagIndex is not None else None
             for image in list_images(folder)[: a.limit or None]:
                 item, source = grounding(image, index, opts)

@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.13** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.14** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.13) |
+| | Upstream (v1.1.0) | This fork (1.14) |
 |---|---|---|
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
 | **Closing or restarting the app during training** | Training ends | Training carries on; the restarted app reattaches to it |
@@ -156,6 +156,7 @@ The tools run in the background; their progress shows in the log.
 `start_captioner.bat` opens a separate captioner that writes a natural-language caption for every image with [ToriiGate 0.5](https://huggingface.co/Minthy/ToriiGate-0.5).
 * It runs the model in llama.cpp. Both are downloaded on first use: about 5.2 GB for the model.
 * The image's Grabber tags or tag caption are passed to the model as hints, so characters get their right names.
+* The prompt can be edited, starting from the model's own. Each image's tags and names are still filled in.
 * Each caption is saved as `<name>.toriigate.txt`; your tag captions aren't touched. The dataset tools above treat it as part of its image.
 * **Training doesn't use these captions yet:** it reads only `<name>.txt`.
 * There's a command line too. Details are in [tools/toriigate-captioner/README.md](tools/toriigate-captioner/README.md).

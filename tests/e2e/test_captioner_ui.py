@@ -100,8 +100,9 @@ try:
     cfg = client.cfg
     check("captioner UI is up", ui_proc.poll() is None and "dependencies" in cfg)
     apis = {d.get("api_name") for d in cfg["dependencies"]}
-    check("API: start, try_one, download, stop, unload, list_files, poll",
-          {"start", "try_one", "download", "stop", "unload", "list_files", "poll"} <= apis, sorted(a for a in apis if a))
+    check("API: start, try_one, download, stop, unload, list_files, load_prompt, clear_prompt, poll",
+          {"start", "try_one", "download", "stop", "unload", "list_files", "load_prompt", "clear_prompt", "poll"} <= apis,
+          sorted(a for a in apis if a))
 
     srv, url = fake_server()
     try:
@@ -126,6 +127,25 @@ try:
         p = wait_idle(client)
         check("…with no name: the first image without a caption", "🔍 a03.jpg" in p["log"], p["log"][-200:])
         (DS / "a03.toriigate.txt").write_text(before, encoding="utf-8")
+        tc = captioner_ui.tc
+        _, out = client.call("load_prompt", ["long"])
+        check("📋 Load: the model's prompt for the chosen format, and its system prompt",
+              out[0] == tc.default_template("long") and out[1] == tc.tg.system_prompt, out)
+        mine = out[0].replace("vivid", "vivid and calm") + "\nMention the lighting.\n"
+        client.call("try_one", values(mode="external", url=url, try_image="a03.jpg", format="long", prompt=mine,
+                                      system_prompt="You are terse."))
+        p = wait_idle(client)
+        sent = json.loads((WORK / f"requests_{url.rsplit(':', 1)[1]}.jsonl").read_text(encoding="utf-8").splitlines()[-1])
+        check("🔍 Try one image with your own prompts: sent as edited, with the image's tags and names filled in",
+              sent["query"] == p["query"] and "vivid and calm" in sent["query"] and "Mention the lighting." in sent["query"]
+              and "[hatsune miku]" in sent["query"] and "{tags}" not in sent["query"] and sent["system"] == "You are terse.",
+              sent["query"][-300:])
+        check("…the log line says a custom prompt was used",
+              "custom prompt + custom system prompt) — not saved" in p["log"].splitlines()[-1], p["log"].splitlines()[-1])
+        check("…and the prompts are saved with the settings",
+              json.loads(SETTINGS.read_text(encoding="utf-8"))["prompt"] == mine)
+        _, out = client.call("clear_prompt", [])
+        check("↺ Use the model's own: both boxes emptied", list(out[:2]) == ["", ""], out)
         client.call("try_one", values(mode="external", url=url, try_image="nope.png"))
         time.sleep(0.5)
         check("…an image that isn't there is reported", "nope.png isn't an image in this folder" in poll(client)["log"])
