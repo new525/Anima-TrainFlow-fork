@@ -223,6 +223,9 @@ try:
     client = start_ui()
     comp = {c.get("props", {}).get("label"): c.get("props", {}).get("value") for c in client.cfg["components"]}
     check("settings come back after a restart", comp.get("Image folder") == str(DS), comp.get("Image folder"))
+    console = (WORK / "ui.log").read_text(encoding="utf-8", errors="replace")
+    check("the console isn't filled with Gradio's status-code deprecation warning (one per button press before 1.15)",
+          "HTTP_422_UNPROCESSABLE_ENTITY" not in console, console.count("HTTP_422_UNPROCESSABLE_ENTITY"))
 finally:
     if ui_proc is not None:
         ui_proc.kill()

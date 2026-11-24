@@ -28,11 +28,15 @@ The ToriiGate captioner explains `hints: none`, and `Install_Triton_for_MOSS.bat
   - **What you saw:** the message even after running `Install_Requirements.bat`.
   - **Fix:** each case has its own message. It names the Python that was used and its packages folder, and shows the real error when PyTorch won't load. A missing package record no longer stops it when PyTorch itself loads.
   - Which of the cases a given machine is in isn't known from here; the new output is what tells.
+- **The console filled up with `StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated`.**
+  - **Cause:** Gradio 6.17.3 looks that status-code name up on every button press, and the Starlette installed beside it has renamed it. The warning says nothing about the request.
+  - **Fix:** the trainer app and the captioner filter that one warning. Other warnings still show.
 - **The 1.14 entry below was missing its MOSS-Image half.** Two changes were both written up as 1.14, and merging them kept only the captioner's prompt editor. The entry now covers both, as the 1.14 tag does.
 
 ### Tests
 - `test_toriigate_captioner.py` (17 new checks): compressed XMP in a PNG; the explanation for an image with no metadata, with an original, and with metadata in other fields; the hint report's counts and groups; the advice for a folder with no metadata, and its absence for a tagged one; the warning and the closing count in a folder run; `--check-hints` and `--dry-run`.
 - `e2e/test_captioner_ui.py`: the 🔎 Check hints button through the UI's API, with no server set up.
+- `e2e/test_e2e.py` and `e2e/test_captioner_ui.py`: the server's console output doesn't contain the status-code warning. Before the fix it appeared 42 times in one captioner test run.
 - **New, `test_install_triton.py`** (8 checks): the Triton version taken from PyTorch's requirement line, and the message for each way PyTorch can be unusable.
 
 ### Verified

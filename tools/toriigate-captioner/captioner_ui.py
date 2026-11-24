@@ -9,11 +9,15 @@ import os
 import sys
 import threading
 import time
+import warnings
 from dataclasses import asdict, fields
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))   # the portable Python's ._pth leaves this folder off sys.path
 import toriigate_captioner as tc  # noqa: E402  (puts the TrainFlow folder on sys.path too, for embedded_tags)
+# Gradio 6.17.3 looks up a status-code name that newer Starlette has renamed, on every button press, and Starlette
+# prints a deprecation warning each time. It says nothing about the request; keep it out of the console.
+warnings.filterwarnings("ignore", message=r"'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated")
 import gradio as gr  # noqa: E402
 from PIL import Image  # noqa: E402
 

@@ -8,8 +8,12 @@ import glob
 import math
 from pathlib import Path
 import sys
+import warnings
 # The portable Python's ._pth file keeps the script's folder off sys.path; shared modules live next to app.py.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Gradio 6.17.3 looks up a status-code name that newer Starlette has renamed, on every button press, and Starlette
+# prints a deprecation warning each time. It says nothing about the request; keep it out of the console.
+warnings.filterwarnings("ignore", message=r"'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated")
 import gradio as gr
 import psutil
 from PIL import Image, ImageOps
