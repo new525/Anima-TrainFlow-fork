@@ -351,5 +351,65 @@ check("an Anima run on the same folder adds its own cache files next to MOSS-Ima
 check("the dataset folder itself holds only images and captions (caches are in the two subfolders)",
       not list(ds.glob("*.npz")), [p_.name for p_ in ds.glob("*.npz")])
 
+# --- ConvRot INT8 without the Triton kernels: what a GPU older than the RTX 30 series trains with --------------------
+import logging  # noqa: E402
+
+from library import convrot_int8_kernels as ck  # noqa: E402
+from library import convrot_int8_utils as cu  # noqa: E402
+
+check("the Triton kernels are for compute capability 8.0 and newer: a 2080 Ti (7.5) is given the reason, newer GPUs none",
+      "7.5" in (ck.triton_capability_problem((7, 5)) or "") and "RTX 30" in ck.triton_capability_problem((7, 5))
+      and [ck.triton_capability_problem(c) for c in ((8, 0), (8, 6), (8, 9), (12, 0))] == [None] * 4, ck.triton_capability_problem((7, 5)))
+check("without a GPU the kernels are off and their entry points are absent", ck.HAS_TRITON is False and ck.int8_linear is None)
+
+
+class Heard(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+heard = Heard()
+cu.logger.addHandler(heard)
+saved_reason = cu.TRITON_UNUSABLE_REASON
+try:
+    cu.TRITON_UNUSABLE_REASON = None
+    cu._validate_convrot_bwd_mode("bf16")
+    plain = list(heard.lines)
+    del heard.lines[:]
+    cu.TRITON_UNUSABLE_REASON = ck.triton_capability_problem((7, 5))
+    cu._validate_convrot_bwd_mode("bf16")
+    old_gpu = list(heard.lines)
+    try:
+        cu._validate_convrot_bwd_mode("int8")
+        refused = ""
+    except ValueError as e:
+        refused = str(e)
+finally:
+    cu.TRITON_UNUSABLE_REASON = saved_reason
+    cu.logger.removeHandler(heard)
+check("no Triton: the log suggests installing it", len(plain) == 1 and "Install triton" in plain[0], plain)
+check("Triton there but the GPU too old: the log gives that reason and doesn't suggest installing anything",
+      len(old_gpu) == 1 and "compute capability is 7.5" in old_gpu[0] and "Install" not in old_gpu[0] and "falls back" in old_gpu[0], old_gpu)
+check("…and the INT8 backward mode is refused for the same reason", "7.5" in refused and "Install" not in refused, refused)
+
+torch.manual_seed(0)
+lin_w = torch.randn(48, 256) * 0.05
+lin_x = torch.randn(2, 5, 256)
+wq, w_scale = ck.quantize_int8_convrot_weight(lin_w, 256)
+got = cu.convrot_int8_linear(lin_x, wq, w_scale, None, 256, True, "bf16")
+want = torch.nn.functional.linear(lin_x, lin_w)
+rel = ((got - want).norm() / want.norm()).item()
+check("the route such a GPU takes computes the layer from the INT8 weight (within quantization error of the original)",
+      wq.dtype == torch.int8 and got.shape == want.shape and rel < 0.05, rel)
+lin_x.requires_grad_(True)
+cu.convrot_int8_linear(lin_x, wq, w_scale, None, 256, True, "bf16").sum().backward()
+want_grad = lin_w.sum(0).expand_as(lin_x)
+rel_g = ((lin_x.grad - want_grad).norm() / want_grad.norm()).item()
+check("…and its backward pass gives the gradient the original layer would", rel_g < 0.05, rel_g)
+
 shutil.rmtree(root, ignore_errors=True)
 finish()

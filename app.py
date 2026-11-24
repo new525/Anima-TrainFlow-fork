@@ -3286,7 +3286,7 @@ def start_training(trigger_word, dataset_path, dit_p, qwen_p, vae_p, rank, lr, o
                        + (" (pre-quantized file)" if is_convrot_int8_file(moss_te_p) else " (quantized while loading)" if te_int8 else ""))
         if (dit_int8 or te_int8) and importlib.util.find_spec("triton") is None:
             console.append("⚠️ Triton isn't installed in this Python: ConvRot INT8 still saves VRAM but runs through sd-scripts' slower "
-                           "fallback. Install_Triton_for_MOSS.bat installs it.")
+                           "fallback. On an RTX 30 series or newer card, Install_Triton_for_MOSS.bat installs it; older cards can't use it.")
         if int(blocks_to_swap or 0) > 0:
             console.append(f"🧊 Block swap: {int(blocks_to_swap)} of 42 blocks kept in system RAM (less VRAM, slower steps)"
                            + (", H2D-only." if moss_h2d_only else "."))
