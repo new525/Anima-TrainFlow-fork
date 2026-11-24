@@ -34,6 +34,38 @@ def triton_spec_of_torch(requirements):
     return None
 
 
+def this_python() -> str:
+    """Which Python is running and how many packages it has, so "not installed" can be told from "wrong folder"."""
+    import site
+    try:
+        folders = site.getsitepackages()
+    except Exception:  # noqa: BLE001
+        folders = []
+    count = sum(1 for f in folders if Path(f).is_dir() for d in Path(f).iterdir() if d.name.endswith(".dist-info"))
+    return (f"  This Python:     {sys.executable}\n"
+            f"  Its packages:    {', '.join(folders) or '(none found)'}  ({count} installed)")
+
+
+def load_torch():
+    """Import PyTorch and say what really happened: (module, None) or (None, message). "Not installed", "installed
+    but one of its own imports is missing" and "installed but it won't load" (a DLL, usually) are different problems
+    with different fixes, and only the first is solved by Install_Requirements.bat."""
+    try:
+        import torch
+        return torch, None
+    except ModuleNotFoundError as e:
+        if e.name == "torch":
+            return None, ("PyTorch isn't installed in the Python this script runs with.\n" + this_python() + "\n"
+                          "  Install_Requirements.bat installs it into python_embeded next to this folder's app.py. If you ran it,\n"
+                          "  check that it was the one in this same folder, and that its step [1/3] ended without an error.")
+        return None, (f"PyTorch is installed, but a package it needs is missing: {e.name}\n" + this_python() + "\n"
+                      "  Re-running Install_Requirements.bat should bring it back; if step [2/3] ends in an error, that error is the cause.")
+    except Exception as e:  # noqa: BLE001  (ImportError: DLL load failed…, OSError: [WinError 126]…)
+        return None, (f"PyTorch is installed but won't load:\n  {type(e).__name__}: {e}\n" + this_python() + "\n"
+                      "  This is not fixed by Install_Requirements.bat. A DLL error usually means the Microsoft Visual C++\n"
+                      "  Redistributable is missing or the NVIDIA driver is too old for this PyTorch build. Does start_trainer.bat open the app?")
+
+
 def install(spec):
     package = f"triton-windows{spec}"
     print(f"Installing {package} ...", flush=True)
@@ -42,12 +74,11 @@ def install(spec):
 
 def check():
     """Ask sd-scripts itself: does its ConvRot INT8 module find a usable Triton, and does a kernel compile and run?"""
-    sys.path.insert(0, str(SD_SCRIPTS))
-    try:
-        import torch
-    except ImportError:
-        print("PyTorch isn't installed in this Python yet: run Install_Requirements.bat first.")
+    torch, problem = load_torch()
+    if torch is None:
+        print(problem)
         return False
+    sys.path.insert(0, str(SD_SCRIPTS))   # after PyTorch is loaded: nothing in sd-scripts can stand in for its imports
     try:
         from library import convrot_int8_kernels as kernels
     except Exception as e:  # noqa: BLE001
@@ -87,10 +118,16 @@ def main():
     if not a.check_only:
         try:
             torch_version = importlib.metadata.version("torch")
+            requirements = importlib.metadata.requires("torch")
         except importlib.metadata.PackageNotFoundError:
-            print("PyTorch isn't installed in this Python yet: run Install_Requirements.bat first.")
-            return 1
-        spec = a.spec or triton_spec_of_torch(importlib.metadata.requires("torch"))
+            # No package record. That alone doesn't mean PyTorch is missing: ask PyTorch itself.
+            torch, problem = load_torch()
+            if torch is None:
+                print(problem)
+                return 1
+            torch_version, requirements = torch.__version__, []
+            print("(PyTorch loads, but its package record wasn't found, so it can't say which Triton it was built for.)")
+        spec = a.spec or triton_spec_of_torch(requirements)
         print(f"PyTorch {torch_version}" + (f" was built for Triton {spec}" if spec and not a.spec else ""))
         if os.name != "nt":
             print("Not Windows: PyTorch's own installation brings Triton where it supports it. Nothing to install.")

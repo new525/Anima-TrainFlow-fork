@@ -88,6 +88,67 @@ check("falls back to the image's .txt caption (first line; @artist and score tag
       item11["tags"] == ["1girl", "blue sky"] and src11 == "a11.txt", (item11, src11))
 check("query text matches prompts.make_user_query for the same inputs", q.startswith("# Captioning format:\n" + tc.tg.prompts_b["short"]))
 
+# --- when an image has no hints, the tool says what it looked at ----------------------------------------------------------
+from PIL import PngImagePlugin  # noqa: E402
+
+XMP = ('<x:xmpmeta xmlns:x="adobe:ns:meta/"><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">'
+       '<rdf:Description xmlns:dc="http://purl.org/dc/elements/1.1/">{}</rdf:Description></rdf:RDF></x:xmpmeta>')
+SUBJECT = "<dc:subject><rdf:Bag><rdf:li>character:hatsune_miku</rdf:li><rdf:li>general:1girl</rdf:li></rdf:Bag></dc:subject>"
+
+
+def png(path, xmp=None, compressed=False, **text_chunks):
+    info = PngImagePlugin.PngInfo()
+    if xmp is not None:
+        info.add_itxt("XML:com.adobe.xmp", xmp, zip=compressed)
+    for key, text in text_chunks.items():
+        info.add_text(key, text)
+    Image.new("RGB", (64, 64), (len(path.name) * 9 % 255, 60, 90)).save(path, pnginfo=info)
+
+
+nohints = tmpdir()
+png(nohints / "zipped.png", xmp=XMP.format(SUBJECT), compressed=True)
+png(nohints / "described.png", xmp=XMP.format("<dc:description>1girl, hatsune_miku</dc:description>"))
+png(nohints / "generated.png", parameters="masterpiece, 1girl\nSteps: 20")
+png(nohints / "bare.png")
+png(nohints / "captioned.png")
+(nohints / "captioned.txt").write_text("1girl, smile", encoding="utf-8")
+(nohints / "original_images").mkdir()
+png(nohints / "bucketed.png")
+Image.new("RGB", (64, 64)).save(nohints / "original_images" / "bucketed.jpg")
+nindex = tc.EmbeddedTagIndex(nohints)
+item_z, src_z = tc.grounding(nohints / "zipped.png", nindex, tc.Options())
+check("XMP stored compressed inside a PNG is read (the byte scan alone can't see it)",
+      item_z["characters"] == ["hatsune_miku"] and item_z["tags"] == ["1girl"] and src_z == "embedded tags (XMP)", (item_z, src_z))
+why = {f: tc.why_no_hints(nohints / f, nindex) for f in ("bare.png", "described.png", "generated.png", "bucketed.png")}
+check("no hints, no metadata: said so, with the files looked at", "bare.png: no metadata" in why["bare.png"]
+      and "no other file of that name here or in original_images/" in why["bare.png"] and "no .xmp sidecar" in why["bare.png"]
+      and "no bare.txt" in why["bare.png"], why["bare.png"])
+check("…the original in original_images/ is named when there is one", "original_images/bucketed.jpg: no metadata" in why["bucketed.png"], why["bucketed.png"])
+check("no hints, but metadata of another kind: the fields it does have are named",
+      "XMP: dc:description" in why["described.png"] and "PNG text: parameters" in why["generated.png"], (why["described.png"], why["generated.png"]))
+check("…and nothing is read from those fields (a description or generation settings aren't a tag list)",
+      nindex.items_for(nohints / "described.png") == ([], "") and nindex.items_for(nohints / "generated.png") == ([], ""))
+report = "\n".join(tc.hint_report(nohints, tc.Options()))
+check("hint report: counts by where the hints come from", "6 image(s)" in report and "1 from embedded tags, 1 from .txt captions, 4 with none" in report, report.splitlines()[0])
+check("…images without metadata and images with other metadata are listed apart, with what was found",
+      "2 with no metadata at all" in report and "bare.png, bucketed.png" in report and "2 with metadata, but no tags where they are read from" in report
+      and "described.png: XMP: dc:description" in report and "generated.png: PNG text: parameters" in report, report)
+check("…and it says where tags are read from", "XMP Subject/Keywords, IPTC Keywords or Windows keywords" in report)
+untagged = tmpdir()
+for i in range(3):
+    png(untagged / f"{i}.png")
+report_u = "\n".join(tc.hint_report(untagged, tc.Options()))
+check("a folder with no metadata anywhere: the report points at the downloader (exiftool, extension list)",
+      "0 from embedded tags, 0 from .txt captions, 3 with none" in report_u and "exiftool" in report_u and "jpg jpeg png gif mp4" in report_u, report_u)
+check("…a tagged folder gets no such advice", "exiftool" not in "\n".join(tc.hint_report(grabber(), tc.Options())))
+check("names typed in are counted for images that have nothing else", "still get the names you typed in" in "\n".join(tc.hint_report(untagged, tc.Options(characters="mychar"))))
+missing_reader, tc.EmbeddedTagIndex = tc.EmbeddedTagIndex, None
+try:
+    check("without embedded_tags.py (captioner copied out of TrainFlow) the report says tags can't be read",
+          "embedded_tags.py isn't next to the captioner" in "\n".join(tc.hint_report(grabber(), tc.Options())))
+finally:
+    tc.EmbeddedTagIndex = missing_reader
+
 # --- your own prompt -----------------------------------------------------------------------------------------------------
 n = differ = 0
 for fmt in tc.FORMATS:
@@ -223,7 +284,18 @@ try:
     check("grounded prompt reached the server", any("make sure to use them: [hatsune miku]" in q for q in by_q))
     log = (d / tc.LOG_NAME).read_text(encoding="utf-8")
     check("per-image log line with format, time and where the hints came from", "a03.jpg  short" in log and "hints: embedded tags (XMP)" in log, log.splitlines()[0])
-    n_before = len(r)
+    said = "\n".join(e.message for e in events if e.kind == "log")
+    check("the run ends with where the hints came from", summary["hints"] == {"embedded tags": 13, ".txt": 0, "none": 2}
+          and "Tag hints: 13 from embedded tags, 0 from .txt, 2 none." in said, summary.get("hints"))
+    check("…and a tagged folder gets no warning about missing hints", "No tag hints for" not in said)
+    events.clear()
+    summary_u = session.caption_folder(untagged, tc.Options())
+    said_u = [e.message for e in events if e.kind == "log"]
+    check("a folder whose first images have no hints: warned before the first caption, with what the first file carries",
+          summary_u["captioned"] == 3 and any("No tag hints for any of the first 3 images" in m for m in said_u)
+          and any("0.png: no metadata" in m for m in said_u) and summary_u["hints"]["none"] == 3, said_u[:4])
+    events.clear()
+    n_before = len(records(rec))
     summary = session.caption_folder(d, tc.Options())
     check("re-run skips images that already have a caption", summary["captioned"] == 0 and summary["skipped"] == 15 and len(records(rec)) == n_before)
     summary = session.caption_folder(d, tc.Options(overwrite=True, seed=7, format="long", temperature=0.3, max_tokens=300), limit=2)
@@ -394,6 +466,11 @@ r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), str(d)
                    capture_output=True, text=True, encoding="utf-8")
 check("--dry-run prints the prompts without loading anything", r.returncode == 0 and r.stdout.count("=====") == 3
       and "make sure to use them: [mychar]" in r.stdout and not list(d.glob("*.toriigate.txt")), r.stdout[:200] + r.stderr[-300:])
+r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), str(nohints), "--dry-run"], capture_output=True, text=True, encoding="utf-8")
+check("--dry-run says what was looked at for an image with no hints", "bare.png   (hints: none)" in r.stdout and "[bare.png: no metadata" in r.stdout, r.stdout[:300])
+r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), str(nohints), "--check-hints"], capture_output=True, text=True, encoding="utf-8")
+check("--check-hints prints the hint report and loads nothing", r.returncode == 0 and "1 from embedded tags, 1 from .txt captions, 4 with none" in r.stdout
+      and not list(nohints.glob("*.toriigate.txt")), r.stdout[:300] + r.stderr[-300:])
 r = subprocess.run([sys.executable, str(TOOL / "toriigate_captioner.py"), "--show-prompt", "--format", "long"],
                    capture_output=True, text=True, encoding="utf-8")
 check("--show-prompt prints the model's prompt for the format as a template, and the system prompt",

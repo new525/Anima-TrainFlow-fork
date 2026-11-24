@@ -101,8 +101,13 @@ try:
     check("captioner UI is up", ui_proc.poll() is None and "dependencies" in cfg)
     apis = {d.get("api_name") for d in cfg["dependencies"]}
     check("API: start, try_one, download, stop, unload, list_files, load_prompt, clear_prompt, poll",
-          {"start", "try_one", "download", "stop", "unload", "list_files", "load_prompt", "clear_prompt", "poll"} <= apis,
+          {"start", "try_one", "check_hints", "download", "stop", "unload", "list_files", "load_prompt", "clear_prompt", "poll"} <= apis,
           sorted(a for a in apis if a))
+
+    client.call("check_hints", values())
+    p = wait_idle(client)
+    check("🔎 Check hints: reports where the folder's hints come from, with no model or server set up",
+          "🔎 Tag hints for" in p["log"] and "from embedded tags" in p["log"] and "⏳" not in p["status"], p["log"].splitlines()[-6:])
 
     srv, url = fake_server()
     try:

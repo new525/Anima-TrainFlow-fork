@@ -91,11 +91,24 @@ def _iim_keywords(blob: bytes) -> List[str]:
         i = start + n
 
 
+def _pil_xmp_text(im) -> str:
+    """The XMP packet as Pillow decoded it. A PNG may store it compressed (a compressed iTXt chunk), which the byte
+    scan in _xmp_items_from_file can't see; Pillow inflates it."""
+    for key in ("XML:com.adobe.xmp", "xmp"):
+        v = im.info.get(key)
+        if v:
+            return v.decode("utf-8", errors="replace") if isinstance(v, (bytes, bytearray)) else str(v)
+    return ""
+
+
 def _pil_keyword_items(path: Path) -> Tuple[List[str], str]:
-    """IPTC Keywords and EXIF XPKeywords (Windows keywords) through Pillow."""
+    """IPTC Keywords and EXIF XPKeywords (Windows keywords) through Pillow, and XMP stored compressed."""
     from PIL import IptcImagePlugin
     try:
         with Image.open(path) as im:
+            items = _xmp_items_from_text(_pil_xmp_text(im))
+            if any(items):
+                return items, "XMP"
             items: List[str] = []
             if im.format in ("JPEG", "TIFF", "MPO"):
                 info = IptcImagePlugin.getiptcinfo(im) or {}
@@ -115,6 +128,64 @@ def _pil_keyword_items(path: Path) -> Tuple[List[str], str]:
     except Exception:
         pass
     return [], ""
+
+
+_XMP_PROPERTY = re.compile(r"<([A-Za-z][\w.-]*:[A-Za-z][\w.-]*)[\s>/]|\s([A-Za-z][\w.-]*:[A-Za-z][\w.-]*)\s*=")
+_XMP_STRUCTURE = ("x", "rdf", "xml", "xmlns", "xpacket")
+_EXIF_TEXT_TAGS = {0x010E: "ImageDescription", 0x013B: "Artist", 0x9C9B: "XPTitle", 0x9C9C: "XPComment", 0x9C9D: "XPAuthor",
+                   0x9C9E: "XPKeywords", 0x9C9F: "XPSubject"}
+_IPTC_NAMES = {(2, 5): "ObjectName", (2, 25): "Keywords", (2, 80): "By-line", (2, 105): "Headline", (2, 120): "Caption-Abstract"}
+
+
+def metadata_fields(path: Path) -> List[str]:
+    """Which metadata a file carries, by field name, e.g. ["XMP: dc:description, xmp:CreatorTool", "PNG text:
+    parameters"]. Empty when it carries none. Used to say why no tags were read from a file: tags are read from XMP
+    dc:subject / pdf:Keywords, IPTC Keywords and EXIF XPKeywords only."""
+    out: List[str] = []
+    xmp_names: List[str] = []
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            blob = f.read() if size <= _XMP_SCAN_WHOLE else f.read(_XMP_SCAN_WHOLE // 2)
+        packets = [p.decode("utf-8", errors="replace") for p in _XMP_PACKET.findall(blob)]
+    except OSError:
+        return ["unreadable file"]
+    try:
+        with Image.open(path) as im:
+            if not packets and _pil_xmp_text(im):
+                packets = [_pil_xmp_text(im)]
+            try:
+                from PIL import IptcImagePlugin
+                iptc = IptcImagePlugin.getiptcinfo(im) if im.format in ("JPEG", "TIFF", "MPO") else None
+            except Exception:
+                iptc = None
+            if iptc:
+                out.append("IPTC: " + ", ".join(sorted(_IPTC_NAMES.get(k, f"{k[0]}:{k[1]}") for k in iptc)[:6]))
+            elif "Raw profile type iptc" in im.info:
+                out.append("IPTC")
+            exif = im.getexif()
+            names = [n for tag, n in _EXIF_TEXT_TAGS.items() if exif.get(tag)]
+            try:
+                if exif.get_ifd(0x8769).get(0x9286):
+                    names.append("UserComment")
+            except Exception:
+                pass
+            if names:
+                out.append("EXIF: " + ", ".join(names))
+            if im.format == "PNG":
+                text = [k for k, v in im.info.items() if isinstance(v, str) and k != "XML:com.adobe.xmp" and not k.startswith("Raw profile")]
+                if text:
+                    out.append("PNG text: " + ", ".join(text[:6]))
+    except Exception:
+        pass
+    for packet in packets:
+        for a, b in _XMP_PROPERTY.findall(packet):
+            name = a or b
+            if name.split(":")[0] not in _XMP_STRUCTURE and name not in xmp_names:
+                xmp_names.append(name)
+    if packets:
+        out.insert(0, "XMP: " + (", ".join(xmp_names[:8]) + (" …" if len(xmp_names) > 8 else "") if xmp_names else "an empty packet"))
+    return out
 
 
 def _split_tag_items(items: List[str]) -> List[str]:
@@ -213,6 +284,26 @@ class EmbeddedTagIndex:
             if items:
                 return items, "XMP sidecar"
         return [], ""
+
+    def explain(self, image: Path) -> Tuple[str, str]:
+        """Why items_for(image) found nothing, as (kind, sentence). kind is "bare" when neither the image nor an
+        original of it carries any metadata, "other" when there is metadata but no keyword field among it.
+        The sentence names every file that was looked at."""
+        key = image.stem.lower()
+        originals = [f for f in self.by_stem.get(key, []) if f != image]
+        looked = []
+        any_metadata = False
+        for f in [image] + sorted(originals, key=lambda p: (p.parent != self.backup, p.name)):
+            fields = metadata_fields(f)
+            any_metadata = any_metadata or bool(fields)
+            where = f.name if f.parent == self.root else f"{f.parent.name}/{f.name}"
+            looked.append(f"{where}: " + ("; ".join(fields) if fields else "no metadata"))
+        if not originals:
+            looked.append("no other file of that name here or in original_images/" if self.backup.is_dir()
+                          else "no original_images/ folder")
+        sidecars = self.sidecars.get(key, []) + [s for f in [image] + originals for s in self.sidecars.get(f.name.lower(), [])]
+        looked.append(f"{len(set(sidecars))} .xmp sidecar(s) without tags" if sidecars else "no .xmp sidecar")
+        return ("other" if any_metadata else "bare"), " · ".join(looked)
 
     def caption_for(self, image: Path) -> Tuple[str, str]:
         items, src = self.items_for(image)

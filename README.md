@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.14** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.15** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.14) |
+| | Upstream (v1.1.0) | This fork (1.15) |
 |---|---|---|
 | **Models** | Anima 2B | Anima 2B and MOSS-Image |
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
@@ -66,7 +66,7 @@ Either way you get `python_embeded/`, an embedded Python 3.10 with pip. There's 
 ### 2. Install dependencies
 Run **`Install_Requirements.bat`**. It installs PyTorch (CUDA 12.8) and the training dependencies into `python_embeded/`.
 
-**Only for MOSS-Image:** then run **`Install_Triton_for_MOSS.bat`**. It's optional, and it makes the low-memory ConvRot INT8 option run at full speed. It finishes by trying one of the trainer's INT8 kernels on your GPU and says whether that worked; if it didn't, MOSS-Image still trains, more slowly.
+**Only for MOSS-Image:** then run **`Install_Triton_for_MOSS.bat`**. It's optional, and it makes the low-memory ConvRot INT8 option run at full speed. It finishes by trying one of the trainer's INT8 kernels on your GPU and says whether that worked; if it didn't, MOSS-Image still trains, more slowly. If it reports a problem with PyTorch instead, it names the Python it ran with and shows the error.
 
 ### 3. Download the models
 Put each file in the folder shown; these are the paths the app uses by default. If you already have the files elsewhere, for example in ComfyUI, you can point the app at them instead (step 4).
@@ -96,6 +96,7 @@ Run **`start_trainer.bat`**; the UI opens in your browser. Pick the model under 
   * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
   * **1.5** through **1.13** add no dependencies. (1.9 lists `pandas` and `psutil` explicitly, but they were already installed.)
   * **1.14** replaces the bundled sd-scripts with v0.13.1, which needs newer `transformers`, `diffusers`, `accelerate`, `safetensors` and `huggingface-hub`. **Re-run `Install_Requirements.bat`**; training won't start on the old packages.
+  * **1.15** adds no dependencies.
 
 ---
 
@@ -163,7 +164,7 @@ The tools run in the background; their progress shows in the log.
 ### Natural-language captions (optional)
 `start_captioner.bat` opens a separate captioner that writes a natural-language caption for every image with [ToriiGate 0.5](https://huggingface.co/Minthy/ToriiGate-0.5).
 * It runs the model in llama.cpp. Both are downloaded on first use: about 5.2 GB for the model.
-* The image's Grabber tags or tag caption are passed to the model as hints, so characters get their right names.
+* The image's Grabber tags or tag caption are passed to the model as hints, so characters get their right names. **🔎 Check hints** shows, without loading the model, where each image's hints come from and why some have none.
 * The prompt can be edited, starting from the model's own. Each image's tags and names are still filled in.
 * Each caption is saved as `<name>.toriigate.txt`; your tag captions aren't touched. The dataset tools above treat it as part of its image.
 * **MOSS-Image runs can train on these captions** (Caption Source). Anima runs read only `<name>.txt`.
@@ -240,6 +241,7 @@ More options:
 * **ConvRot INT8 DiT / text encoder:** quantizes a bf16 file while loading. For the pre-quantized files the boxes change nothing, because sd-scripts detects those files itself.
 * **INT8 needs Triton to run at full speed.** Run **`Install_Triton_for_MOSS.bat`** once, after `Install_Requirements.bat`. It installs the `triton-windows` version your PyTorch names, then compiles and runs one of sd-scripts' INT8 kernels on your GPU and tells you whether that worked. Without Triton, INT8 still saves the VRAM but runs through a fallback that sd-scripts describes as slower than bf16. The app's log warns at the start of a run when Triton isn't installed.
 * **Block Swap** keeps that many of the 42 DiT blocks in system RAM (at most 40). **H2D-only** is sd-scripts' faster variant for LoRA training; it uses slightly more VRAM for the same count.
+* **Two notices while captions are cached are harmless:** `causal_conv1d is not installed` and `flash-linear-attention is not installed`. They come from the text encoder falling back to a slower, equally correct routine. With cached captions the text encoder runs once per caption and not at all during training steps, so only the caching step is slower.
 * **Text Encoder Block Swap** streams that many of the text encoder's 32 layers from RAM while captions are cached, for cards the caching step doesn't fit on. sd-scripts gives about 5 GB at 28 and 3.5 GB at 32 for the bf16 text encoder, and 2.2 GB at 32 with INT8. It's slower, and only matters during caching.
 * On Windows the page file has to be large enough: sd-scripts notes a commit charge of up to about 38 GB for its bf16 runs.
 

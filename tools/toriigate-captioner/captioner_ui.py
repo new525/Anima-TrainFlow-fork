@@ -216,8 +216,29 @@ def try_one(*values):
         job.log(f"🔍 {image.name} ({res['seconds']:.1f} s, hints: {res['source'] or 'none'}"
                 f"{tc.custom_prompt_label(opts).replace(' (', ', ').rstrip(')')}) — not saved"
                 + (f"\n   {res['note']}" if res["note"] else ""))
+        if not res["source"]:   # say what was looked at, so "none" isn't a dead end
+            job.log(f"   no tag hints: {tc.why_no_hints(image, index)}")
         job.show(image, res["text"], res["query"])
     msg = job.start(f"Trying {image.name}", run)
+    if msg:
+        job.log(msg)
+
+
+def check_hints(*values):
+    """Where each image's hints would come from, and why some have none. Reads the files only; no model needed."""
+    v, opts, cfg = split_values(values)
+    save_settings(v)
+    folder = Path(str(v["folder"]).strip().strip('"'))
+    if not folder.is_dir():
+        job.log(f"❌ Not a folder: {folder}")
+        return
+    if refuse_if_busy():
+        return
+
+    def run():
+        for line in tc.hint_report(folder, opts, stop_event=job.stop_event):
+            job.log(line)
+    msg = job.start("Checking hints", run)
     if msg:
         job.log(msg)
 
@@ -353,6 +374,7 @@ def build_ui():
                 with gr.Row():
                     start_btn = gr.Button("▶ Caption folder", variant="primary")
                     try_btn = gr.Button("🔍 Try one image")
+                    hints_btn = gr.Button("🔎 Check hints")
                     stop_btn = gr.Button("⏹ Stop", variant="stop")
                     unload_btn = gr.Button("⏏ Unload model")
                 status = gr.Markdown("**Idle.**", elem_classes="tg-status")
@@ -372,6 +394,7 @@ def build_ui():
         seen = gr.State(-1)
         start_btn.click(start_captioning, inputs, None, api_name="start")
         try_btn.click(try_one, inputs, None, api_name="try_one")
+        hints_btn.click(check_hints, inputs, None, api_name="check_hints")
         download_btn.click(download_now, inputs, None, api_name="download")
         stop_btn.click(stop, None, None, api_name="stop")
         unload_btn.click(unload, None, None, api_name="unload")

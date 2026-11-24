@@ -77,6 +77,20 @@ Some tags are never passed:
 - Artist tags, unless you tick *Include artist tags*.
 - `score_*` tags.
 
+**When the log says `hints: none`.** No tags were found for that image, and the caption is written from the picture alone. The tool says what it looked at:
+- **🔎 Check hints** (command line: `--check-hints`) reads the whole folder without loading the model. It counts the images by where their hints come from, and for those with none it lists what their files do carry.
+- 🔍 Try one image and `--dry-run` add a line naming the files that were looked at for that image.
+- ▶ Caption folder warns before the model loads when none of the first 20 images has hints, and its last line counts the hints by source.
+
+What the report means:
+
+| It says | What that means |
+|---|---|
+| `no metadata` for the image and for its original | Nothing was ever written into the file, or it was re-saved by something that drops metadata. With Grabber, check that exiftool is installed where Grabber finds it, and that the file's extension is in Grabber's Exiftool extension list. That list is `jpg jpeg png gif mp4` by default, so `.webp` files get no tags unless you add it. |
+| `no other file of that name here or in original_images/` | The image was re-encoded (bucketing does that) and its original isn't in `original_images/` next to it. Tags live in the original. |
+| `XMP: dc:description`, `PNG text: parameters`, `EXIF: ImageDescription`… | The file has metadata, but in a field that isn't a tag list. Tags are read from XMP Subject/Keywords, IPTC Keywords and Windows keywords only. In Grabber, set the Exiftool key to `Subject`. |
+| `embedded_tags.py isn't next to the captioner` | The captioner was copied out of the TrainFlow folder, so only `.txt` captions can be read. |
+
 **Character names:**
 - **known** (default): the model uses names that were given or found, and is told not to guess when there are none.
 - **recognize:** with no names known, the model is asked to recognise the characters.
