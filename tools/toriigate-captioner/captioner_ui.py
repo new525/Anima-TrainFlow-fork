@@ -22,6 +22,13 @@ OPTION_KEYS = [f.name for f in fields(tc.Options) if f.name != "timeout"]
 SERVER_KEYS = [f.name for f in fields(tc.ServerConfig)]
 UI_KEYS = ["folder", "try_image"] + OPTION_KEYS + SERVER_KEYS
 DEFAULTS = {"folder": "", "try_image": "", **asdict(tc.Options()), **asdict(tc.ServerConfig())}
+PROMPT_HELP = (
+    "Empty boxes use the model's own prompts. **📋 Load** puts the model's prompt for the chosen *Caption format* "
+    f"here to edit. In the prompt, `{tc.TAGS_SLOT}` and `{tc.CHARS_SLOT}` are replaced for each image by its tag "
+    "hints and its character names, written the way the model expects; leave one out and that part isn't sent. "
+    "Your prompt replaces the format's instructions, so changing *Caption format* afterwards only changes how names "
+    "are handled. The model card discourages changing the prompts, so check an edit with 🔍 Try one image; "
+    "*Prompt sent to the model* shows what each image got.")
 
 
 def load_settings() -> dict:
@@ -201,10 +208,13 @@ def try_one(*values):
         job.log("ℹ️ Tip: tick 'Keep the model loaded' to try several settings without reloading it each time.")
 
     def run():
+        for w in tc.prompt_warnings(opts):
+            job.log(w)
         session.prepare(job.stop_event)
         index = tc.EmbeddedTagIndex(folder) if tc.EmbeddedTagIndex is not None else None
         res = session.caption_one(image, opts, index, write=False)
-        job.log(f"🔍 {image.name} ({res['seconds']:.1f} s, hints: {res['source'] or 'none'}) — not saved"
+        job.log(f"🔍 {image.name} ({res['seconds']:.1f} s, hints: {res['source'] or 'none'}"
+                f"{tc.custom_prompt_label(opts).replace(' (', ', ').rstrip(')')}) — not saved"
                 + (f"\n   {res['note']}" if res["note"] else ""))
         job.show(image, res["text"], res["query"])
     msg = job.start(f"Trying {image.name}", run)
@@ -246,6 +256,17 @@ def unload():
         job.session.close(force=True)
     else:
         job.log("No model loaded.")
+
+
+def load_prompt(fmt):
+    job.log(f"📋 Loaded the model's own prompt for '{fmt}'. Edit it, keeping {tc.TAGS_SLOT} and {tc.CHARS_SLOT} "
+            "where each image's tags and names should go.")
+    return tc.default_template(fmt), tc.tg.system_prompt
+
+
+def clear_prompt():
+    job.log("↺ Back to the model's own prompts.")
+    return "", ""
 
 
 def list_files(repo):
@@ -293,6 +314,16 @@ def build_ui():
                     overwrite = gr.Checkbox(label=f"Overwrite existing {tc.NL_CAPTION_SUFFIX}", value=s["overwrite"])
                 tag_style = gr.Radio(label="Tag style in the prompt", value=s["tag_style"],
                                      choices=[("plain: long hair, smile", "plain"), ("booru: long_hair smile", "booru")])
+                with gr.Accordion("Prompt", open=bool(s["prompt"].strip() or s["system_prompt"].strip())):
+                    gr.Markdown(PROMPT_HELP)
+                    with gr.Row():
+                        load_prompt_btn = gr.Button("📋 Load the model's prompt for this format", size="sm")
+                        clear_prompt_btn = gr.Button("↺ Use the model's own", size="sm")
+                    prompt = gr.Textbox(label="Prompt (empty: the model's own)", value=s["prompt"], lines=8,
+                                        max_lines=30, placeholder=f"# Captioning format:\n…your instructions…\n"
+                                                                  f"{tc.TAGS_SLOT}{tc.CHARS_SLOT}")
+                    system_prompt = gr.Textbox(label="System prompt (empty: the model's own)", value=s["system_prompt"],
+                                               lines=2, max_lines=8, placeholder=tc.tg.system_prompt)
                 with gr.Accordion("Generation", open=False):
                     with gr.Row():
                         temperature = gr.Slider(0.0, 1.5, value=s["temperature"], step=0.05, label="Temperature (model default 0.5)")
@@ -331,9 +362,13 @@ def build_ui():
                 caption = gr.Textbox(label="Caption", lines=10, interactive=False)
                 with gr.Accordion("Prompt sent to the model", open=False):
                     query = gr.Textbox(show_label=False, lines=12, interactive=False)
-        inputs = [folder, try_image, fmt, names, characters, use_tags, tag_style, include_artists, overwrite,
-                  temperature, max_tokens, seed, mode, llama_server, url, repo, model, mmproj, gpu_layers, ctx, keep_running]
-        assert len(inputs) == len(UI_KEYS)
+        comps = dict(folder=folder, try_image=try_image, format=fmt, names=names, characters=characters,
+                     use_tags=use_tags, tag_style=tag_style, include_artists=include_artists, overwrite=overwrite,
+                     temperature=temperature, max_tokens=max_tokens, seed=seed, prompt=prompt,
+                     system_prompt=system_prompt, mode=mode, llama_server=llama_server, url=url, repo=repo,
+                     model=model, mmproj=mmproj, gpu_layers=gpu_layers, ctx=ctx, keep_running=keep_running)
+        assert set(comps) == set(UI_KEYS), set(comps) ^ set(UI_KEYS)
+        inputs = [comps[k] for k in UI_KEYS]
         seen = gr.State(-1)
         start_btn.click(start_captioning, inputs, None, api_name="start")
         try_btn.click(try_one, inputs, None, api_name="try_one")
@@ -341,6 +376,8 @@ def build_ui():
         stop_btn.click(stop, None, None, api_name="stop")
         unload_btn.click(unload, None, None, api_name="unload")
         list_btn.click(list_files, [repo], [model, mmproj], api_name="list_files")
+        load_prompt_btn.click(load_prompt, [fmt], [prompt, system_prompt], api_name="load_prompt")
+        clear_prompt_btn.click(clear_prompt, None, [prompt, system_prompt], api_name="clear_prompt")
         outputs = [log, status, preview, caption, query, seen]
         gr.Timer(1.0).tick(poll, [seen], outputs, show_progress="hidden", concurrency_limit=None, api_name="poll")
         ui.load(poll, [seen], outputs, show_progress="hidden")

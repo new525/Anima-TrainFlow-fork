@@ -164,6 +164,7 @@ The tools run in the background; their progress shows in the log.
 `start_captioner.bat` opens a separate captioner that writes a natural-language caption for every image with [ToriiGate 0.5](https://huggingface.co/Minthy/ToriiGate-0.5).
 * It runs the model in llama.cpp. Both are downloaded on first use: about 5.2 GB for the model.
 * The image's Grabber tags or tag caption are passed to the model as hints, so characters get their right names.
+* The prompt can be edited, starting from the model's own. Each image's tags and names are still filled in.
 * Each caption is saved as `<name>.toriigate.txt`; your tag captions aren't touched. The dataset tools above treat it as part of its image.
 * **MOSS-Image runs can train on these captions** (Caption Source). Anima runs read only `<name>.txt`.
 * There's a command line too. Details are in [tools/toriigate-captioner/README.md](tools/toriigate-captioner/README.md).
