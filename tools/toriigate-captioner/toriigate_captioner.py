@@ -88,6 +88,7 @@ MAX_TOKENS = 2048
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif", ".avif", ".jxl", ".heic", ".heif", ".hif", ".tif", ".tiff"}
 LOG_NAME = "toriigate_captions.log"
+HINT_PROBE = 20           # images looked at before a run to warn that none of them has tag hints
 FORMATS = list(tg.prompts_b)
 FORMAT_NOTES = {
     "short": "a few sentences covering the main things — the best fit for training captions",
@@ -223,6 +224,76 @@ def grounding(image: Path, index, opts: Options) -> Tuple[dict, str]:
             # prompts.py reads these even when unused; its fallback is a string, so they must be real dicts
             "char_p_tags": {"chars": {}, "skins": {}}, "char_descr": {"chars": {}, "skins": {}}}
     return item, source
+
+
+TAG_FIELDS = "XMP Subject/Keywords, IPTC Keywords or Windows keywords, in the image, its original in original_images/, or an .xmp sidecar"
+NO_READER = "ℹ️ embedded_tags.py isn't next to the captioner (it lives in the TrainFlow folder), so tags embedded in the images can't be read; .txt captions still work."
+
+
+def why_no_hints(image: Path, index) -> str:
+    """One line saying what was looked at when an image has no tag hints at all (no embedded tags, no .txt)."""
+    txt = f"no {image.stem}.txt"
+    if index is None:
+        return f"{txt} · embedded tags can't be read here (embedded_tags.py is missing)"
+    return f"{index.explain(image)[1]} · {txt}"
+
+
+def hint_report(folder: Path, opts: Options, limit: Optional[int] = None,
+                stop_event: Optional[threading.Event] = None) -> List[str]:
+    """Where each image's tag hints would come from, without loading the model: counts, and for images with none,
+    what their files do carry. The answer to "why does the log say hints: none?"."""
+    folder = Path(folder)
+    images = list_images(folder)[: limit or None]
+    if not images:
+        return ["❌ No images in this folder."]
+    index = EmbeddedTagIndex(folder) if EmbeddedTagIndex is not None else None
+    embedded: dict = {}
+    from_txt, names_only, bare, other = [], [], [], []
+    for image in images:
+        if stop_event is not None and stop_event.is_set():
+            break
+        item, source = grounding(image, index, opts)
+        if source.startswith("embedded tags"):
+            where = source[len("embedded tags ("):].split(")")[0] + (")" if "(original" in source else "")
+            embedded[where] = embedded.get(where, 0) + 1
+        elif item["tags"] or (source and not source.startswith("names given")):
+            from_txt.append(image.name)
+        else:
+            if item["characters"]:
+                names_only.append(image.name)
+            kind, text = index.explain(image) if index is not None else ("bare", "")
+            (other if kind == "other" else bare).append((image.name, text))
+
+    def some(names, n=5):
+        return ", ".join(names[:n]) + (f" … (+{len(names) - n})" if len(names) > n else "")
+    n_embedded, n_none = sum(embedded.values()), len(bare) + len(other)
+    out = [f"🔎 Tag hints for {len(images)} image(s) in {folder}: {n_embedded} from embedded tags, {len(from_txt)} from "
+           f".txt captions, {n_none} with none"]
+    if index is None:
+        out.append(NO_READER)
+    for where, n in sorted(embedded.items(), key=lambda kv: -kv[1]):
+        out.append(f"   {n:>5} embedded: {where}")
+    if from_txt:
+        out.append(f"   {len(from_txt):>5} from their .txt caption, having no embedded tags: {some(from_txt)}")
+    if bare:
+        out.append(f"   {len(bare):>5} with no metadata at all, in the image or an original of it: {some([n for n, _ in bare])}")
+        out.append(f"         e.g. {bare[0][1]}")
+    if other:
+        out.append(f"   {len(other):>5} with metadata, but no tags where they are read from: {some([n for n, _ in other])}")
+        for name, text in other[:3]:
+            out.append(f"         {text}")
+    if n_none:
+        out.append(f"   Tags are read from {TAG_FIELDS}.")
+        if bare and not other and not n_embedded:
+            out.append("   Nothing here carries any metadata, so the downloader didn't write tags into these files (or they "
+                       "were re-saved since by something that drops metadata). With Grabber: exiftool has to be installed "
+                       "where Grabber finds it, and the file's extension has to be in its Exiftool extension list "
+                       "(by default jpg jpeg png gif mp4, so not webp).")
+    if names_only:
+        out.append(f"   {len(names_only)} of those still get the names you typed in.")
+    if not opts.use_tags and (n_embedded or from_txt):
+        out.append("   'Give the image's tags as hints' is off: tags aren't sent, only character names.")
+    return out
 
 
 def name_settings(item: dict, opts: Options) -> Tuple[bool, bool, str]:
@@ -618,10 +689,21 @@ class Session:
         for w in prompt_warnings(opts):
             self.log(w)
         stop_event = stop_event or threading.Event()
-        self.prepare(stop_event)
         index = EmbeddedTagIndex(folder) if EmbeddedTagIndex is not None else None
+        if index is None:
+            self.log(NO_READER)
+        # Before the model loads: if the first images have no tag hints at all, say so and say what they do carry.
+        probe = todo[:HINT_PROBE]
+        probed = [grounding(im, index, opts)[0] for im in probe] if opts.use_tags else []
+        if probed and not any(item["tags"] or item["characters"] for item in probed):
+            self.log(f"⚠️ No tag hints for {'any of the first ' + str(len(probe)) + ' images' if len(probe) > 1 else 'this image'}: "
+                     f"the captions are written from the picture alone.")
+            self.log(f"   {probe[0].name} — {why_no_hints(probe[0], index)}")
+            self.log(f"   Tags are read from {TAG_FIELDS}. 🔎 Check hints lists every image.")
+        self.prepare(stop_event)
         log_file = folder / LOG_NAME
         t_start = time.time()
+        hint_counts = {"embedded tags": 0, ".txt": 0, "none": 0}
         for n, image in enumerate(todo, start=1):
             if stop_event.is_set():
                 summary["stopped"] = True
@@ -642,6 +724,8 @@ class Session:
                 self.log(f"❌ {image.name}: lost the server ({e}).")
                 break
             summary["captioned"] += 1
+            hint_counts["embedded tags" if res["source"].startswith("embedded tags") else
+                        ".txt" if res["source"] and not res["source"].startswith("names given") else "none"] += 1
             tokens = res["usage"].get("completion_tokens")
             warn = " ⚠️ hit the token limit (caption may be cut off)" if res["finish_reason"] == "length" else ""
             self._append_log(log_file, f"{image.name}  {opts.format}{custom_prompt_label(opts)}  {res['seconds']:.1f}s"
@@ -653,7 +737,10 @@ class Session:
                             str(image), res["text"], res["query"]))
             self.emit(Event("progress", f"{n}/{len(todo)} · about {eta / 60:.0f} min left" if n < len(todo) else
                             f"{n}/{len(todo)}", n, len(todo)))
+        summary["hints"] = hint_counts
         self.log(f"🏁 Captioned {summary['captioned']}, skipped {summary['skipped']}, failed {summary['failed']}."
+                 + (f" Tag hints: {hint_counts['embedded tags']} from embedded tags, {hint_counts['.txt']} from .txt, "
+                    f"{hint_counts['none']} none." if summary["captioned"] and opts.use_tags else "")
                  + f" Log: {log_file.name}")
         return summary
 
@@ -681,6 +768,8 @@ def parse_args(argv=None):
     g.add_argument("--names", default="known", choices=list(NAMES_MODES), help="; ".join(f"{k}: {v}" for k, v in NAMES_MODES.items()))
     g.add_argument("--characters", default="", help="comma-separated names to use for every image (e.g. your trigger word)")
     g.add_argument("--no-tags", action="store_true", help="don't give the image's booru tags as hints")
+    g.add_argument("--check-hints", action="store_true",
+                   help="report where each image's tag hints would come from, and why some have none; loads nothing")
     g.add_argument("--tag-style", default="plain", choices=["plain", "booru"])
     g.add_argument("--include-artists", action="store_true", help="also pass artist tags as hints")
     g.add_argument("--overwrite", action="store_true", help="caption images that already have a .toriigate.txt")
@@ -760,6 +849,9 @@ def main(argv=None) -> int:
         if not folder.is_dir():
             print(f"not a folder: {folder}")
             return 2
+        if a.check_hints:
+            print("\n".join(hint_report(folder, opts, a.limit or None)))
+            return 0
         if a.dry_run:
             for w in prompt_warnings(opts):
                 print(w)
@@ -769,7 +861,8 @@ def main(argv=None) -> int:
             for image in list_images(folder)[: a.limit or None]:
                 item, source = grounding(image, index, opts)
                 query, note = build_query(item, opts, image.name)
-                print(f"===== {image.name}   (hints: {source or 'none'}){'   ' + note if note else ''}\n{query}")
+                print(f"===== {image.name}   (hints: {source or 'none'}){'   ' + note if note else ''}"
+                      + ("" if source else f"\n      [{why_no_hints(image, index)}]") + f"\n{query}")
             return 0
         stop = threading.Event()
         try:

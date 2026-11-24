@@ -261,6 +261,9 @@ try:
         time.sleep(0.5); p = poll(call)
         if "Total Dataset Size" in p[0]: break
     check("bucketing completes in background", "Total Dataset Size" in p[0], p[0].splitlines()[-1])
+    console_text = (WORK / "server.log").read_text(encoding="utf-8", errors="replace")
+    check("the app's console isn't filled with Gradio's status-code deprecation warning (one per button press before 1.15)",
+          "HTTP_422_UNPROCESSABLE_ENTITY" not in console_text, console_text.count("HTTP_422_UNPROCESSABLE_ENTITY"))
 finally:
     try:
         kill_server()
