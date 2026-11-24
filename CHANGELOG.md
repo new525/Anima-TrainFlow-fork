@@ -3,6 +3,28 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.16] - 2026-11-24
+
+Triton works with the bundled Python, so MOSS-Image's ConvRot INT8 can run on its fast kernels.
+
+**Updating from 1.15:** no new dependencies. To fix an existing folder, copy `python_embeded\Include` and `python_embeded\libs` from this version into its `python_embeded`, then run `Install_Triton_for_MOSS.bat`.
+
+### Fixed
+- **Triton couldn't compile its kernels with the bundled Python: `include file 'Python.h' not found`, `Failed to find Python libs`.**
+  - **Cause:** Triton builds a small C module the first time it runs, against the running Python's headers and import library. The embeddable Python the fork bundles comes without them.
+  - **What you saw:** the installer ended with "Triton is installed, but sd-scripts could not set it up on this GPU", and INT8 training stayed on its slow fallback.
+  - **Fix:** `python_embeded` now carries `Include\` (the headers) and `libs\python310.lib`, where triton-windows looks for them. They come from the Python Software Foundation's own 3.10.11 package, whose `python310.dll` is byte-identical to the bundled one. The installer names the two files if they're missing.
+  - To fix an existing folder without downloading everything again, copy `python_embeded\Include` and `python_embeded\libs` from 1.16 into it, then run `Install_Triton_for_MOSS.bat` again.
+
+### Tests
+- `test_install_triton.py` (3 new checks): the bundled Python carries its headers and import library where triton-windows looks for them; the headers are of the bundled Python's own version; a Python without them gets both files named.
+
+### Verified
+- `tests/run_all.py` on Linux with Python 3.10.
+- The headers and import library come from the Python Software Foundation's `python` 3.10.11 package; its `python310.dll`, `python.exe` and `python3.dll` are byte-identical to the bundled ones.
+- Where triton-windows 3.6.0 (post26) looks was read from its source: the include folder Python itself reports, which is `python_embeded\Include`, and `libs\python310.lib` next to `python.exe`. Its bundled TinyCC links through Triton's own `python310.def`, so the missing headers were what stopped the compile; the `.lib` is what the "Failed to find Python libs" check looks for, and what a Visual Studio compiler would link.
+- **Not yet confirmed:** that the kernels then compile and run on Windows. The installer's last step tests exactly that.
+
 ## [1.15] - 2026-11-24
 
 The ToriiGate captioner explains `hints: none`, and `Install_Triton_for_MOSS.bat` says what is actually wrong.
@@ -35,18 +57,13 @@ The ToriiGate captioner explains `hints: none`, and `Install_Triton_for_MOSS.bat
 - **The console filled up with `StarletteDeprecationWarning: 'HTTP_422_UNPROCESSABLE_ENTITY' is deprecated`.**
   - **Cause:** Gradio 6.17.3 looks that status-code name up on every button press, and the Starlette installed beside it has renamed it. The warning says nothing about the request.
   - **Fix:** the trainer app and the captioner filter that one warning. Other warnings still show.
-- **Triton couldn't compile its kernels with the bundled Python: `include file 'Python.h' not found`, `Failed to find Python libs`.**
-  - **Cause:** Triton builds a small C module the first time it runs, against the running Python's headers and import library. The embeddable Python the fork bundles comes without them.
-  - **What you saw:** the installer ended with "Triton is installed, but sd-scripts could not set it up on this GPU", and INT8 training stayed on its slow fallback.
-  - **Fix:** `python_embeded` now carries `Include\` (the headers) and `libs\python310.lib`, where triton-windows looks for them. They come from the Python Software Foundation's own 3.10.11 package, whose `python310.dll` is byte-identical to the bundled one. The installer names the two files if they're missing.
-  - To fix an existing folder without downloading everything again, copy `python_embeded\Include` and `python_embeded\libs` from 1.15 into it.
 - **The 1.14 entry below was missing its MOSS-Image half.** Two changes were both written up as 1.14, and merging them kept only the captioner's prompt editor. The entry now covers both, as the 1.14 tag does.
 
 ### Tests
 - `test_toriigate_captioner.py` (17 new checks): compressed XMP in a PNG; the explanation for an image with no metadata, with an original, and with metadata in other fields; the hint report's counts and groups; the advice for a folder with no metadata, and its absence for a tagged one; the warning and the closing count in a folder run; `--check-hints` and `--dry-run`.
 - `e2e/test_captioner_ui.py`: the 🔎 Check hints button through the UI's API, with no server set up.
 - `e2e/test_e2e.py` and `e2e/test_captioner_ui.py`: the server's console output doesn't contain the status-code warning. Before the fix it appeared 42 times in one captioner test run.
-- **New, `test_install_triton.py`** (14 checks): the Triton version taken from PyTorch's requirement line, and the message for each way PyTorch can be unusable.
+- **New, `test_install_triton.py`** (11 checks): the Triton version taken from PyTorch's requirement line, and the message for each way PyTorch can be unusable.
 
 ### Verified
 - `tests/run_all.py` on Linux with Python 3.10: all scripts pass (three skip there by design).

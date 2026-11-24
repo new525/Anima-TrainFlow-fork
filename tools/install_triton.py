@@ -90,7 +90,7 @@ def load_torch():
 def missing_build_files(base=None, version=None):
     """Triton compiles a small C module the first time it runs, against the running Python: it needs that Python's
     headers (Include\\Python.h) and import library (libs\\pythonXY.lib) next to python.exe. An embeddable Python
-    doesn't come with them; TrainFlow's python_embeded has had them since 1.15. Returns the paths that are missing."""
+    doesn't come with them; TrainFlow's python_embeded has had them since 1.16. Returns the paths that are missing."""
     base = Path(base or os.path.dirname(sys.executable))
     version = version or f"{sys.version_info.major}{sys.version_info.minor}"
     wanted = [base / "Include" / "Python.h", base / "libs" / f"python{version}.lib"]
@@ -113,8 +113,8 @@ def check():
         gone = missing_build_files()
         if gone:
             print("Triton can't compile its kernels with this Python, because these files aren't there:\n  " + "\n  ".join(gone) + "\n"
-                  "They are Python's own headers and import library. TrainFlow 1.15 ships them in python_embeded (Include\\ and\n"
-                  "libs\\); copy those two folders from a 1.15 download into this python_embeded folder and run this again.")
+                  "They are Python's own headers and import library. TrainFlow 1.16 ships them in python_embeded (Include\\ and\n"
+                  "libs\\); copy those two folders from a 1.16 download into this python_embeded folder and run this again.")
             return False
     sys.path.insert(0, str(SD_SCRIPTS))   # after PyTorch is loaded: nothing in sd-scripts can stand in for its imports
     try:
