@@ -35,6 +35,7 @@ from tqdm import tqdm
 
 from library.convrot_int8_kernels import (
     HAS_TRITON,
+    TRITON_UNUSABLE_REASON,
     _build_hadamard,
     _rotate_activation,
     _rotate_weight,
@@ -519,9 +520,16 @@ def convrot_int8_embedding_forward_patch(self: nn.Embedding, input: torch.Tensor
 def _validate_convrot_bwd_mode(bwd_mode: str) -> None:
     if bwd_mode not in ("bf16", "int8"):
         raise ValueError(f"Unsupported ConvRot INT8 backward mode: {bwd_mode}")
+    if bwd_mode == "int8" and not HAS_TRITON and TRITON_UNUSABLE_REASON:  # [TrainFlow]
+        raise ValueError(f"ConvRot INT8 backward mode 'int8' can't be used: {TRITON_UNUSABLE_REASON}.")
     if bwd_mode == "int8" and not HAS_TRITON:
         raise ValueError("ConvRot INT8 backward mode 'int8' requires triton. Install triton (triton-windows on Windows).")
-    if not HAS_TRITON:
+    if not HAS_TRITON and TRITON_UNUSABLE_REASON:  # [TrainFlow] installing triton would change nothing: say why
+        logger.warning(
+            f"triton is not used: {TRITON_UNUSABLE_REASON}. ConvRot INT8 falls back to transient dequantization in forward."
+            " Weight VRAM is still reduced, but there is no speedup."
+        )
+    elif not HAS_TRITON:
         logger.warning(
             "triton is not available: ConvRot INT8 falls back to transient dequantization in forward."
             " Weight VRAM is still reduced, but there is no speedup. Install triton (triton-windows on Windows)"

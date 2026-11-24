@@ -52,6 +52,26 @@ try:
 except ImportError:
     HAS_TRITON = False
 
+# [TrainFlow] The fused kernels need a GPU of compute capability 8.0 or newer (RTX 30 series and later). On an older one,
+# triton no longer maps `tl.dot` to tensor cores ("Dot op using MMA for compute capability ... has been deprecated. It
+# falls back to the FMA path", triton 3.6 AccelerateMatmul.cpp), and that path cannot compile a dot of int8 operands at all:
+# "'arith.extf' op operand #0 must be floating-point-like, but got 'tensor<...xi8, ...>'". Seen on an RTX 2080 Ti (7.5),
+# where it stopped the run at the first INT8 Linear call. Such a GPU uses the eager implementation, as without triton.
+TRITON_MIN_CAPABILITY = (8, 0)
+TRITON_UNUSABLE_REASON = None
+
+
+def triton_capability_problem(capability) -> str | None:
+    """None if a GPU of this compute capability, e.g. (7, 5), can run the fused INT8 kernels; otherwise the reason it can't."""
+    major, minor = int(capability[0]), int(capability[1])
+    if (major, minor) >= TRITON_MIN_CAPABILITY:
+        return None
+    return (
+        f"this GPU's compute capability is {major}.{minor}, and triton's INT8 kernels need"
+        f" {TRITON_MIN_CAPABILITY[0]}.{TRITON_MIN_CAPABILITY[1]} or newer (RTX 30 series and later)"
+    )
+
+
 if HAS_TRITON:
     # The fused kernels are CUDA only, and `triton.autotune` needs an active GPU driver when the kernels below are
     # defined (import time): on a CPU-only machine with triton installed (e.g. CI) it raises RuntimeError
@@ -60,6 +80,9 @@ if HAS_TRITON:
         from triton.runtime import driver as _triton_driver
 
         HAS_TRITON = torch.cuda.is_available() and _triton_driver.active is not None
+        if HAS_TRITON:
+            TRITON_UNUSABLE_REASON = triton_capability_problem(torch.cuda.get_device_capability())  # [TrainFlow]
+            HAS_TRITON = TRITON_UNUSABLE_REASON is None
     except Exception:
         HAS_TRITON = False
 

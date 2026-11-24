@@ -6,14 +6,14 @@ This is a fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/A
 
 `Raw Images` ➔ `Smart Resize & Crop` ➔ `Auto-Tag` ➔ `Inspect` ➔ `Train` ➔ `Compare Checkpoints` ➔ `Ready LoRA`
 
-> **Current version: 1.16** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
+> **Current version: 1.17** — see [CHANGELOG.md](CHANGELOG.md) and [Releases](https://github.com/new525/Anima-TrainFlow-fork/releases).
 > Fork versions are numbered independently of upstream. Fork 1.1 was built on upstream's v1.1.0 code.
 
 ---
 
 ## How this fork differs from upstream
 
-| | Upstream (v1.1.0) | This fork (1.16) |
+| | Upstream (v1.1.0) | This fork (1.17) |
 |---|---|---|
 | **Models** | Anima 2B | Anima 2B and MOSS-Image |
 | **Refreshing the page during training** | The trainer hangs on a full output pipe, keeping its VRAM, and Stop can no longer reach it | Training carries on; any tab shows the live run |
@@ -66,7 +66,7 @@ Either way you get `python_embeded/`, an embedded Python 3.10 with pip. There's 
 ### 2. Install dependencies
 Run **`Install_Requirements.bat`**. It installs PyTorch (CUDA 12.8) and the training dependencies into `python_embeded/`.
 
-**Only for MOSS-Image:** then run **`Install_Triton_for_MOSS.bat`**. It's optional, and it makes the low-memory ConvRot INT8 option run at full speed. It finishes by trying one of the trainer's INT8 kernels on your GPU and says whether that worked; if it didn't, MOSS-Image still trains, more slowly. If it reports a problem with PyTorch instead, it names the Python it ran with and shows the error. Triton compiles its kernels against the bundled Python, which carries its own headers and import library for that since 1.16 (`python_embeded\Include`, `python_embeded\libs`).
+**Only for MOSS-Image, and only with an RTX 30 series or newer card:** then run **`Install_Triton_for_MOSS.bat`**. It's optional, and it makes the low-memory ConvRot INT8 option run at full speed. On an older card (RTX 20 series, GTX) it says the card can't use Triton and installs nothing. It finishes by running the trainer's INT8 kernels on your GPU and says whether that worked; if it didn't, MOSS-Image still trains, more slowly. If it reports a problem with PyTorch instead, it names the Python it ran with and shows the error. Triton compiles its kernels against the bundled Python, which carries its own headers and import library for that since 1.16 (`python_embeded\Include`, `python_embeded\libs`).
 
 ### 3. Download the models
 Put each file in the folder shown; these are the paths the app uses by default. If you already have the files elsewhere, for example in ComfyUI, you can point the app at them instead (step 4).
@@ -96,7 +96,8 @@ Run **`start_trainer.bat`**; the UI opens in your browser. Pick the model under 
   * **1.4** adds `pillow-jxl-plugin` for JPEG XL and `pillow-heif` for HEIC.
   * **1.5** through **1.13** add no dependencies. (1.9 lists `pandas` and `psutil` explicitly, but they were already installed.)
   * **1.14** replaces the bundled sd-scripts with v0.13.1, which needs newer `transformers`, `diffusers`, `accelerate`, `safetensors` and `huggingface-hub`. **Re-run `Install_Requirements.bat`**; training won't start on the old packages.
-  * **1.15** and **1.16** add no dependencies. 1.16 adds two folders to `python_embeded` (`Include`, `libs`) that Triton needs.
+  * **1.15**, **1.16** and **1.17** add no dependencies. 1.16 adds two folders to `python_embeded` (`Include`, `libs`) that Triton needs.
+  * **If you installed Triton on a card older than the RTX 30 series** and stay on 1.16 or older, remove it, or MOSS-Image training stops at its first step: `python_embeded\python.exe -m pip uninstall -y triton-windows`. From 1.17 on it is left unused on such a card.
 
 ---
 
@@ -195,7 +196,7 @@ More options:
 
 ### Training MOSS-Image
 **In short:**
-1. Run `Install_Triton_for_MOSS.bat` once (optional, see *Memory*).
+1. Run `Install_Triton_for_MOSS.bat` once (optional, RTX 30 series or newer only; see *Memory*).
 2. Download the three model files below.
 3. Caption the dataset: `start_captioner.bat` for natural-language captions, *Create .txt captions* for tags, or both.
 4. Choose **MOSS-Image**, check **Caption Source**, set a Trigger Word, press **🚀 Start Training**.
@@ -239,7 +240,8 @@ More options:
 
 * **The defaults are the third row** (INT8 for both, Block Swap 20), which leaves room on an 11 or 12 GB card on paper. sd-scripts measured these on an RTX PRO 6000; on another card, watch the first run.
 * **ConvRot INT8 DiT / text encoder:** quantizes a bf16 file while loading. For the pre-quantized files the boxes change nothing, because sd-scripts detects those files itself.
-* **INT8 needs Triton to run at full speed.** Run **`Install_Triton_for_MOSS.bat`** once, after `Install_Requirements.bat`. It installs the `triton-windows` version your PyTorch names, then compiles and runs one of sd-scripts' INT8 kernels on your GPU and tells you whether that worked. Without Triton, INT8 still saves the VRAM but runs through a fallback that sd-scripts describes as slower than bf16. The app's log warns at the start of a run when Triton isn't installed.
+* **INT8 needs Triton to run at full speed.** Run **`Install_Triton_for_MOSS.bat`** once, after `Install_Requirements.bat`. It installs the `triton-windows` version your PyTorch names, then compiles and runs sd-scripts' INT8 kernels on your GPU and tells you whether that worked. Without Triton, INT8 still saves the VRAM but runs through a fallback that sd-scripts describes as slower than bf16. The app's log warns at the start of a run when Triton isn't installed.
+  * **Triton's kernels need an RTX 30 series or newer card** (compute capability 8.0+). On an older one, such as an RTX 2080 Ti, Triton can't compile them. The installer says so and installs nothing, and the trainer uses the fallback there even when Triton is installed; its log line then reads `triton is not used: this GPU's compute capability is 7.5 …`.
 * **Block Swap** keeps that many of the 42 DiT blocks in system RAM (at most 40). **H2D-only** is sd-scripts' faster variant for LoRA training; it uses slightly more VRAM for the same count.
 * **Two notices while captions are cached are harmless:** `causal_conv1d is not installed` and `flash-linear-attention is not installed`. They come from the text encoder falling back to a slower, equally correct routine. With cached captions the text encoder runs once per caption and not at all during training steps, so only the caching step is slower.
 * **Text Encoder Block Swap** streams that many of the text encoder's 32 layers from RAM while captions are cached, for cards the caching step doesn't fit on. sd-scripts gives about 5 GB at 28 and 3.5 GB at 32 for the bf16 text encoder, and 2.2 GB at 32 with INT8. It's slower, and only matters during caching.

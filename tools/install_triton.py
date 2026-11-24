@@ -97,6 +97,54 @@ def missing_build_files(base=None, version=None):
     return [str(p) for p in wanted if not p.is_file()]
 
 
+MIN_CAPABILITY = (8, 0)   # the same limit as TRITON_MIN_CAPABILITY in sd-scripts' library/convrot_int8_kernels.py
+
+
+def gpu_too_old(capability, name="This GPU"):
+    """Triton's INT8 kernels need a GPU of compute capability 8.0+ (RTX 30 series and later): on an older one Triton can't
+    compile them, and TrainFlow's trainer doesn't try. Returns what to tell the user, or None if the GPU is new enough."""
+    major, minor = int(capability[0]), int(capability[1])
+    if (major, minor) >= MIN_CAPABILITY:
+        return None
+    return (f"{name} has compute capability {major}.{minor}. Triton's INT8 kernels need {MIN_CAPABILITY[0]}.{MIN_CAPABILITY[1]} or newer, which is the\n"
+            "RTX 30 series and later: on an older card Triton can't compile them, so there is nothing for it to speed up.\n"
+            "MOSS-Image still trains on this card. ConvRot INT8 still saves the VRAM, through sd-scripts' own slower route.")
+
+
+def visible_gpu(torch):
+    """(compute capability, name) of the GPU PyTorch trains on, or (None, None) if it sees none or can't say."""
+    try:
+        if torch.cuda.is_available():
+            return tuple(torch.cuda.get_device_capability()), torch.cuda.get_device_name(0)
+    except Exception:  # noqa: BLE001
+        pass
+    return None, None
+
+
+def triton_installed():
+    for name in ("triton-windows", "triton"):
+        try:
+            return f"{name} {importlib.metadata.version(name)}"
+        except importlib.metadata.PackageNotFoundError:
+            continue
+    return None
+
+
+def old_gpu_notice(torch):
+    """If the GPU is too old for the kernels: print why, and what to do about a Triton that's already installed."""
+    capability, name = visible_gpu(torch)
+    problem = gpu_too_old(capability, name) if capability else None
+    if not problem:
+        return False
+    print(problem)
+    have = triton_installed()
+    if have:
+        print(f"\n{have} is installed. TrainFlow 1.17 and newer leave it unused on this card. With 1.16 or older it stops MOSS-Image\n"
+              "training at the first step ('arith.extf' ... PassManager::run failed), so remove it there:\n"
+              f"  \"{sys.executable}\" -m pip uninstall -y triton-windows")
+    return True
+
+
 def install(spec):
     package = f"triton-windows{spec}"
     print(f"Installing {package} ...", flush=True)
@@ -125,6 +173,8 @@ def check():
     if not torch.cuda.is_available():
         print("No CUDA GPU is visible to PyTorch, so Triton can't be tried here (its kernels are GPU-only).")
         return False
+    if old_gpu_notice(torch):
+        return False
     if not kernels.HAS_TRITON:
         try:
             import triton  # noqa: F401
@@ -132,19 +182,29 @@ def check():
         except Exception as e:  # noqa: BLE001
             print(f"Triton can't be imported ({type(e).__name__}: {e}), so INT8 training would use the slow fallback.")
         return False
+    print("Compiling and running sd-scripts' INT8 kernels on the GPU. The first time, this can take a few minutes ...", flush=True)
+    step = "quantize"
     try:
-        x = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
-        kernels.triton_quantize_rowwise(x)       # compiles one of the kernels sd-scripts trains with, and runs it
+        # The calls training makes: quantize the activations, the INT8 matrix product (forward), and the weight
+        # dequantization of the backward pass. The matrix product is the one an unsupported GPU fails on.
+        x = torch.randn(8, 256, device="cuda", dtype=torch.bfloat16)
+        wq = torch.randint(-127, 128, (64, 256), device="cuda", dtype=torch.int8)
+        scale = torch.full((64,), 0.01, device="cuda", dtype=torch.float32)
+        kernels.triton_quantize_rowwise(x)
+        step = "INT8 matrix product"
+        kernels.int8_linear(x, wq, scale, None, torch.bfloat16, True, 256)
+        step = "weight dequantization"
+        kernels.triton_dequantize_rotate_weight(wq, scale, 256, torch.bfloat16)
         torch.cuda.synchronize()
     except Exception as e:  # noqa: BLE001
-        print(f"Triton is installed, but compiling a kernel failed:\n  {type(e).__name__}: {e}\n"
+        print(f"Triton is installed, but its {step} kernel failed:\n  {type(e).__name__}: {e}\n"
               "INT8 training would stop with this error. See the triton-windows README for what it needs on your system:\n"
               "  https://github.com/triton-lang/triton-windows\n"
               "Until it's sorted out: pip uninstall triton-windows (INT8 then uses the slow fallback), or untick the two\n"
               "ConvRot INT8 boxes and use more Block Swap.")
         return False
     import triton
-    print(f"OK: Triton {triton.__version__} compiled and ran one of sd-scripts' INT8 kernels on {torch.cuda.get_device_name(0)}.")
+    print(f"OK: Triton {triton.__version__} compiled and ran sd-scripts' INT8 kernels on {torch.cuda.get_device_name(0)}.")
     return True
 
 
@@ -153,6 +213,11 @@ def main():
     ap.add_argument("--check-only", action="store_true")
     ap.add_argument("--spec", default=None)
     a = ap.parse_args()
+    if not a.check_only and os.name == "nt":
+        torch, _ = load_torch()          # a PyTorch that won't load is reported further down, as before
+        if torch is not None and old_gpu_notice(torch):
+            print("\nNothing was installed.")
+            return 0
     if not a.check_only:
         try:
             torch_version = importlib.metadata.version("torch")

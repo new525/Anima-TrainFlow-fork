@@ -3,6 +3,32 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.17] - 2026-11-24
+
+MOSS-Image training no longer stops on RTX 20 series and older cards when Triton is installed. Those cards can't use Triton's INT8 kernels; the trainer and the installer now know it.
+
+**Updating from 1.16:** no new dependencies. If you stay on 1.16 or older with such a card and installed Triton, remove it: `python_embeded\python.exe -m pip uninstall -y triton-windows`.
+
+### Fixed
+- **MOSS-Image training stopped at its first step on an RTX 2080 Ti once Triton was installed: `'arith.extf' op operand #0 must be floating-point-like, but got 'tensor<128x64xi8 …>'`, `PassManager::run failed`.**
+  - **Cause:** Triton 3.6 only maps a matrix product to tensor cores on compute capability 8.0 and newer (RTX 30 series and later). Below that it takes another route ("Dot op using MMA for compute capability … has been deprecated. It falls back to the FMA path", `AccelerateMatmul.cpp`), and that route can't compile a product of int8 operands at all. sd-scripts' ConvRot INT8 kernels are exactly that.
+  - **Fix, trainer:** `library/convrot_int8_kernels.py` turns the Triton kernels off on a GPU below compute capability 8.0, so it trains through sd-scripts' own fallback, as it does without Triton. The log says why: `triton is not used: this GPU's compute capability is 7.5, and triton's INT8 kernels need 8.0 or newer`, in place of the line that suggested installing Triton.
+  - **Fix, installer:** `Install_Triton_for_MOSS.bat` checks the GPU first. On an older card it explains this, installs nothing, and says how to remove a Triton that's already there.
+- **The installer's final test passed on a card where training then failed.** It ran only the kernel that quantizes activations. It now runs the three kernels training uses: the quantization, the INT8 matrix product and the weight dequantization of the backward pass.
+
+### Changed
+- README, the installer and the app's "Triton isn't installed" log line say that Triton is for RTX 30 series and newer cards.
+- **Correction to 1.14–1.16:** they presented Triton as the way to full INT8 speed on any card. On an RTX 20 series or older card there is no Triton speedup to be had; ConvRot INT8 still saves the VRAM there.
+
+### Tests
+- `test_install_triton.py` (8 new checks): which compute capabilities are too old; the installer and the trainer use the same limit; what an old GPU is told with and without Triton installed; nothing is installed for it on Windows, with or without `--spec`.
+- `test_trainer_moss.py` (7 new checks, sd-scripts' real code): the capability limit; the log line and the refused `int8` backward mode on an old GPU; the fallback route computes the layer and its gradient from the INT8 weight within quantization error.
+
+### Verified
+- `tests/run_all.py` on Linux with Python 3.10, the three trainer scripts with the trainer's packages. The browser test was not run for this version (nothing in the page changed).
+- The cause was read from Triton's source (`lib/Dialect/TritonGPU/Transforms/AccelerateMatmul.cpp`, tag `v3.6.0`) against the error log of a real run on an RTX 2080 Ti (`target=cuda:75`).
+- **Not run on a GPU:** the new installer test with the three kernels, and the trainer's check on a real card of either generation.
+
 ## [1.16] - 2026-11-24
 
 Triton works with the bundled Python, so MOSS-Image's ConvRot INT8 can run on its fast kernels.
