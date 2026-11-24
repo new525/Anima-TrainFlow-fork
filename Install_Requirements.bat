@@ -25,4 +25,5 @@ cd /d %~dp0
 echo.
 echo Installation Complete!
 echo You can now run the trainer via start_trainer.bat
+echo For MOSS-Image with ConvRot INT8, also run Install_Triton_for_MOSS.bat (optional, speeds INT8 up).
 pause

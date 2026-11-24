@@ -1,6 +1,6 @@
 # Tests
 
-These tests run the real `app.py` without a GPU and without the models. torch is replaced by a stub that reports a GPU, U2Net by a plain resize, and the WD tagger by a fixed caption where needed. The end-to-end test replaces sd-scripts with `e2e/fake_trainer.py`, which writes the same files and prints the same progress lines.
+These tests run the real `app.py` without a GPU and without the models. torch is replaced by a stub that reports a GPU, U2Net by a plain resize, and the WD tagger by a fixed caption where needed. The end-to-end test replaces sd-scripts with `e2e/fake_trainer.py`, which writes the same files and prints the same progress lines. Two scripts instead run sd-scripts' real dataset and caching code with stand-in encoders; they need the trainer's packages (`training/sd-scripts/requirements.txt`, CPU PyTorch is enough) and skip without them.
 
 ## Running
 
@@ -22,14 +22,16 @@ python -m venv .venv
 | `test_embedded_tags.py` | Grabber/exiftool tags → captions; WD tagger only for untagged images; renaming keeps everything linked |
 | `test_heic.py`, `test_media_*.py`, `test_other_formats.py` | Video/GIF/AVIF/JXL/HEIC/PSD/TIFF… conversion, frame extraction, messages |
 | `test_rename.py` | Rename to Numbers: undo when a file is locked part-way, letter-case pairing, training interlock |
-| `test_trainer_patch.py` | The sd-scripts patch: resume/Train More with gradient accumulation, halt-state cleanup (runs the real trainer code, extracted) |
+| `test_moss.py` | MOSS-Image in the app: caption sources and the trigger word, the files a run writes, model-file checks, memory options, per-model preview settings, Resume Run and Train More choosing the trainer, older `settings.json`, the controls shown for each model |
+| `test_trainer_patch.py` | The sd-scripts patch: resume/Train More with gradient accumulation, halt-state cleanup (runs the real trainer code, extracted). Both trainers share this code |
+| `test_trainer_moss.py` | sd-scripts' real code for MOSS-Image, with stand-in encoders: the app's configs for both models contain only options the real trainers have, the MOSS-Image trainer's start-up checks pass, both captions of an image are cached and served, edited captions and images are encoded again, Anima and MOSS-Image caches coexist. Needs the trainer's packages, like `test_trainer_cache.py` |
 | `test_trainer_cache.py` | sd-scripts' real dataset and caching code: the trigger word reaches the cached captions; edited captions, edited images and renamed datasets are encoded again. Needs the trainer's packages: on Windows it runs itself with `python_embeded\python.exe`, elsewhere it reports SKIP |
 | `test_training_flow.py` | Input validation, training ⇄ tool interlock, Train More rollback, which run Resume Run picks, settings.json safety, preview prompts, WD caption format, inspector checks |
 | `test_toriigate_captioner.py` | The ToriiGate captioner (`tools/toriigate-captioner`), against `e2e/fake_llama_server.py`, which stands in for llama-server. Covers:<br>• the bundled `prompts.py` is the official file<br>• hints from Grabber tags and `.txt` captions, and name modes<br>• image preparation<br>• the llama-server lifecycle<br>• captioning, skip, overwrite, stop<br>• error handling<br>• resumable downloads and the llama.cpp zip<br>• the web UI's buttons during a run<br>• the CLI<br>• TrainFlow's handling of `.toriigate.txt` |
 | `test_toriigate_real_llama.py` | Optional: the captioner against a real llama-server and model. Skipped unless `TG_LLAMA_SERVER`, `TG_MODEL` and `TG_MMPROJ` are set; `TG_REAL_MODEL=1` adds caption-content checks for the real ToriiGate model |
-| `e2e/test_e2e.py` | The app served by Gradio and driven through its API: the trainer outliving the app, reattach, pause/halt/resume, grid, loss, Train More, background tools |
+| `e2e/test_e2e.py` | The app served by Gradio and driven through its API: the trainer outliving the app, reattach, pause/halt/resume, grid, loss, Train More, a MOSS-Image run (start, halt, resume), background tools |
 | `e2e/test_captioner_ui.py` | The captioner's web UI served by Gradio and driven through its API. Covers:<br>• caption folder, try one image<br>• a page reload during a run, and stop<br>• keeping the model loaded, and unload<br>• settings surviving a restart |
-| `e2e/test_browser.py` | Optional: the UI in a headless browser (tab switching mid-run, loss chart, settings restored after reload) |
+| `e2e/test_browser.py` | Optional: the UI in a headless browser (tab switching mid-run, loss chart, settings restored after reload, switching between Anima and MOSS-Image) |
 
 ## Browser test (optional)
 

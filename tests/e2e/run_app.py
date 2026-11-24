@@ -15,8 +15,10 @@ assert marker in src
 src = src.replace(marker, "build_train_command = __fake_cmd__\n" + marker)
 
 
-def fake_cmd(training_toml, dataset_toml, extra_args=()):
-    return [sys.executable, str(HERE / "fake_trainer.py"), "--config_file", str(training_toml), "--dataset_config", str(dataset_toml), *extra_args]
+def fake_cmd(training_toml, dataset_toml, extra_args=(), script=None):
+    # --fake_script records which trainer the app would have launched (anima_train_network.py / moss_image_train_network.py)
+    return [sys.executable, str(HERE / "fake_trainer.py"), "--config_file", str(training_toml), "--dataset_config", str(dataset_toml),
+            "--fake_script", Path(script).name if script else "", *extra_args]
 
 
 g = {"__name__": "app", "__file__": str(APP), "__fake_cmd__": fake_cmd}

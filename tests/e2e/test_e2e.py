@@ -1,7 +1,8 @@
 """End to end: the real app.py served by Gradio, driven through its API, with fake_trainer.py standing in for
 sd-scripts. Covers the trainer outliving the app (kill + restart + reattach), pause/halt/resume across restarts, block
-swap and multi-prompt previews in the config, checkpoint grid, loss history, Train More, background tools, the
-inspector, the trigger prefix, and the training/tool interlock. The app tree lives in tests/e2e/_work (outside the
+swap and multi-prompt previews in the config, checkpoint grid, loss history, Train More, a MOSS-Image run (its own
+trainer, model files and caption sources, halt and resume), background tools, the inspector, the trigger prefix, and
+the training/tool interlock. The app tree lives in tests/e2e/_work (outside the
 server's working folder and the temp folder, so preview/grid serving depends on allowed_paths like a real install)."""
 import importlib
 import json
@@ -62,9 +63,18 @@ def kill_server():
     server.kill(); server.wait()   # like the console window being closed / the app crashing
 
 
-def args(steps=300, blocks=0, prompts="first prompt\nsecond prompt", kw=KW):
+NL, TAGS, BOTH = "Natural language (.toriigate.txt)", "Tags (.txt)", "Both (one picked at random each step)"
+MM = M / "moss_image"
+
+
+def args(steps=300, blocks=0, prompts="first prompt\nsecond prompt", kw=KW, moss=None):
+    """The Start Training inputs in UI order. moss=dict(...) trains MOSS-Image instead of Anima."""
+    m = {**dict(source=NL, int8=True, int8_te=True, swap=20, h2d=True, te_swap=0, neg="", steps_gen=50, cfg=3.0), **(moss or {})}
     return [kw, str(DS), str(M / "dit.safetensors"), str(M / "qwen.safetensors"), str(M / "vae.safetensors"),
-            32, "1.0", "Prodigy", steps, 100, 50, prompts, "neg", 1024, 1024, 30, 4.0, 42, 42, 1, 1, True, blocks, 0]
+            32, "1.0", "Prodigy", steps, 100, 50, prompts, "neg", 1024, 1024, 30, 4.0, 42, 42, 1, 1, True, blocks, 0,
+            "MOSS-Image" if moss is not None else "Anima", str(MM / "dit.safetensors"), str(MM / "te.safetensors"),
+            str(MM / "vae.safetensors"), "", m["source"], m["int8"], m["int8_te"], m["swap"], m["h2d"], m["te_swap"],
+            m["neg"], m["steps_gen"], m["cfg"]]
 
 
 def steps_written():
@@ -160,6 +170,62 @@ try:
     check("extended run finishes at 700", "Finished" in p[2] and "700/700" in p[2], p[2])
     check("old final LoRA kept", (run_dir / "kw-step00000600-final.safetensors").exists(), sorted(x.name for x in run_dir.glob("*.safetensors")))
     check("config backup kept", (run_dir / "configs" / "kw_training.before_extend_600.toml").exists())
+
+    # --- MOSS-Image: its own trainer script, model files and caption sources; halt, edit a caption, resume
+    MM.mkdir()
+    for f in ("dit", "te", "vae"):
+        (MM / f"{f}.safetensors").touch()
+    (DS / "img0.toriigate.txt").write_text("A girl smiles at the viewer.\n\nShe stands in soft daylight.")
+    (DS / "img1.toriigate.txt").write_text("mk stands on a stage under spotlights.")
+    _, out = call("start_training", args(steps=300, kw="mk", moss=dict(source=NL)))
+    check("MOSS: the natural-language source refuses an image without a .toriigate.txt",
+          "without a .toriigate.txt caption" in out[0] and "img2.png" in out[0] and not (OUT / "mk").exists(), out[0].splitlines()[-1])
+    _, out = call("start_training", args(steps=300, kw="mk", prompts="a portrait of mk\nstanding in the rain",
+                                         moss=dict(source=BOTH, swap=20, te_swap=28)))
+    time.sleep(2)
+    run_m = sorted((OUT / "mk").iterdir())[0]
+    cfg = toml.load(str(next((run_m / "configs").glob("*_training.toml"))))
+    ds_sub = toml.load(str(next((run_m / "configs").glob("*_dataset.toml"))))["datasets"][0]["subsets"][0]
+    meta = json.loads(Path(ds_sub["metadata_file"]).read_text(encoding="utf-8"))
+    argv = json.loads((WORK / "last_argv.json").read_text())
+    check("MOSS: launched with the MOSS-Image trainer", argv[argv.index("--fake_script") + 1] == "moss_image_train_network.py", argv[:6])
+    check("MOSS: config names the MOSS model files and network", cfg.get("text_encoder", "").endswith("moss_image/te.safetensors")
+          and cfg["pretrained_model_name_or_path"].endswith("moss_image/dit.safetensors") and "qwen3" not in cfg
+          and cfg["network_module"] == "networks.lora_generic", {k: cfg.get(k) for k in ("text_encoder", "network_module", "qwen3")})
+    check("MOSS: memory options written", cfg.get("blocks_to_swap") == 20 and cfg.get("block_swap_h2d_only") is True
+          and cfg.get("text_encoder_blocks_to_swap") == 28 and cfg.get("convrot_int8") is True
+          and cfg.get("convrot_int8_text_encoder") is True, {k: v for k, v in cfg.items() if "swap" in k or "int8" in k})
+    by_name = {Path(k).name: v["caption"] for k, v in meta.items()}
+    check("MOSS: both captions of an image become candidates, each with the trigger word",
+          by_name["img0.png"] == ["mk, A girl smiles at the viewer.\n\nShe stands in soft daylight.", "mk, 1girl, solo, smile"], by_name["img0.png"])
+    check("MOSS: a caption that already names the trigger isn't given it twice", by_name["img1.png"][0] == "mk stands on a stage under spotlights.", by_name["img1.png"])
+    check("MOSS: an image with only tags trains on its tags", by_name["img2.png"] == "mk, 1girl, solo, smile", by_name["img2.png"])
+    check("MOSS: dataset is a metadata subset of the dataset folder", Path(ds_sub["image_dir"]) == DS.resolve()
+          and ds_sub.get("enable_multiline_caption") is True and "caption_prefix" not in ds_sub, ds_sub)
+    prompt_lines = next((run_m / "configs").glob("*_prompts.txt")).read_text(encoding="utf-8").splitlines()
+    check("MOSS: previews use MOSS-Image's own settings and no negative prompt when it's empty",
+          prompt_lines == ["a portrait of mk --w 1024 --h 1024 --l 3.0 --s 50 --d 42", "mk, standing in the rain --w 1024 --h 1024 --l 3.0 --s 50 --d 42"], prompt_lines)
+    info = json.loads((run_m / "run.json").read_text(encoding="utf-8"))
+    check("MOSS: run.json records the model and caption source", info.get("model_family") == "MOSS-Image" and info.get("caption_source") == BOTH, info)
+    p = poll(call)
+    check("MOSS: status follows the run", "Training" in p[2] and "mk/" in p[2], p[2])
+    call("halt_training", [])
+    p = wait_status(call, "Halted")
+    check("MOSS: halt & save", "Halted" in p[2], p[2])
+    (DS / "img2.toriigate.txt").write_text("A girl in a red coat.")          # captioned while the run was halted
+    call("resume_training", ["mk"]); time.sleep(1.5)
+    argv = json.loads((WORK / "last_argv.json").read_text())
+    meta = json.loads(Path(ds_sub["metadata_file"]).read_text(encoding="utf-8"))
+    check("MOSS: resume uses the MOSS-Image trainer and the saved state", "--resume" in argv and "--skip_until_initial_step" in argv
+          and argv[argv.index("--fake_script") + 1] == "moss_image_train_network.py", argv[4:])
+    check("MOSS: resume reads the captions as they are now", {Path(k).name: v["caption"] for k, v in meta.items()}["img2.png"]
+          == ["mk, A girl in a red coat.", "mk, 1girl, solo, smile"], meta)
+    p = wait_status(call, "Finished", 40)
+    check("MOSS: resumed run finishes", "Finished" in p[2] and "300/300" in p[2], p[2])
+    _, out = call("resume_training", [KW])
+    check("an Anima keyword is unaffected by the MOSS run", "Nothing to resume" in out[0].splitlines()[-1], out[0].splitlines()[-1])
+    for f in DS.glob("*.toriigate.txt"):
+        f.unlink()
 
     # --- background tools + inspector
     (DS / "img0.txt").write_text("kw, 1girl, solo, solo")    # trigger in 1 of 3 captions + duplicate tag

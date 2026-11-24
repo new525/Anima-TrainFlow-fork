@@ -3,6 +3,63 @@
 All notable changes to this fork of [ThetaCursed/Anima-TrainFlow](https://github.com/ThetaCursed/Anima-TrainFlow) are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.14] - 2026-11-24
+
+MOSS-Image LoRA training, on an updated sd-scripts. **Nothing in this version has been run on a GPU yet**; see *Verified* for what was and wasn't checked.
+
+**Updating from 1.13:** re-run `Install_Requirements.bat`. The bundled sd-scripts now needs newer `transformers`, `diffusers`, `accelerate`, `safetensors` and `huggingface-hub`, and training won't start on the old ones. Keep your 1.13 folder until an Anima run has worked for you on 1.14: this version replaces the trainer under Anima as well.
+
+### Added
+- **MOSS-Image** (OpenMOSS: a 5B DiT, the Qwen3.5-9B text encoder, the FLUX.2 VAE) as a second model. *Model to train a LoRA for* switches the page between the two.
+  - Each model has its own model paths, block-swap setting, and preview Negative Prompt, Steps and CFG. Rank, alpha, learning rate, optimizer, steps and the preview prompts are shared.
+  - Pause, Halt & Save, Resume Run, Train More, the checkpoint grid, the loss chart, crash recovery and reattaching work for MOSS-Image runs as for Anima runs. Resume Run and Train More pick the trainer from the run, not from the page.
+  - A dataset folder can be trained on both models. Their caches sit in the same two subfolders under different names.
+- **Caption Source** for MOSS-Image runs: natural language (`<name>.toriigate.txt`, from the ToriiGate captioner), tags (`<name>.txt`), or both.
+  - **Both** gives each image two captions; sd-scripts caches the text-encoder output of each and picks one at random at every step. An image with only one kind trains on that one, and the log lists those images.
+  - Natural-language captions are used whole, with their line breaks. Tag captions use the first line, as before.
+  - The trigger word is added per caption, only where it's missing: matched as a whole word in sentences, as a tag in tags. No caption gets it twice.
+  - A run's captions are written to `configs/<keyword>_metadata.json` in its folder. Resume Run and Train More rebuild that file from the captions as they are then, and refuse to continue if an image has lost its caption.
+- **MOSS-Image memory options:** ConvRot INT8 for the DiT and for the text encoder, Block Swap (up to 40 of 42 blocks) with sd-scripts' H2D-only variant, and Text Encoder Block Swap (up to 32 layers) for the caption-caching step.
+  - The defaults are INT8 for both models and Block Swap 20, which sd-scripts measured at 7.9 GB while caching and 6.9 GB while training.
+  - Pre-quantized INT8 files are recognised from their header and left to sd-scripts' own detection. The log says which precision each model runs in.
+- **`Install_Triton_for_MOSS.bat`** (optional): installs the `triton-windows` version the installed PyTorch names in its own metadata, then compiles and runs one of sd-scripts' INT8 kernels and reports the result. The app warns at the start of an INT8 run when Triton is missing.
+- **Checks before a MOSS-Image run starts:** missing model files, a later part of a split checkpoint given instead of the first, missing parts, the W4A8 GPTQ text encoder (which sd-scripts can't load), a missing tokenizer folder, images without a caption for the chosen source, and a caption line that sd-scripts would read as a divider between captions.
+
+### Changed
+- **The bundled sd-scripts is now kohya-ss v0.13.1** (it was a May 2026 snapshot). This is where the MOSS-Image trainer comes from. The fork's patches were applied again by hand and are marked `[TrainFlow]`:
+  - **Kept:** the halt-request hook, the resume fix for gradient accumulation (v0.13.1 still has the original formula), the absolute step count after a resume, removal of superseded Halt & Save resume points, the image fingerprint in cached latents, the caption text in Anima's cached captions, and the `cache_text_encoder/` and `latent_cache/` subfolders.
+  - **No longer needed:** the caption prefix reaching cached captions (v0.13.1 does this itself) and the LoRA merge device fix (merged upstream).
+  - **Extended to MOSS-Image:** the cache subfolders and the latent fingerprint. MOSS-Image's cached captions already carry their text in v0.13.1.
+- Existing Anima caches stay valid: the file names, folders and stored caption text are unchanged.
+- `requirements.txt` is upstream's v0.13.1 list plus the fork's additions. Gradio stays at 6.17.3.
+- 🔎 Inspect Dataset's line about natural-language captions says which model trains on them.
+
+### Tests
+- **New, `test_moss.py`** (57 checks): caption sources and trigger-word rules, the files a MOSS-Image run writes, model-file checks, memory options, per-model preview settings, Resume Run and Train More choosing the trainer, a 1.13 `settings.json`, and which controls each model shows.
+- **New, `test_trainer_moss.py`** (31 checks, needs the trainer's packages): sd-scripts' real code without a GPU.
+  - Every key of the configs the app writes, for both models, is an option of that model's real trainer, with an accepted value. sd-scripts ignores unknown config keys silently, so this is what catches a misspelt option.
+  - The MOSS-Image trainer's own start-up checks pass on the app's dataset.
+  - Its real caching code, with stand-in encoders: both captions of an image cached with the trigger word, a batch served from the caches, edited captions and images encoded again, Anima and MOSS-Image caches side by side.
+- `e2e/test_e2e.py`: a MOSS-Image run through the Gradio API with the stand-in trainer: refused without captions, launched with the MOSS-Image trainer, halted, a caption added, resumed and finished (16 new checks).
+- `e2e/test_browser.py`: choosing MOSS-Image swaps in its controls, the choice survives a reload, and switching back restores Anima's (5 new checks).
+  - This found a real fault during development: with Gradio 6.17.3, controls that start hidden with `visible=False` didn't all appear when switched on, until the page was reloaded. Single controls now start as `visible="hidden"` and the path boxes sit in groups.
+- `test_trainer_patch.py` and `test_trainer_cache.py` updated for where v0.13.1 keeps the patched code.
+
+### Verified
+- On Linux with Python 3.10, the bundled version:
+  - `tests/run_all.py` in an environment built from `tests/requirements.txt`: all scripts pass, including `e2e/test_browser.py` in headless Chromium. `test_trainer_cache.py`, `test_trainer_moss.py` and `test_toriigate_real_llama.py` skip there, as designed.
+  - `test_trainer_cache.py` (20 checks) and `test_trainer_moss.py` in an environment built from the new `requirements.txt` with CPU PyTorch. That environment installs without conflicts, Gradio 6.17.3 included, and `anima_train_network.py --help` and `moss_image_train_network.py --help` both run.
+- **Not yet confirmed:**
+  - Any real MOSS-Image run: loading the models, the INT8 kernels, the memory figures (they are sd-scripts' measurements on an RTX PRO 6000), a finished LoRA, the LoRA in ComfyUI.
+  - Anima training on sd-scripts v0.13.1 on a real GPU, including halt and resume through it.
+  - `Install_Triton_for_MOSS.bat` on Windows, and Triton with the bundled embedded Python.
+  - Anything on Windows.
+
+### Known limitations
+- MOSS-Image on 8 GB cards isn't set up: sd-scripts' route for them caches captions in a separate step before training, which the app doesn't do. Text Encoder Block Swap covers the caching step's VRAM, but that combination is untested.
+- The training settings shared between the models aren't tuned for MOSS-Image. The README gives the example values from sd-scripts' guide.
+- Text-encoder LoRA, LoHa/LoKr and edit training for MOSS-Image aren't offered.
+
 ## [1.13] - 2026-11-14
 
 ### Fixed
