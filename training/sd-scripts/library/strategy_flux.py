@@ -1,11 +1,14 @@
-import os
+﻿import os
 import glob
 from typing import Any, List, Optional, Tuple, Union
 import torch
 import numpy as np
-from transformers import CLIPTokenizer, T5TokenizerFast
+from transformers import T5TokenizerFast
+from library.clip_tokenizer import CLIPTokenizer  # transformers.CLIPTokenizer with the legacy (ftfy) text normalization
 
-from library import flux_utils, train_util
+from library import flux_utils
+import library.accelerator_setup as accelerator_setup
+import library.device_utils as device_utils
 from library.strategy_base import LatentsCachingStrategy, TextEncodingStrategy, TokenizeStrategy, TextEncoderOutputsCachingStrategy
 
 from library.utils import setup_logging
@@ -143,7 +146,12 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
         return [l_pooled, t5_out, txt_ids, t5_attn_mask]
 
     def cache_batch_outputs(
-        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, infos: List
+        self,
+        tokenize_strategy: TokenizeStrategy,
+        models: List[Any],
+        text_encoding_strategy: TextEncodingStrategy,
+        infos: List,
+        captions: List[str],
     ):
         if not self.warn_fp8_weights:
             if flux_utils.get_t5xxl_actual_dtype(models[1]) == torch.float8_e4m3fn:
@@ -154,7 +162,6 @@ class FluxTextEncoderOutputsCachingStrategy(TextEncoderOutputsCachingStrategy):
             self.warn_fp8_weights = True
 
         flux_text_encoding_strategy: FluxTextEncodingStrategy = text_encoding_strategy
-        captions = [info.caption for info in infos]
 
         tokens_and_masks = tokenize_strategy.tokenize(captions)
         with torch.no_grad():
@@ -229,8 +236,8 @@ class FluxLatentsCachingStrategy(LatentsCachingStrategy):
             encode_by_vae, vae_device, vae_dtype, image_infos, flip_aug, alpha_mask, random_crop, multi_resolution=True
         )
 
-        if not train_util.HIGH_VRAM:
-            train_util.clean_memory_on_device(vae.device)
+        if not accelerator_setup.HIGH_VRAM:
+            device_utils.clean_memory_on_device(vae.device)
 
 
 if __name__ == "__main__":

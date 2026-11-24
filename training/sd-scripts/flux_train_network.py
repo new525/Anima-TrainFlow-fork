@@ -8,6 +8,7 @@ import torch
 from accelerate import Accelerator
 
 from library.device_utils import clean_memory_on_device, init_ipex
+from library.custom_offloading_utils import BlockSwapConfig
 
 init_ipex()
 
@@ -19,8 +20,11 @@ from library import (
     sd3_train_utils,
     strategy_base,
     strategy_flux,
-    train_util,
+    sampling,
 )
+import library.args as args_util
+import library.model_io as model_io
+from library.dataset import DatasetGroup, MinimalDataset
 from library.utils import setup_logging
 
 setup_logging()
@@ -40,11 +44,13 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
     def assert_extra_args(
         self,
         args,
-        train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
-        val_dataset_group: Optional[train_util.DatasetGroup],
+        train_dataset_group: Union[DatasetGroup, MinimalDataset],
+        val_dataset_group: Optional[DatasetGroup],
     ):
         super().assert_extra_args(args, train_dataset_group, val_dataset_group)
         # sdxl_train_util.verify_sdxl_training_args(args)
+
+        flux_train_utils.log_timestep_sampling_info(args)
 
         self.model_type = args.model_type  # "flux" or "chroma"
         if self.model_type != "chroma":
@@ -129,8 +135,14 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
         if self.is_swapping_blocks:
             # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
-            logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
-            model.enable_block_swap(args.blocks_to_swap, accelerator.device)
+            # The base weights are frozen in LoRA training. Freeze them here, before enabling block swap, for the H2D-only offloader.
+            model.requires_grad_(False)
+            swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+            logger.info(
+                f"enable block swap: blocks_to_swap={args.blocks_to_swap}, H2D-only: {swap_config.h2d_only}, "
+                f"use pinned memory: {swap_config.use_pinned_memory}"
+            )
+            model.enable_block_swap(args.blocks_to_swap, swap_config)
 
         if self.use_clip_l:
             clip_l = flux_utils.load_clip_l(args.clip_l, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
@@ -224,7 +236,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             return None
 
     def cache_text_encoder_outputs_if_needed(
-        self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
+        self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: DatasetGroup, weight_dtype
     ):
         if args.cache_text_encoder_outputs:
             if not args.lowram:
@@ -258,7 +270,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
                 tokenize_strategy: strategy_flux.FluxTokenizeStrategy = strategy_base.TokenizeStrategy.get_strategy()
                 text_encoding_strategy: strategy_flux.FluxTextEncodingStrategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-                prompts = train_util.load_prompts(args.sample_prompts)
+                prompts = sampling.load_prompts(args.sample_prompts)
                 sample_prompts_te_outputs = {}  # key: prompt, value: text encoder outputs
                 with accelerator.autocast(), torch.no_grad():
                     for prompt_dict in prompts:
@@ -327,9 +339,18 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
         noise = torch.randn_like(latents)
         bsz = latents.shape[0]
 
+        # Per-sample timestep sampling offset from custom_attributes: timestep_sampling = { offset = ... }
+        tso = None
+        if is_train and "custom_attributes" in batch:
+            offsets = [ca.get("timestep_sampling", {}).get("offset", 0.0) for ca in batch["custom_attributes"]]
+            t = torch.tensor(offsets, dtype=torch.float32)
+            if t.abs().sum() > 0:
+                tso = t
+
         # get noisy model input and timesteps
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
+            timestep_sampling_offset=tso,
         )
 
         # pack latents and get img_ids
@@ -441,7 +462,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
             model_description = "schnell" if self.is_schnell else "dev"
         else:
             model_description = "chroma"
-        return train_util.get_sai_model_spec(None, args, False, True, False, flux=model_description)
+        return model_io.get_sai_model_spec(None, args, False, True, False, flux=model_description)
 
     def update_metadata(self, metadata, args):
         metadata["ss_model_type"] = args.model_type
@@ -522,7 +543,7 @@ class FluxNetworkTrainer(train_network.NetworkTrainer):
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
-    train_util.add_dit_training_arguments(parser)
+    args_util.add_dit_training_arguments(parser)
     flux_train_utils.add_flux_train_arguments(parser)
 
     parser.add_argument(
@@ -540,8 +561,11 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    train_util.verify_command_line_training_args(args)
-    args = train_util.read_config_from_file(args, parser)
+    args_util.verify_command_line_training_args(args)
+    args = args_util.read_config_from_file(args, parser)
 
-    trainer = FluxNetworkTrainer()
-    trainer.train(args)
+    if args.show_timesteps:
+        flux_train_utils.show_timesteps(args)
+    else:
+        trainer = FluxNetworkTrainer()
+        trainer.train(args)

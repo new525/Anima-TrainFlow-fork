@@ -9,8 +9,22 @@ from accelerate.utils import set_seed
 import torch
 from tqdm import tqdm
 
-from library import config_util, flux_train_utils, flux_utils, strategy_base, strategy_flux, strategy_sd, strategy_sdxl
-from library import train_util
+from library import (
+    config_util,
+    flux2_vae,
+    flux_train_utils,
+    flux_utils,
+    moss_image_train_utils,
+    strategy_base,
+    strategy_flux,
+    strategy_moss_image,
+    strategy_sd,
+    strategy_sdxl,
+)
+import library.accelerator_setup as accelerator_setup
+import library.args as args_util
+import library.dataset as dataset_util
+import library.model_io as model_io
 from library import sdxl_train_util
 import library.sai_model_spec as sai_model_spec
 from library.config_util import (
@@ -25,7 +39,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-def set_tokenize_strategy(is_sd: bool, is_sdxl: bool, is_flux: bool, args: argparse.Namespace) -> None:
+def set_tokenize_strategy(is_sd: bool, is_sdxl: bool, is_flux: bool, args: argparse.Namespace, is_moss_image: bool = False) -> None:
     if is_flux:
         _, is_schnell, _ = flux_utils.check_flux_state_dict_diffusers_schnell(args.pretrained_model_name_or_path)
     else:
@@ -35,6 +49,8 @@ def set_tokenize_strategy(is_sd: bool, is_sdxl: bool, is_flux: bool, args: argpa
         tokenize_strategy = strategy_sd.SdTokenizeStrategy(args.v2, args.max_token_length, args.tokenizer_cache_dir)
     elif is_sdxl:
         tokenize_strategy = strategy_sdxl.SdxlTokenizeStrategy(args.max_token_length, args.tokenizer_cache_dir)
+    elif is_moss_image:
+        tokenize_strategy = strategy_moss_image.MossImageTokenizeStrategy(args.moss_max_token_length, args.tokenizer_cache_dir)
     else:
         if args.t5xxl_max_token_length is None:
             if is_schnell:
@@ -51,8 +67,8 @@ def set_tokenize_strategy(is_sd: bool, is_sdxl: bool, is_flux: bool, args: argpa
 
 def cache_to_disk(args: argparse.Namespace) -> None:
     setup_logging(args, reset=True)
-    train_util.prepare_dataset_args(args, True)
-    train_util.enable_high_vram(args)
+    accelerator_setup.prepare_dataset_args(args, True)
+    accelerator_setup.enable_high_vram(args)
 
     # assert args.cache_latents_to_disk, "cache_latents_to_disk must be True / cache_latents_to_diskはTrueである必要があります"
     args.cache_latents = True
@@ -63,14 +79,17 @@ def cache_to_disk(args: argparse.Namespace) -> None:
     if args.seed is not None:
         set_seed(args.seed)  # 乱数系列を初期化する
 
-    is_sd = not args.sdxl and not args.flux
+    is_sd = not args.sdxl and not args.flux and not args.moss_image
     is_sdxl = args.sdxl
     is_flux = args.flux
+    is_moss_image = args.moss_image
 
-    set_tokenize_strategy(is_sd, is_sdxl, is_flux, args)
+    set_tokenize_strategy(is_sd, is_sdxl, is_flux, args, is_moss_image)
 
     if is_sd or is_sdxl:
         latents_caching_strategy = strategy_sd.SdSdxlLatentsCachingStrategy(is_sd, True, args.vae_batch_size, args.skip_cache_check)
+    elif is_moss_image:
+        latents_caching_strategy = strategy_moss_image.MossImageLatentsCachingStrategy(True, args.vae_batch_size, args.skip_cache_check)
     else:
         latents_caching_strategy = strategy_flux.FluxLatentsCachingStrategy(True, args.vae_batch_size, args.skip_cache_check)
     strategy_base.LatentsCachingStrategy.set_strategy(latents_caching_strategy)
@@ -120,24 +139,28 @@ def cache_to_disk(args: argparse.Namespace) -> None:
         train_dataset_group, val_dataset_group = config_util.generate_dataset_group_by_blueprint(blueprint.dataset_group)
     else:
         # use arbitrary dataset class
-        train_dataset_group = train_util.load_arbitrary_dataset(args)
+        train_dataset_group = dataset_util.load_arbitrary_dataset(args)
         val_dataset_group = None
 
     # acceleratorを準備する
     logger.info("prepare accelerator")
     args.deepspeed = False
-    accelerator = train_util.prepare_accelerator(args)
+    accelerator = accelerator_setup.prepare_accelerator(args)
 
     # mixed precisionに対応した型を用意しておき適宜castする
-    weight_dtype, _ = train_util.prepare_dtype(args)
+    weight_dtype, _ = accelerator_setup.prepare_dtype(args)
     vae_dtype = torch.float32 if args.no_half_vae else weight_dtype
 
     # モデルを読み込む
     logger.info("load model")
     if is_sd:
-        _, vae, _, _ = train_util.load_target_model(args, weight_dtype, accelerator)
+        _, vae, _, _ = model_io.load_target_model(args, weight_dtype, accelerator)
     elif is_sdxl:
         (_, _, _, vae, _, _, _) = sdxl_train_util.load_target_model(args, accelerator, "sdxl", weight_dtype)
+    elif is_moss_image:
+        # the FLUX.2 VAE is always used in float32
+        vae_dtype = torch.float32
+        vae = flux2_vae.load_flux2_vae(args.vae, vae_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
     else:
         vae = flux_utils.load_ae(args.ae, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors)
 
@@ -161,17 +184,21 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     add_logging_arguments(parser)
-    train_util.add_sd_models_arguments(parser)
+    args_util.add_sd_models_arguments(parser)
     sai_model_spec.add_model_spec_arguments(parser)
-    train_util.add_training_arguments(parser, True)
-    train_util.add_dataset_arguments(parser, True, True, True)
-    train_util.add_masked_loss_arguments(parser)
+    args_util.add_training_arguments(parser, True)
+    args_util.add_dataset_arguments(parser, True, True, True)
+    args_util.add_masked_loss_arguments(parser)
     config_util.add_config_arguments(parser)
-    train_util.add_dit_training_arguments(parser)
+    args_util.add_dit_training_arguments(parser)
     flux_train_utils.add_flux_train_arguments(parser)
+    moss_image_train_utils.add_moss_image_model_arguments(parser)
 
     parser.add_argument("--sdxl", action="store_true", help="Use SDXL model / SDXLモデルを使用する")
     parser.add_argument("--flux", action="store_true", help="Use FLUX model / FLUXモデルを使用する")
+    parser.add_argument(
+        "--moss_image", action="store_true", help="Use MOSS-Image model (--vae is the FLUX.2 VAE) / MOSS-Imageモデルを使用する（--vae は FLUX.2 VAE）"
+    )
     parser.add_argument(
         "--no_half_vae",
         action="store_true",
@@ -190,6 +217,6 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    args = train_util.read_config_from_file(args, parser)
+    args = args_util.read_config_from_file(args, parser)
 
     cache_to_disk(args)

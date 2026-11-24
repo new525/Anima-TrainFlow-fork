@@ -45,14 +45,15 @@ from diffusers import (
 )
 from einops import rearrange
 from tqdm import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer, CLIPVisionModelWithProjection, CLIPImageProcessor
+from transformers import CLIPTextModel, CLIPVisionModelWithProjection, CLIPImageProcessor
+from library.clip_tokenizer import CLIPTokenizer, as_legacy_clip_tokenizer  # transformers.CLIPTokenizer with the legacy (ftfy) text normalization
 from accelerate import init_empty_weights
 import PIL
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 import library.model_util as model_util
-import library.train_util as train_util
+from library.hidden_states import pool_workaround
 import library.sdxl_model_util as sdxl_model_util
 import library.sdxl_train_util as sdxl_train_util
 from networks.lora import LoRANetwork
@@ -65,6 +66,7 @@ from library.original_unet import FlashAttentionFunction
 from library.custom_train_functions import pyramid_noise_like
 from networks.control_net_lllite import ControlNetLLLite
 from library.utils import GradualLatent, EulerAncestralDiscreteSchedulerGL
+from library.sampling import check_sampler_requirements
 from library.utils import setup_logging, add_logging_arguments
 
 setup_logging()
@@ -1165,7 +1167,7 @@ def get_unweighted_text_embeddings(
             if pool is None:
                 pool = enc_out.get("text_embeds", None)  # use 1st chunk, if provided
                 if pool is not None:
-                    pool = train_util.pool_workaround(text_encoder, enc_out["last_hidden_state"], text_input_chunk, eos)
+                    pool = pool_workaround(text_encoder, enc_out["last_hidden_state"], text_input_chunk, eos)
 
             if no_boseos_middle:
                 if i == 0:
@@ -1187,7 +1189,7 @@ def get_unweighted_text_embeddings(
             text_embeddings = text_encoder.text_model.final_layer_norm(text_embeddings)
         pool = enc_out.get("text_embeds", None)  # text encoder 1 doesn't return this
         if pool is not None:
-            pool = train_util.pool_workaround(text_encoder, enc_out["last_hidden_state"], text_input, eos)
+            pool = pool_workaround(text_encoder, enc_out["last_hidden_state"], text_input, eos)
     return text_embeddings, pool
 
 
@@ -1610,6 +1612,8 @@ class ListPrompter:
 
 
 def main(args):
+    check_sampler_requirements(args.sampler)  # fail before loading the models if the sampler needs a missing package
+
     if args.fp16:
         dtype = torch.float16
     elif args.bf16:
@@ -1665,7 +1669,7 @@ def main(args):
             text_encoder = loading_pipe.text_encoder
             vae = loading_pipe.vae
             unet = loading_pipe.unet
-            tokenizer = loading_pipe.tokenizer
+            tokenizer = as_legacy_clip_tokenizer(loading_pipe.tokenizer)
             del loading_pipe
 
             # Diffusers U-Net to original U-Net
@@ -1734,6 +1738,9 @@ def main(args):
     elif args.sampler == "dpmsolver" or args.sampler == "dpmsolver++":
         scheduler_cls = DPMSolverMultistepScheduler
         sched_init_args["algorithm_type"] = args.sampler
+        if args.sampler == "dpmsolver":
+            # diffusers rejects the default final_sigmas_type="zero" for the (non-++) dpmsolver algorithm
+            sched_init_args["final_sigmas_type"] = "sigma_min"
         scheduler_module = diffusers.schedulers.scheduling_dpmsolver_multistep
         has_clip_sample = False
     elif args.sampler == "dpmsingle":

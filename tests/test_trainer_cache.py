@@ -117,7 +117,7 @@ def latent_npz(stem):
 group = training_run()
 check("cached text includes the trigger prefix", sorted(encoded_text) == ["mytrigger, 1girl, smile", "mytrigger, 1girl, standing"], encoded_text)
 check("…identical to what uncached training would encode (minus dropout)",
-      sorted(encoded_text) == sorted(group.datasets[0].caption_for_cache(group.datasets[0].subsets[0], i.caption)
+      sorted(encoded_text) == sorted(group.datasets[0].process_caption_for_cache(group.datasets[0].subsets[0], i.caption)
                                      for i in group.datasets[0].image_data.values()))
 check("…and stored in the cache file", str(np.load(te_npz("a"))["caption_text"]) == "mytrigger, 1girl, smile")
 check("caption dropout still applies at train time (rate kept in the cache)",

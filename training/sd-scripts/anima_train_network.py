@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 from accelerate import Accelerator
 from library.device_utils import init_ipex, clean_memory_on_device
+from library.custom_offloading_utils import BlockSwapConfig
 
 init_ipex()
 
@@ -28,8 +29,13 @@ from library import (
     sd3_train_utils,
     strategy_anima,
     strategy_base,
-    train_util,
+    sampling,
 )
+import library.args as args_util
+import library.compile_utils as compile_utils
+import library.model_io as model_io
+import library.replica_trainer as replica_trainer
+from library.dataset import DatasetGroup, MinimalDataset
 import train_network
 from library.utils import setup_logging
 
@@ -47,9 +53,11 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def assert_extra_args(
         self,
         args,
-        train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
-        val_dataset_group: Optional[train_util.DatasetGroup],
+        train_dataset_group: Union[DatasetGroup, MinimalDataset],
+        val_dataset_group: Optional[DatasetGroup],
     ):
+        flux_train_utils.log_timestep_sampling_info(args)
+
         if args.fp8_base or args.fp8_base_unet:
             logger.warning("fp8_base and fp8_base_unet are not supported. / fp8_baseとfp8_base_unetはサポートされていません。")
             args.fp8_base = False
@@ -84,6 +92,18 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 args.blocks_to_swap is None or args.blocks_to_swap == 0
             ), "blocks_to_swap is not supported with unsloth_offload_checkpointing"
 
+        args_util.verify_gradient_checkpointing_skip_blocks(args)
+
+        if args.compile:
+            assert not args.torch_compile, (
+                "--compile (per-block torch.compile) and --torch_compile (accelerate dynamo) cannot be used together"
+                " / --compile（ブロック単位torch.compile）と--torch_compile（accelerate dynamo）は併用できません"
+            )
+            assert not (args.compile_fullgraph and args.split_attn), (
+                "--compile_fullgraph cannot be used with --split_attn (split attention uses dynamic control flow)"
+                " / --compile_fullgraphは--split_attnと併用できません（split attentionは動的な制御フローを使用します）"
+            )
+
         train_dataset_group.verify_bucket_reso_steps(16)  # WanVAE spatial downscale = 8 and patch size = 2
         if val_dataset_group is not None:
             val_dataset_group.verify_bucket_reso_steps(16)
@@ -98,9 +118,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
         # Load VAE
         logger.info("Loading Anima VAE...")
-        vae = qwen_image_autoencoder_kl.load_vae(
-            args.vae, device="cpu", disable_mmap=True, spatial_chunk_size=args.vae_chunk_size, disable_cache=args.vae_disable_cache
-        )
+        vae = anima_train_utils.load_qwen_image_vae(args, device="cpu", disable_mmap=True)
         vae.to(weight_dtype)
         vae.eval()
 
@@ -137,8 +155,14 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         # Block swap
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
         if self.is_swapping_blocks:
-            logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
-            model.enable_block_swap(args.blocks_to_swap, accelerator.device)
+            # The base weights are frozen in LoRA training. Freeze them here, before enabling block swap, for the H2D-only offloader.
+            model.requires_grad_(False)
+            swap_config = BlockSwapConfig.from_args(args, accelerator.device, supports_backward=True)
+            logger.info(
+                f"enable block swap: blocks_to_swap={args.blocks_to_swap}, H2D-only: {swap_config.h2d_only}, "
+                f"use pinned memory: {swap_config.use_pinned_memory}"
+            )
+            model.enable_block_swap(args.blocks_to_swap, swap_config)
 
         return model, text_encoders
 
@@ -177,7 +201,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return None
 
     def cache_text_encoder_outputs_if_needed(
-        self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
+        self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: DatasetGroup, weight_dtype
     ):
         if args.cache_text_encoder_outputs:
             if not args.lowram:
@@ -200,7 +224,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
                 tokenize_strategy = strategy_base.TokenizeStrategy.get_strategy()
                 text_encoding_strategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-                prompts = train_util.load_prompts(args.sample_prompts)
+                prompts = sampling.load_prompts(args.sample_prompts)
                 sample_prompts_te_outputs = {}
                 with accelerator.autocast(), torch.no_grad():
                     for prompt_dict in prompts:
@@ -281,9 +305,17 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
             latents = latents.squeeze(2)  # [B, C, 1, H, W] -> [B, C, H, W]
         noise = torch.randn_like(latents)
 
-        # Get noisy model input and timesteps
+        # Per-sample timestep sampling offset from custom_attributes: timestep_sampling = { offset = ... }
+        # Only applied during training; validation uses unbiased sampling for comparable loss.
+        tso = None
+        if is_train and "custom_attributes" in batch:
+            offsets = [ca.get("timestep_sampling", {}).get("offset", 0.0) for ca in batch["custom_attributes"]]
+            t = torch.tensor(offsets, dtype=torch.float32)
+            if t.abs().sum() > 0:
+                tso = t
         noisy_model_input, timesteps, sigmas = flux_train_utils.get_noisy_model_input_and_timesteps(
-            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype
+            args, noise_scheduler, latents, noise, accelerator.device, weight_dtype,
+            timestep_sampling_offset=tso,
         )
         timesteps = timesteps / 1000.0  # scale to [0, 1] range. timesteps is float32
 
@@ -389,7 +421,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
         return loss
 
     def get_sai_model_spec(self, args):
-        return train_util.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
+        return model_io.get_sai_model_spec_dataclass(None, args, False, True, False, anima="preview").to_metadata_dict()
 
     def update_metadata(self, metadata, args):
         metadata["ss_weighting_scheme"] = args.weighting_scheme
@@ -411,18 +443,31 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
     def prepare_unet_with_accelerator(
         self, args: argparse.Namespace, accelerator: Accelerator, unet: torch.nn.Module
     ) -> torch.nn.Module:
-        # The base NetworkTrainer only calls enable_gradient_checkpointing(cpu_offload=True/False),
-        # so we re-apply with unsloth_offload if needed (after base has already enabled it).
-        if self._use_unsloth_offload_checkpointing and args.gradient_checkpointing:
-            unet.enable_gradient_checkpointing(unsloth_offload=True)
+        # The base NetworkTrainer only calls enable_gradient_checkpointing(cpu_offload=True/False), so we re-apply with
+        # unsloth_offload and/or skip_blocks (partial gradient checkpointing) if needed (after base has already enabled it).
+        if args.gradient_checkpointing and (self._use_unsloth_offload_checkpointing or args.gradient_checkpointing_skip_blocks > 0):
+            unet.enable_gradient_checkpointing(
+                cpu_offload=args.cpu_offload_checkpointing,
+                unsloth_offload=self._use_unsloth_offload_checkpointing,
+                skip_blocks=args.gradient_checkpointing_skip_blocks,
+            )
 
         if not self.is_swapping_blocks:
-            return super().prepare_unet_with_accelerator(args, accelerator, unet)
+            model = super().prepare_unet_with_accelerator(args, accelerator, unet)
+        else:
+            model = unet
+            model = accelerator.prepare(model, device_placement=[not self.is_swapping_blocks])
+            accelerator.unwrap_model(model).move_to_device_except_swap_blocks(accelerator.device)
+            accelerator.unwrap_model(model).prepare_block_swap_before_forward()
 
-        model = unet
-        model = accelerator.prepare(model, device_placement=[not self.is_swapping_blocks])
-        accelerator.unwrap_model(model).move_to_device_except_swap_blocks(accelerator.device)
-        accelerator.unwrap_model(model).prepare_block_swap_before_forward()
+        # CUDA perf switches are independent of torch.compile; apply whenever requested.
+        compile_utils.apply_cuda_optimizations(args)
+
+        if args.compile:
+            # Apply per-block torch.compile to the DiT blocks. Reach the real Anima via
+            # unwrap_model so we mutate the underlying ModuleList regardless of any DDP wrapper.
+            dit = accelerator.unwrap_model(model)
+            compile_utils.compile_transformer(args, dit, [dit.blocks], disable_linear=self.is_swapping_blocks)
 
         return model
 
@@ -434,7 +479,7 @@ class AnimaNetworkTrainer(train_network.NetworkTrainer):
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
-    train_util.add_dit_training_arguments(parser)
+    args_util.add_dit_training_arguments(parser)
     anima_train_utils.add_anima_training_arguments(parser)
     # parser.add_argument("--fp8_scaled", action="store_true", help="Use scaled fp8 for DiT / DiTにスケーリングされたfp8を使う")
     parser.add_argument(
@@ -443,6 +488,7 @@ def setup_parser() -> argparse.ArgumentParser:
         help="offload activations to CPU RAM using async non-blocking transfers (faster than --cpu_offload_checkpointing). "
         "Cannot be used with --cpu_offload_checkpointing or --blocks_to_swap.",
     )
+    replica_trainer.add_replica_arguments(parser)
     return parser
 
 
@@ -450,11 +496,14 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    train_util.verify_command_line_training_args(args)
-    args = train_util.read_config_from_file(args, parser)
+    args_util.verify_command_line_training_args(args)
+    args = args_util.read_config_from_file(args, parser)
 
     if args.attn_mode == "sdpa":
         args.attn_mode = "torch"  # backward compatibility
 
-    trainer = AnimaNetworkTrainer()
-    trainer.train(args)
+    if args.show_timesteps:
+        anima_train_utils.show_timesteps(args)
+    else:
+        trainer = replica_trainer.wrap_trainer_class(AnimaNetworkTrainer, args)()
+        trainer.train(args)

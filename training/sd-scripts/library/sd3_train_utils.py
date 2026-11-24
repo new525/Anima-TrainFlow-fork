@@ -28,7 +28,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-from library import sd3_models, sd3_utils, strategy_base, train_util
+from library import sd3_models, sd3_utils, strategy_base, checkpoint_io, sampling
+import library.model_io as model_io
 
 
 def save_models(
@@ -97,12 +98,12 @@ def save_sd3_model_on_train_end(
     vae: sd3_models.SDVAE,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
-        sai_metadata = train_util.get_sai_model_spec(
+        sai_metadata = model_io.get_sai_model_spec(
             None, args, False, False, False, is_stable_diffusion_ckpt=True, sd3=mmdit.model_type
         )
         save_models(ckpt_file, mmdit, vae, clip_l, clip_g, t5xxl, sai_metadata, save_dtype)
 
-    train_util.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
+    checkpoint_io.save_sd_model_on_train_end_common(args, True, True, epoch, global_step, sd_saver, None)
 
 
 # epochとstepの保存、メタデータにepoch/stepが含まれ引数が同じになるため、統合している
@@ -122,12 +123,12 @@ def save_sd3_model_on_epoch_end_or_stepwise(
     vae: sd3_models.SDVAE,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
-        sai_metadata = train_util.get_sai_model_spec(
+        sai_metadata = model_io.get_sai_model_spec(
             None, args, False, False, False, is_stable_diffusion_ckpt=True, sd3=mmdit.model_type
         )
         save_models(ckpt_file, mmdit, vae, clip_l, clip_g, t5xxl, sai_metadata, save_dtype)
 
-    train_util.save_sd_model_on_epoch_end_or_stepwise_common(
+    checkpoint_io.save_sd_model_on_epoch_end_or_stepwise_common(
         args,
         on_epoch_end,
         accelerator,
@@ -382,23 +383,12 @@ def sample_images(
     sample_prompts_te_outputs,
     prompt_replacement=None,
 ):
-    if steps == 0:
-        if not args.sample_at_first:
-            return
-    else:
-        if args.sample_every_n_steps is None and args.sample_every_n_epochs is None:
-            return
-        if args.sample_every_n_epochs is not None:
-            # sample_every_n_steps は無視する
-            if epoch is None or epoch % args.sample_every_n_epochs != 0:
-                return
-        else:
-            if steps % args.sample_every_n_steps != 0 or epoch is not None:  # steps is not divisible or end of epoch
-                return
+    if not sampling.should_sample_images(args, epoch, steps):
+        return
 
     logger.info("")
     logger.info(f"generating sample images at step / サンプル画像生成 ステップ: {steps}")
-    if not os.path.isfile(args.sample_prompts) and sample_prompts_te_outputs is None:
+    if not sampling.has_sample_prompts(args) and sample_prompts_te_outputs is None:
         logger.error(f"No prompt file / プロンプトファイルがありません: {args.sample_prompts}")
         return
 
@@ -409,7 +399,7 @@ def sample_images(
     text_encoders = None if text_encoders is None else [accelerator.unwrap_model(te) for te in text_encoders]
     # print([(te.parameters().__next__().device if te is not None else None) for te in text_encoders])
 
-    prompts = train_util.load_prompts(args.sample_prompts)
+    prompts = sampling.get_sample_prompts(args)
 
     save_dir = args.output_dir + "/sample"
     os.makedirs(save_dir, exist_ok=True)
@@ -583,7 +573,9 @@ def sample_image_inference(
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
     img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
-    image.save(os.path.join(save_dir, img_filename))
+    img_path = os.path.join(save_dir, img_filename)
+    image.save(img_path)
+    sampling.notify_sample_saved(img_path)
 
     # send images to wandb if enabled
     if "wandb" in [tracker.name for tracker in accelerator.trackers]:
@@ -875,17 +867,27 @@ def get_sigmas(noise_scheduler, timesteps, device, n_dim=4, dtype=torch.float32)
 
 
 def compute_density_for_timestep_sampling(
-    weighting_scheme: str, batch_size: int, logit_mean: float = None, logit_std: float = None, mode_scale: float = None
+    weighting_scheme: str,
+    batch_size: int,
+    logit_mean: float = None,
+    logit_std: float = None,
+    mode_scale: float = None,
+    logit_offset: Optional[torch.Tensor] = None,
 ):
     """Compute the density for sampling the timesteps when doing SD3 training.
 
     Courtesy: This was contributed by Rafie Walker in https://github.com/huggingface/diffusers/pull/8528.
 
     SD3 paper reference: https://arxiv.org/abs/2403.03206v1.
+
+    ``logit_offset`` ([batch_size], CPU) is added to the normal sample of the ``logit_normal`` scheme before the
+    sigmoid (per-sample shift of ``logit_mean``). It is ignored by the other schemes.
     """
     if weighting_scheme == "logit_normal":
         # See 3.1 in the SD3 paper ($rf/lognorm(0.00,1.00)$).
         u = torch.normal(mean=logit_mean, std=logit_std, size=(batch_size,), device="cpu")
+        if logit_offset is not None:
+            u = u + logit_offset.to(device=u.device, dtype=u.dtype)
         u = torch.nn.functional.sigmoid(u)
     elif weighting_scheme == "mode":
         u = torch.rand(size=(batch_size,), device="cpu")

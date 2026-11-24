@@ -9,9 +9,7 @@ import torch
 from transformers import CLIPTokenizer, CLIPTextModel, CLIPTextModelWithProjection
 
 
-# TODO remove circular import by moving ImageInfo to a separate file
-# from library.train_util import ImageInfo
-
+from library import caching
 from library.utils import setup_logging
 
 setup_logging()
@@ -52,17 +50,30 @@ class TokenizeStrategy:
         return cls._strategy
 
     def _load_tokenizer(
-        self, model_class: Any, model_id: str, subfolder: Optional[str] = None, tokenizer_cache_dir: Optional[str] = None
+        self,
+        model_class: Any,
+        model_id: str,
+        subfolder: Optional[str] = None,
+        tokenizer_cache_dir: Optional[str] = None,
+        cache_name: Optional[str] = None,
+        **from_pretrained_kwargs,
     ) -> Any:
+        """
+        Load a tokenizer from the Hub (or from `tokenizer_cache_dir` if it was saved there before).
+
+        `cache_name` overrides the directory name under `tokenizer_cache_dir` (default: `model_id` with "/" replaced).
+        `from_pretrained_kwargs` are passed to `model_class.from_pretrained` when loading from the Hub; they are
+        persisted by `save_pretrained`, so the cached tokenizer does not need them.
+        """
         tokenizer = None
         if tokenizer_cache_dir:
-            local_tokenizer_path = os.path.join(tokenizer_cache_dir, model_id.replace("/", "_"))
+            local_tokenizer_path = os.path.join(tokenizer_cache_dir, (cache_name or model_id).replace("/", "_"))
             if os.path.exists(local_tokenizer_path):
                 logger.info(f"load tokenizer from cache: {local_tokenizer_path}")
                 tokenizer = model_class.from_pretrained(local_tokenizer_path)  # same for v1 and v2
 
         if tokenizer is None:
-            tokenizer = model_class.from_pretrained(model_id, subfolder=subfolder)
+            tokenizer = model_class.from_pretrained(model_id, subfolder=subfolder, **from_pretrained_kwargs)
 
         if tokenizer_cache_dir and not os.path.exists(local_tokenizer_path):
             logger.info(f"save Tokenizer to cache: {local_tokenizer_path}")
@@ -362,28 +373,71 @@ class TextEncoderOutputsCachingStrategy:
     def is_weighted(self):
         return self._is_weighted
 
+    @property
+    def supports_multiple_caption_candidates(self) -> bool:
+        """True if the strategy can cache the outputs of all caption candidates of an image
+        (``enable_multiline_caption`` with separator lines) and return one of them by ``candidate_index``.
+
+        Such a strategy must implement :meth:`cache_batch_outputs_multi`, accept ``captions`` in
+        :meth:`is_disk_cached_outputs_expected` and ``candidate_index`` in :meth:`load_outputs_npz`, and store the
+        in-memory outputs (``info.text_encoder_outputs``) as a list with one element per candidate.
+        """
+        return False
+
     def get_outputs_npz_path(self, image_abs_path: str) -> str:
         raise NotImplementedError
 
-    def load_outputs_npz(self, npz_path: str) -> List[np.ndarray]:
+    def load_outputs_npz(self, npz_path: str, candidate_index: int = 0) -> List[np.ndarray]:
+        """Load the cached outputs. ``candidate_index`` selects the caption candidate; it is always 0 unless
+        :attr:`supports_multiple_caption_candidates` is True."""
         raise NotImplementedError
 
-    def is_disk_cached_outputs_expected(self, npz_path: str) -> bool:
+    def is_disk_cached_outputs_expected(self, npz_path: str, captions: Optional[List[str]] = None) -> bool:
+        """Check whether the cache file exists and is valid. ``captions`` are the processed caption candidates of the
+        image (see :meth:`cache_batch_outputs_multi`); a strategy with :attr:`supports_multiple_caption_candidates`
+        uses them to check that the number of candidates and their texts match the cache. Other strategies ignore it."""
         raise NotImplementedError
 
     def is_disk_cached_caption_current(self, npz_path: str, caption: str) -> bool:
-        """[TrainFlow] Whether the cached outputs were encoded from exactly this caption text. Strategies that don't
-        store the text can't tell, and keep the old behaviour (the cache is reused)."""
+        """[TrainFlow] Whether the cached outputs were encoded from exactly this (processed) caption text. Strategies
+        that don't store the text can't tell, and keep the old behaviour (the cache is reused). Strategies with
+        :attr:`supports_multiple_caption_candidates` check the texts in :meth:`is_disk_cached_outputs_expected`."""
         return True
 
     def cache_batch_outputs(
-        self, tokenize_strategy: TokenizeStrategy, models: List[Any], text_encoding_strategy: TextEncodingStrategy, batch: List
+        self,
+        tokenize_strategy: TokenizeStrategy,
+        models: List[Any],
+        text_encoding_strategy: TextEncodingStrategy,
+        batch: List,
+        captions: List[str],
     ):
+        """Encode ``captions`` and cache the outputs for ``batch`` (list of ImageInfo, same order as ``captions``).
+
+        ``captions`` are the processed captions (``BaseDataset.process_caption_for_cache``: prefix/suffix etc. applied),
+        not ``info.caption``.
+        """
+        raise NotImplementedError
+
+    def cache_batch_outputs_multi(
+        self,
+        tokenize_strategy: TokenizeStrategy,
+        models: List[Any],
+        text_encoding_strategy: TextEncodingStrategy,
+        batch: List,
+        captions_list: List[List[str]],
+    ):
+        """Encode all caption candidates and cache the outputs for ``batch`` (list of ImageInfo).
+
+        ``captions_list[i]`` is the list of processed caption candidates of ``batch[i]``
+        (``BaseDataset.process_caption_candidates_for_cache``), with one or more elements.
+        Only strategies with :attr:`supports_multiple_caption_candidates` implement this.
+        """
         raise NotImplementedError
 
 
 class LatentsCachingStrategy:
-    # TODO commonize utillity functions to this class, such as npz handling etc.
+    # TODO commonize utility functions to this class, such as npz handling etc.
 
     _strategy = None  # strategy instance: actual strategy class
 
@@ -433,6 +487,8 @@ class LatentsCachingStrategy:
         """[TrainFlow] Whether the cached latents were encoded from this exact file. The cache file is named after the
         image's name and size only, so an image edited or replaced under the same name and size kept its old latents.
         Caches written before this check have no fingerprint and are encoded again once."""
+        if not os.path.isfile(image_path) or str(image_path).endswith(".npz"):
+            return True  # no image to compare with (a fine-tuning dataset trained from the cache files alone)
         try:
             npz = np.load(npz_path)
             return "image_fingerprint" in npz and np.array_equal(npz["image_fingerprint"], self.image_fingerprint(image_path))
@@ -525,9 +581,7 @@ class LatentsCachingStrategy:
         Returns:
             None
         """
-        from library import train_util  # import here to avoid circular import
-
-        img_tensor, alpha_masks, original_sizes, crop_ltrbs = train_util.load_images_and_masks_for_caching(
+        img_tensor, alpha_masks, original_sizes, crop_ltrbs = caching.load_images_and_masks_for_caching(
             image_infos, apply_alpha_mask, random_crop
         )
         img_tensor = img_tensor.to(device=vae_device, dtype=vae_dtype)
@@ -656,13 +710,17 @@ class LatentsCachingStrategy:
             None
         """
         kwargs = {}
-        fingerprint = self.image_fingerprint(image_path) if image_path is not None else None
+        # [TrainFlow] only for a real file: a fine-tuning dataset may point absolute_path at the cache file itself
+        has_image = image_path is not None and os.path.isfile(image_path) and not str(image_path).endswith(".npz")
+        fingerprint = self.image_fingerprint(image_path) if has_image else None
 
         if os.path.exists(npz_path):
             # load existing npz and update it
             npz = np.load(npz_path)
             # [TrainFlow] latents of an older version of the image (other resolutions) must not be kept alongside
-            same_image = fingerprint is None or ("image_fingerprint" in npz and np.array_equal(npz["image_fingerprint"], fingerprint))
+            same_image = fingerprint is None or (
+                "image_fingerprint" in npz and np.array_equal(npz["image_fingerprint"], fingerprint)
+            )
             if same_image:
                 for key in npz.files:
                     kwargs[key] = npz[key]

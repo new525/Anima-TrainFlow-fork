@@ -10,8 +10,10 @@ init_ipex()
 
 from accelerate import init_empty_weights
 from tqdm import tqdm
-from transformers import CLIPTokenizer
-from library import model_util, sdxl_model_util, train_util, sdxl_original_unet
+from library.clip_tokenizer import CLIPTokenizer  # transformers.CLIPTokenizer with the legacy (ftfy) text normalization
+from library import model_util, sdxl_model_util, checkpoint_io, sampling, sdxl_original_unet
+import library.model_io as model_io
+from library.clip_text_model import wrap_clip_text_model
 from .utils import setup_logging
 
 setup_logging()
@@ -111,7 +113,7 @@ def _load_target_model(
             )
             raise ex
 
-        text_encoder1 = pipe.text_encoder
+        text_encoder1 = wrap_clip_text_model(pipe.text_encoder)
         text_encoder2 = pipe.text_encoder_2
 
         # convert to fp32 for cache text_encoders outputs
@@ -242,7 +244,7 @@ def save_sd_model_on_train_end(
     ckpt_info,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
-        sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
+        sai_metadata = model_io.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
         sdxl_model_util.save_stable_diffusion_checkpoint(
             ckpt_file,
             text_encoder1,
@@ -269,7 +271,7 @@ def save_sd_model_on_train_end(
             save_dtype=save_dtype,
         )
 
-    train_util.save_sd_model_on_train_end_common(
+    checkpoint_io.save_sd_model_on_train_end_common(
         args, save_stable_diffusion_format, use_safetensors, epoch, global_step, sd_saver, diffusers_saver
     )
 
@@ -295,7 +297,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
     ckpt_info,
 ):
     def sd_saver(ckpt_file, epoch_no, global_step):
-        sai_metadata = train_util.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
+        sai_metadata = model_io.get_sai_model_spec(None, args, True, False, False, is_stable_diffusion_ckpt=True)
         sdxl_model_util.save_stable_diffusion_checkpoint(
             ckpt_file,
             text_encoder1,
@@ -322,7 +324,7 @@ def save_sd_model_on_epoch_end_or_stepwise(
             save_dtype=save_dtype,
         )
 
-    train_util.save_sd_model_on_epoch_end_or_stepwise_common(
+    checkpoint_io.save_sd_model_on_epoch_end_or_stepwise_common(
         args,
         on_epoch_end,
         accelerator,
@@ -390,4 +392,4 @@ def verify_sdxl_training_args(args: argparse.Namespace, support_text_encoder_cac
 def sample_images(*args, **kwargs):
     from library.sdxl_lpw_stable_diffusion import SdxlStableDiffusionLongPromptWeightingPipeline
 
-    return train_util.sample_images_common(SdxlStableDiffusionLongPromptWeightingPipeline, *args, **kwargs)
+    return sampling.sample_images_common(SdxlStableDiffusionLongPromptWeightingPipeline, *args, **kwargs)

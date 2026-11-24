@@ -2,9 +2,9 @@
 
 from tqdm import tqdm
 from library import model_util
-import library.train_util as train_util
+import library.model_io as model_io
 import argparse
-from transformers import CLIPTokenizer
+from library.clip_tokenizer import CLIPTokenizer  # transformers.CLIPTokenizer with the legacy (ftfy) text normalization
 
 import torch
 from library.device_utils import init_ipex, get_preferred_device
@@ -18,7 +18,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 TOKENIZER_PATH = "openai/clip-vit-large-patch14"
-V2_STABLE_DIFFUSION_PATH = "stabilityai/stable-diffusion-2"     # ここからtokenizerだけ使う
+V2_TOKENIZER_PAD_TOKEN = "!"  # the SD2 tokenizer is the v1 tokenizer with "!" as the pad token (see library/strategy_sd.py)
 
 DEVICE = get_preferred_device()
 
@@ -30,7 +30,7 @@ def interrogate(args):
   logger.info(f"loading SD model: {args.sd_model}")
   args.pretrained_model_name_or_path = args.sd_model
   args.vae = None
-  text_encoder, vae, unet, _ = train_util._load_target_model(args,weights_dtype, DEVICE)
+  text_encoder, vae, unet, _ = model_io._load_target_model(args,weights_dtype, DEVICE)
 
   logger.info(f"loading LoRA: {args.model}")
   network, weights_sd = lora.create_network_from_weights(1.0, args.model, vae, text_encoder, unet)
@@ -48,7 +48,7 @@ def interrogate(args):
 
   logger.info("loading tokenizer")
   if args.v2:
-    tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(V2_STABLE_DIFFUSION_PATH, subfolder="tokenizer")
+    tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(TOKENIZER_PATH, pad_token=V2_TOKENIZER_PAD_TOKEN)
   else:
     tokenizer: CLIPTokenizer = CLIPTokenizer.from_pretrained(TOKENIZER_PATH)  # , model_max_length=max_token_length + 2)
 

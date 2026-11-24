@@ -7,12 +7,16 @@ from typing import Any, Optional, Union
 import torch
 from accelerate import Accelerator
 from library import sd3_models, strategy_sd3, utils
+from library.custom_offloading_utils import BlockSwapConfig
 from library.device_utils import init_ipex, clean_memory_on_device
 from library.safetensors_utils import load_safetensors
 
 init_ipex()
 
-from library import flux_models, flux_train_utils, flux_utils, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3, train_util
+from library import flux_models, flux_train_utils, flux_utils, sd3_train_utils, sd3_utils, strategy_base, strategy_sd3, sampling
+import library.args as args_util
+import library.model_io as model_io
+from library.dataset import DatasetGroup, MinimalDataset
 import train_network
 from library.utils import setup_logging
 
@@ -30,8 +34,8 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
     def assert_extra_args(
         self,
         args,
-        train_dataset_group: Union[train_util.DatasetGroup, train_util.MinimalDataset],
-        val_dataset_group: Optional[train_util.DatasetGroup],
+        train_dataset_group: Union[DatasetGroup, MinimalDataset],
+        val_dataset_group: Optional[DatasetGroup],
     ):
         # super().assert_extra_args(args, train_dataset_group)
         # sdxl_train_util.verify_sdxl_training_args(args)
@@ -107,8 +111,13 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         self.is_swapping_blocks = args.blocks_to_swap is not None and args.blocks_to_swap > 0
         if self.is_swapping_blocks:
             # Swap blocks between CPU and GPU to reduce memory usage, in forward and backward passes.
+            # H2D-only block swap is not supported for SD3: the joint blocks are not homogeneous (see sd3_models.enable_block_swap).
+            if args.block_swap_h2d_only:
+                raise ValueError(
+                    "--block_swap_h2d_only is not supported for SD3 / SD3では--block_swap_h2d_onlyはサポートされていません"
+                )
             logger.info(f"enable block swap: blocks_to_swap={args.blocks_to_swap}")
-            mmdit.enable_block_swap(args.blocks_to_swap, accelerator.device)
+            mmdit.enable_block_swap(args.blocks_to_swap, BlockSwapConfig(accelerator.device, supports_backward=True))
 
         clip_l = sd3_utils.load_clip_l(
             args.clip_l, weight_dtype, "cpu", disable_mmap=args.disable_mmap_load_safetensors, state_dict=state_dict
@@ -201,7 +210,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
             return None
 
     def cache_text_encoder_outputs_if_needed(
-        self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: train_util.DatasetGroup, weight_dtype
+        self, args, accelerator: Accelerator, unet, vae, text_encoders, dataset: DatasetGroup, weight_dtype
     ):
         if args.cache_text_encoder_outputs:
             if not args.lowram:
@@ -236,7 +245,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
                 tokenize_strategy: strategy_sd3.Sd3TokenizeStrategy = strategy_base.TokenizeStrategy.get_strategy()
                 text_encoding_strategy: strategy_sd3.Sd3TextEncodingStrategy = strategy_base.TextEncodingStrategy.get_strategy()
 
-                prompts = train_util.load_prompts(args.sample_prompts)
+                prompts = sampling.load_prompts(args.sample_prompts)
                 sample_prompts_te_outputs = {}  # key: prompt, value: text encoder outputs
                 with accelerator.autocast(), torch.no_grad():
                     for prompt_dict in prompts:
@@ -396,7 +405,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
         return loss
 
     def get_sai_model_spec(self, args):
-        return train_util.get_sai_model_spec(None, args, False, True, False, sd3=self.model_type)
+        return model_io.get_sai_model_spec(None, args, False, True, False, sd3=self.model_type)
 
     def update_metadata(self, metadata, args):
         metadata["ss_apply_lg_attn_mask"] = args.apply_lg_attn_mask
@@ -481,7 +490,7 @@ class Sd3NetworkTrainer(train_network.NetworkTrainer):
 
 def setup_parser() -> argparse.ArgumentParser:
     parser = train_network.setup_parser()
-    train_util.add_dit_training_arguments(parser)
+    args_util.add_dit_training_arguments(parser)
     sd3_train_utils.add_sd3_training_arguments(parser)
     return parser
 
@@ -490,8 +499,8 @@ if __name__ == "__main__":
     parser = setup_parser()
 
     args = parser.parse_args()
-    train_util.verify_command_line_training_args(args)
-    args = train_util.read_config_from_file(args, parser)
+    args_util.verify_command_line_training_args(args)
+    args = args_util.read_config_from_file(args, parser)
 
     trainer = Sd3NetworkTrainer()
     trainer.train(args)

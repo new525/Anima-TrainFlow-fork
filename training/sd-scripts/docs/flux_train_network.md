@@ -20,7 +20,7 @@ This guide assumes you know the basics of LoRA training. For common options see 
 **Prerequisites:**
 
 * The repository is cloned and the Python environment is ready.
-* A training dataset is prepared. See the dataset configuration guide.
+* A training dataset is prepared. See the [Dataset Configuration Guide](./config_README-en.md).
 
 <details>
 <summary>日本語</summary>
@@ -32,7 +32,7 @@ This guide assumes you know the basics of LoRA training. For common options see 
 **前提条件:**
 
 * `sd-scripts`リポジトリのクローンとPython環境のセットアップが完了していること。
-* 学習用データセットの準備が完了していること。（データセットの準備については[データセット設定ガイド](link/to/dataset/config/doc)を参照してください）
+* 学習用データセットの準備が完了していること。（データセットの準備については[データセット設定ガイド](./config_README-ja.md)を参照してください）
 
 </details>
 
@@ -97,7 +97,7 @@ AE and T5-XXL models are same as FLUX.1, so you can use the same files. CLIP-L m
    - CLIP-Lモデルの`.safetensors`ファイル。例として`clip_l.safetensors`を使用します。
    - T5-XXLモデルの`.safetensors`ファイル。例として`t5xxl.safetensors`を使用します。
 4. **AutoEncoderモデルファイル:** FLUX.1に対応するAEモデルの`.safetensors`ファイル。例として`ae.safetensors`を使用します。
-5. **データセット定義ファイル (.toml):** 学習データセットの設定を記述したTOML形式のファイル。（詳細は[データセット設定ガイド](link/to/dataset/config/doc)を参照してください）。例として`my_flux_dataset_config.toml`を使用します。
+5. **データセット定義ファイル (.toml):** 学習データセットの設定を記述したTOML形式のファイル。（詳細は[データセット設定ガイド](./config_README-ja.md)を参照してください）。例として`my_flux_dataset_config.toml`を使用します。
 
 **必要なモデルのダウンロード**
 
@@ -216,9 +216,11 @@ The script adds FLUX.1 specific arguments. For common arguments (like `--output_
   - FLUX.1 dev version is distilled with specific guidance scale values, but for training, specify `1.0` to disable guidance scale. Default is `3.5`, so be sure to specify this. Usually ignored for schnell version.
   - Chroma requires `--guidance_scale=0.0` to disable guidance scale.
 * `--timestep_sampling=<choice>`
-  - Specifies the sampling method for timesteps (noise levels) during training. Choose from `sigma`, `uniform`, `sigmoid`, `shift`, `flux_shift`. Default is `sigma`. Recommended is `flux_shift`. For Chroma models, `sigmoid` is recommended.
+  - Specifies the sampling method for timesteps (noise levels) during training. Choose from `sigma`, `uniform`, `sigmoid`, `shift`, `flux_shift`, `truncated_logit_normal`. Default is `sigma`. Recommended is `flux_shift`. For Chroma models, `sigmoid` is recommended.
 * `--sigmoid_scale=<float>`
   - Scale factor when `timestep_sampling` is set to `sigmoid`, `shift`, or `flux_shift`. Default and recommended value is `1.0`.
+* `--timestep_cutoff=<float>` / `--timestep_uniform_ratio=<float>`
+  - Parameters of `truncated_logit_normal` timestep sampling (see below). Defaults `0.95` and `0.01` (the values of the MOSS-Image pre-training).
 * `--model_prediction_type=<choice>`
   - Specifies what the model predicts. Choose from `raw` (use prediction as-is), `additive` (add to noise input), `sigma_scaled` (apply sigma scaling). Default is `sigma_scaled`. Recommended is `raw`.
 * `--discrete_flow_shift=<float>`
@@ -231,6 +233,7 @@ The script adds FLUX.1 specific arguments. For common arguments (like `--output_
 * `--blocks_to_swap=<integer>` **[Experimental Feature]**
   - Setting to reduce VRAM usage by swapping parts of the model (Transformer blocks) between CPU and GPU. Specify the number of blocks to swap as an integer (e.g., `18`). Larger values reduce VRAM usage but decrease training speed. Adjust according to your GPU's VRAM capacity. Can be used with `gradient_checkpointing`.
   - Cannot be used with `--cpu_offload_checkpointing`.
+  - `--block_swap_h2d_only` enables the faster H2D-only block swap for LoRA training (requires `--gradient_checkpointing`). See [Block Swap](./block_swap.md).
 * `--cache_text_encoder_outputs`
   - Caches the outputs of CLIP-L and T5-XXL. This reduces memory usage.
 * `--cache_latents`, `--cache_latents_to_disk`
@@ -334,8 +337,13 @@ The `--timestep_sampling` option specifies how timesteps (0-1) are sampled:
 - `sigmoid`: Sigmoid of normal distribution random (similar to x-flux, AI-toolkit)
 - `shift`: Sigmoid value of normal distribution random with shift. The `--discrete_flow_shift` setting is used to shift the sigmoid value.
 - `flux_shift`: Shift sigmoid value of normal distribution random according to resolution (similar to FLUX.1 dev inference).
+- `truncated_logit_normal`: Logit-normal distribution on the discrete training grid, like `sigma` with `--weighting_scheme logit_normal` (`sigma = sigmoid(-N(logit_mean, logit_std))`, a negative `--logit_mean` biases toward higher noise), but truncated at `sigma <= --timestep_cutoff` and rescaled to cover (0, 1], with a `--timestep_uniform_ratio` share of samples drawn uniformly from the grid. This is the timestep schedule of the MOSS-Image pre-training (`--logit_mean -1.09 --logit_std 0.95 --discrete_flow_shift 1.0` with the default cutoff and ratio). The loss weight is 1 regardless of `--weighting_scheme`.
 
-`--discrete_flow_shift` only applies when `--timestep_sampling` is set to `shift`.
+`--discrete_flow_shift` applies when `--timestep_sampling` is set to `shift` (explicitly) or to `sigma` / `truncated_logit_normal` (through the shifted training grid).
+
+#### Visualizing the Timestep Distribution
+
+You can visualize the actual sampled-timestep distribution and loss weighting for your current settings — and confirm whether `--discrete_flow_shift` is actually applied — using the `--show_timesteps` and `--show_timesteps_resolution` options. A one-line summary of the configuration is also logged at the start of every training run. These options are shared between FLUX and Anima training; see the [Anima guide](anima_train_network.md#visualizing-the-timestep-distribution) for details.
 
 #### Model Prediction Processing
 
@@ -368,6 +376,8 @@ FLUX.1の学習には多くの未知の点があり、いくつかの設定は�
 - タイムステップのサンプリング方法（`--timestep_sampling`）
 - モデル予測の処理方法（`--model_prediction_type`）
 - 推奨設定の組み合わせ
+
+タイムステップ分布の可視化（`--show_timesteps` / `--show_timesteps_resolution`）や、`--discrete_flow_shift`が適用されるかの確認方法については、FLUXとAnimaで共通のため[Animaのガイド](anima_train_network.md#タイムステップ分布の可視化)を参照してください。
 
 </details>
 
