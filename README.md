@@ -66,7 +66,7 @@ Either way you get `python_embeded/`, an embedded Python 3.10 with pip. There's 
 ### 2. Install dependencies
 Run **`Install_Requirements.bat`**. It installs PyTorch (CUDA 12.8) and the training dependencies into `python_embeded/`.
 
-**Only for MOSS-Image:** then run **`Install_Triton_for_MOSS.bat`**. It's optional, and it makes the low-memory ConvRot INT8 option run at full speed. It finishes by trying one of the trainer's INT8 kernels on your GPU and says whether that worked; if it didn't, MOSS-Image still trains, more slowly. If it reports a problem with PyTorch instead, it names the Python it ran with and shows the error.
+**Only for MOSS-Image:** then run **`Install_Triton_for_MOSS.bat`**. It's optional, and it makes the low-memory ConvRot INT8 option run at full speed. It finishes by trying one of the trainer's INT8 kernels on your GPU and says whether that worked; if it didn't, MOSS-Image still trains, more slowly. If it reports a problem with PyTorch instead, it names the Python it ran with and shows the error. Triton compiles its kernels against the bundled Python, which carries its own headers and import library for that since 1.15 (`python_embeded\Include`, `python_embeded\libs`).
 
 ### 3. Download the models
 Put each file in the folder shown; these are the paths the app uses by default. If you already have the files elsewhere, for example in ComfyUI, you can point the app at them instead (step 4).

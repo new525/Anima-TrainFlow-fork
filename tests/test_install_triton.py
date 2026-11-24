@@ -54,6 +54,21 @@ try:
 finally:
     it.urllib.request.urlopen = real_urlopen
 
+# Triton builds a C module against the running Python: the bundled Python must carry its own headers and import library
+import re  # noqa: E402
+import tempfile  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+embedded = REPO / "python_embeded"
+dll_versions = set(re.findall(rb"3\.10\.\d+", (embedded / "python310.dll").read_bytes()))
+header_version = re.search(r'#define PY_VERSION\s+"([^"]+)"', (embedded / "Include" / "patchlevel.h").read_text(encoding="utf-8")).group(1)
+check("the bundled Python carries its headers and import library, where triton-windows looks for them",
+      it.missing_build_files(embedded, "310") == [] and (embedded / "Include" / "pyconfig.h").is_file()
+      and (embedded / "Include" / "cpython" / "object.h").is_file(), it.missing_build_files(embedded, "310"))
+check("…and the headers are those of the bundled Python's own version", dll_versions == {header_version.encode()}, (dll_versions, header_version))
+bare = Path(tempfile.mkdtemp())
+check("a Python without them: both files are named", [Path(p).name for p in it.missing_build_files(bare, "310")] == ["Python.h", "python310.lib"])
+
 real_import = builtins.__import__
 
 

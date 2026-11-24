@@ -87,6 +87,16 @@ def load_torch():
                       "  Redistributable is missing or the NVIDIA driver is too old for this PyTorch build. Does start_trainer.bat open the app?")
 
 
+def missing_build_files(base=None, version=None):
+    """Triton compiles a small C module the first time it runs, against the running Python: it needs that Python's
+    headers (Include\\Python.h) and import library (libs\\pythonXY.lib) next to python.exe. An embeddable Python
+    doesn't come with them; TrainFlow's python_embeded has had them since 1.15. Returns the paths that are missing."""
+    base = Path(base or os.path.dirname(sys.executable))
+    version = version or f"{sys.version_info.major}{sys.version_info.minor}"
+    wanted = [base / "Include" / "Python.h", base / "libs" / f"python{version}.lib"]
+    return [str(p) for p in wanted if not p.is_file()]
+
+
 def install(spec):
     package = f"triton-windows{spec}"
     print(f"Installing {package} ...", flush=True)
@@ -99,6 +109,13 @@ def check():
     if torch is None:
         print(problem)
         return False
+    if os.name == "nt":
+        gone = missing_build_files()
+        if gone:
+            print("Triton can't compile its kernels with this Python, because these files aren't there:\n  " + "\n  ".join(gone) + "\n"
+                  "They are Python's own headers and import library. TrainFlow 1.15 ships them in python_embeded (Include\\ and\n"
+                  "libs\\); copy those two folders from a 1.15 download into this python_embeded folder and run this again.")
+            return False
     sys.path.insert(0, str(SD_SCRIPTS))   # after PyTorch is loaded: nothing in sd-scripts can stand in for its imports
     try:
         from library import convrot_int8_kernels as kernels
